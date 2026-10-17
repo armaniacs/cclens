@@ -29,6 +29,7 @@ With Nix (no toolchain to set up):
 ```sh
 nix run github:lambdalisue/cclens -- doctor   # run without installing
 nix profile install github:lambdalisue/cclens  # install `cclens` onto PATH
+nix profile install github:lambdalisue/cclens/vX.Y.Z  # a specific release
 ```
 
 From source — dev tools are pinned by the Nix flake, tasks run via `just`:
@@ -53,8 +54,12 @@ published before its assets are built, so the notes are visible for a few
 minutes with nothing attached yet.
 
 The tag is the only place a version is written down: the release workflow
-rewrites `version` in `Cargo.toml` from it before publishing, so the committed
-`0.0.0` is a placeholder and cutting a release never means bumping a file first.
+rewrites `version` in `Cargo.toml` from it before building and publishing, so
+the committed `0.0.0` is a placeholder and cutting a release never means
+bumping a file first. The flake stamps it too, without being told the tag:
+`VERSION` is marked `export-subst`, so the archive GitHub serves for the tag
+carries the tag in it (see
+[nix-github-release](https://github.com/lambdalisue/nix-github-release)).
 
 The tap covers Linux and macOS only; on Windows, take the `-pc-windows-msvc`
 archive for your arch from the release, or build from source. `CLAUDE_CONFIG_DIR`

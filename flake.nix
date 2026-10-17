@@ -19,9 +19,13 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+    nix-github-release = {
+      url = "github:lambdalisue/nix-github-release/v0.1.0";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nix-github-release }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -39,10 +43,17 @@
           # C against the stdenv C toolchain — no system sqlite/pkg-config needed.
         };
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-        cclens = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
+
+        # The tag this flake was fetched at, from VERSION; see
+        # github:lambdalisue/nix-github-release. Only the package is stamped
+        # with it, so the dependency layer above stays cached across releases.
+        version = nix-github-release.lib.version { inherit self; };
+        cclens = craneLib.buildPackage (nix-github-release.lib.stampCargo { inherit pkgs version; }
+          (commonArgs // { inherit cargoArtifacts; }));
       in
       {
-        # `nix build` / `nix run github:lambdalisue/cclens -- summary`.
+        # `nix build` / `nix run github:lambdalisue/cclens -- summary`; pin a
+        # release with `github:lambdalisue/cclens/vX.Y.Z`.
         packages.default = cclens;
         apps.default = flake-utils.lib.mkApp { drv = cclens; };
 

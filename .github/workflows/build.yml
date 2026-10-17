@@ -63,6 +63,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # A release binary reports its tag from `--version`, so the placeholder in
+      # Cargo.toml and the package's own lock entry are stamped first, keeping
+      # --locked satisfied. CI's placeholder tag leaves them at 0.0.0. The
+      # version reaches perl through the environment, never as program text.
+      - name: Stamp the version
+        if: startsWith(inputs.tag, 'v')
+        run: |
+          set -euo pipefail
+          export VERSION="${TAG#v}"
+          perl -0pi -e 's/^version = "0\.0\.0"/version = "$ENV{VERSION}"/m' Cargo.toml
+          perl -0pi -e 's/(name = "cclens"\nversion = )"0\.0\.0"/$1"$ENV{VERSION}"/' Cargo.lock
       # rusqlite is built with `bundled`, so SQLite compiles from C against each
       # runner's native toolchain — no extra setup.
       - name: Build

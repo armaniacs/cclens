@@ -28,46 +28,26 @@ jobs:
     with:
       tag: ${{ github.event.release.tag_name }}
 
-  # The tagged commit's store paths are normally in the cache already: CI built
-  # this same commit on main, and the same commit yields the same derivation. The
-  # push below is therefore usually a no-op, and it is not the point — the pin is.
-  # An ordinary main build is collectable under the cache's retention policy,
-  # which would leave `nix run github:lambdalisue/cclens/vX.Y.Z` compiling from
-  # source. It also covers a tag cut from a commit that never landed on main.
+  # The flake as `nix run github:lambdalisue/cclens/vX.Y.Z` fetches it: from the
+  # archive GitHub serves for the tag, whose VERSION holds the tag. That build
+  # differs from main's even for the same commit, so it is built here, and the
+  # run fails unless it reports the release.
+  #
+  # The pin keeps it: an ordinary build is collectable under the cache's
+  # retention policy, which would leave the tag compiling from source. The pin
+  # name is per system but deliberately NOT per tag: every release re-pins the
+  # same name and so becomes a new revision of it, which is what makes
+  # --keep-revisions meaningful — a tag in the name would give each pin exactly
+  # one revision and retain them all, which is the storage growth this cache
+  # cannot afford.
   nix:
-    name: pin nix build (${{ matrix.system }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { system: x86_64-linux, os: ubuntu-latest }
-          - { system: aarch64-linux, os: ubuntu-24.04-arm }
-          - { system: aarch64-darwin, os: macos-latest }
-    steps:
-      - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-      - uses: cachix/cachix-action@v17
-        with:
-          name: cclens
-          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-      - name: Build, push, and pin
-        run: |
-          set -euo pipefail
-          out=$(nix build .#default --print-out-paths)
-          # Pushed here rather than left to the action's post step, which runs
-          # after this one — the pin needs the path to be in the cache already.
-          cachix push cclens "$out"
-          # The pin name is per system but deliberately NOT per tag: the three
-          # systems are distinct store paths and need their own pins, while
-          # every release re-pins the same name and so becomes a new revision of
-          # it. That is what makes --keep-revisions meaningful — a tag in the
-          # name would give each pin exactly one revision and retain them all,
-          # which is the storage growth this cache cannot afford.
-          cachix pin cclens "release-${{ matrix.system }}" "$out" --keep-revisions 3
+    uses: lambdalisue/nix-github-release/.github/workflows/build.yml@v0.1.0
+    with:
+      ref: ${{ github.event.release.tag_name }}
+      cachix-cache: cclens
+      cachix-pin: release
+    secrets:
+      cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   # One job owns the upload so the matrix builds cannot race, and so the checksums
   # are computed from exactly the bytes that get attached.

@@ -34,6 +34,9 @@ use crate::store::{SessionMeta, Store};
 #[derive(Parser)]
 #[command(
     name = "cclens",
+    // Cargo.toml holds a placeholder that the release workflow and the flake
+    // both stamp from the tag before building.
+    version,
     about = "See where your Claude Code time and tokens go, and which config to fix.\n\
              Start with `cclens doctor`; every report explains itself and names the\n\
              follow-up command."
@@ -2748,6 +2751,19 @@ fn pad(text: &str, width: usize, align: Align) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_flag_prints_the_crate_version() {
+        use clap::CommandFactory;
+        let err = Cli::command()
+            .try_get_matches_from(["cclens", "--version"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            err.to_string(),
+            format!("cclens {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     fn agent(name: &str, runs: i64, out_tokens: i64) -> optimize_mod::AgentCost {
         optimize_mod::AgentCost {
