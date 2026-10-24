@@ -1,96 +1,102 @@
-# feature-otherharness 探索メモ (opencode / kilocode / DSH 対応)
+# Multi-harness exploration (opencode / kilocode / DSH)
 
-- ブランチ: `feature-otherharness` (このファイルが探索作業の成果物)
-- 目的: cclens を Claude Code 専用から、opencode / kilocode / DSH でも使える構成にする
-- 方針 (AGENTS.md 準拠): spec-first / TDD / privacy厳守のため、本メモに実データは貼らない。以下はすべて手元の実ディレクトリを read-only で読んだ shape の要約で、ID・パス・プロンプト文は合成例に置き換えている。
-- 日付: 2026-10-25 JST
+- Branch: `feature-otherharness` (this file records the exploration work).
+- Goal: reshape cclens from Claude Code-only into something usable with
+  opencode, kilocode, and DSH.
+- Method (per AGENTS.md): spec-first, TDD, strict privacy — no real data is
+  pasted here. Everything below summarizes shapes read read-only from local
+  directories; ids, paths, and prompt text are synthetic stand-ins.
+- House rule for this branch: all docs and code stay in English; conversation
+  with the author stays in Japanese.
+- Date: 2026-10-25 JST.
 
-## 1. 現状の Claude Code 前提 (どこを剥がすか)
+## 1. Where the Claude Code assumptions live (what to peel off)
 
-| 箇所 | Claude 前提の内容 |
+| Location | Claude-specific content |
 | --- | --- |
-| `src/adapter/transcript.rs` | JSONL の `type` (`assistant`/`user`/`system`)、`message.usage.*`、`message.content[]` の `tool_use`、`Skill`/`Agent` の特別扱い、`<command-name>`、 `toolDenialKind`、`subagents/` + `*.meta.json` 連携、`cwd` 先頭採用、`promptId` |
-| `src/adapter/config.rs` | `~/.claude` (`$CLAUDE_CONFIG_DIR`) 配下の `skills/*/SKILL.md`、`rules/**/*.md`、`agents/*.md`、`settings.json`、`mcp.json`、プロジェクト側 `.claude/` + `CLAUDE.md`/`AGENTS.md` (+ `@import` 追跡) |
-| `src/cli.rs` (`run_analyze` 周り) | `--projects` 既定 = `$CLAUDE_CONFIG_DIR/projects`、config root 既定 = `~/.claude`、project root 列挙 = sessions の `cwd` |
-| `src/store.rs` | `sessions` に harness 列なし。`events.kind` は Claude 由来の語彙 (`skill_invocation`, `agent_spawn`, …)。`ANALYZER_VERSION = "3"` (抽出意味変更時は bump 必須) |
-| `docs/specs/*` | `session-format.md` / `config-format.md` が Claude 形式を直接カタログ。`format-isolation.md` の「adapter のみが upstream 形式を知る」境界はそのまま活かせる |
+| `src/adapter/transcript.rs` | JSONL `type` (`assistant`/`user`/`system`), `message.usage.*`, `tool_use` in `message.content[]`, special-cased `Skill`/`Agent`, `<command-name>`, `toolDenialKind`, the `subagents/` + `*.meta.json` linkage, first-`cwd` root, `promptId` |
+| `src/adapter/config.rs` | `skills/*/SKILL.md`, `rules/**/*.md`, `agents/*.md`, `settings.json`, `mcp.json` under `~/.claude` (`$CLAUDE_CONFIG_DIR`); project-side `.claude/` + `CLAUDE.md`/`AGENTS.md` (with `@import` tracking) |
+| `src/cli.rs` (around `run_analyze`) | `--projects` defaults to `$CLAUDE_CONFIG_DIR/projects`, config root defaults to `~/.claude`, project roots enumerated from session `cwd` values |
+| `src/store.rs` | No harness column on `sessions`. `events.kind` uses Claude-born vocabulary (`skill_invocation`, `agent_spawn`, …). `ANALYZER_VERSION = "3"` (must bump when extraction semantics change) |
+| `docs/specs/*` | `session-format.md` / `config-format.md` catalogue the Claude formats directly. The `format-isolation.md` boundary (only the adapter knows upstream shapes) stays reusable as-is |
 
-## 2. 実測: 各ハーネスの入力 shape (read-only 調査)
+## 2. Measured input shapes per harness (read-only survey)
 
-### 2.1 opencode — 一番近い。SQLite が正本
+### 2.1 opencode — closest fit. SQLite is the source of record
 
-- セッション正本: `~/.local/share/opencode/opencode.db` (SQLite, drizzle schema)
+- Session source of record: `~/.local/share/opencode/opencode.db` (SQLite, drizzle schema)
   - `session(id, project_id, directory, title, agent, model, tokens_input/output, cost, time_created/updated)`
-  - `message(id, session_id, time_created, data JSON)` — `data.role` / `data.tokens{input,output,reasoning,cache{read,write}}` / `data.cost` / `data.modelID,providerID,agent,mode` / `data.path{cwd,root}` / `data.error{...}`。`parentID` でスレッド連結
-  - `part(id, message_id, session_id, data JSON)` — `data.type` 分布 (実測約5000件): `tool` / `step-start` / `step-finish` / `text` / `reasoning` / `compaction` / `file` / `subtask`
-  - `step-finish` が `tokens{total,input,output,cache}` + `cost` を持つ。compaction 検出は `type=compaction` が直接使える (Claude の `compact_boundary` 相当)
-- ファイルミラー: `project/global/storage/session/{info, message}/...` に同内容の JSON があるが、DB を読む方が join が楽。`subagents/` 相当の分離はない (エージェント実行は `part.tool=task` / `part.type=subtask`)
-- 使用シグナルの対応付け (案):
-  - skill 呼び出し → `part.tool=skill` (`input.name` が skill 名) + `skill_use`。Claude の slash/tool 2経路に相当する区別は opencode にはないので `source=tool` 一本でよい
-  - subagent spawn → `part.tool=task` / `part.type=subtask` (`agent`, `command`, `prompt` を保持)
-  - tool 使用 → `part.tool=<name>` (`read`/`bash`/`edit`/`write`/`glob`/`grep`/`webfetch` …)。`callID` が `tool_use_id` 相当の join key
-  - tool 失敗 → `part.state.status=error` + `state.error` (例: `File not found: /tmp/example/foo.md`)。Claude の `is_error`/`tool_use_error` ラッパーと同位置づけ。`input.filePath`/`command` が target になる
-  - permission 拒否 → `opencode.json` の `permission` (allow/ask/deny) が静的根拠。実行時シグナルとしての denial marker は未確認 (要追加調査)
-  - user prompt → `message.role=user` + `part.type=text`。`session.title` は要約文なので使わない
-- コンフィグ面:
-  - グローバル: `~/.config/opencode/opencode.json` (`model`, `small_model`, `permission`, `providers`, …) + `plugins/`。`command/`・`agent/` ディレクトリはこの環境では未存在 (プロジェクト規約 `.opencode/command/*.md` を使う流儀と合わせて要確認)
-  - プロジェクト: カレントでは `.opencode/` / `opencode.json` を持つ repo は未確認。`AGENTS.md` は opencode も読む共有規約なので、既存の `claude_md` surface (symlink dedup 付き) を流用できる
-  - MCP: `mcp` キー (opencode.json 内 or 別ファイル) を要確認。本環境の `opencode.json` トップレベルキーに `mcp` はなし
+  - `message(id, session_id, time_created, data JSON)` — `data.role` / `data.tokens{input,output,reasoning,cache{read,write}}` / `data.cost` / `data.modelID,providerID,agent,mode` / `data.path{cwd,root}` / `data.error{...}`. `parentID` links reply chains
+  - `part(id, message_id, session_id, data JSON)` — observed `data.type` distribution (~5000 rows): `tool` / `step-start` / `step-finish` / `text` / `reasoning` / `compaction` / `file` / `subtask`
+  - `step-finish` carries `tokens{total,input,output,cache}` + `cost`. Compaction is directly detectable via `type=compaction` (the `compact_boundary` equivalent)
+- File mirror: `project/global/storage/session/{info, message}/...` holds the same content as JSON, but the DB joins more cheaply. No `subagents/`-style split exists (agent runs are `part.tool=task` / `part.type=subtask`)
+- Usage-signal mapping:
+  - Skill invocation → `part.tool=skill` (`input.name` is the skill name). opencode has nothing like Claude's slash/tool split, so a single `source=tool` suffices
+  - Subagent spawn → `part.tool=task` / `part.type=subtask` (keeps `agent`, `command`, `prompt`)
+  - Tool use → `part.tool=<name>` (`read`/`bash`/`edit`/`write`/`glob`/`grep`/`webfetch` …). `callID` is the `tool_use_id`-equivalent join key
+  - Tool failure → `part.state.status=error` + `state.error` (e.g. `File not found: /tmp/example/foo.md`). Same slot as Claude's `is_error`/`tool_use_error` wrapper. `input.filePath`/`command` becomes the target
+  - Permission denial → `opencode.json`'s `permission` table (allow/ask/deny) is static evidence. No runtime denial marker found (needs follow-up survey)
+  - User prompt → `message.role=user` + `part.type=text`. `session.title` is a generated summary, never a prompt
+- Config side:
+  - Global: `~/.config/opencode/opencode.json` (`model`, `small_model`, `permission`, `providers`, …) + `plugins/`. No `command/` or `agent/` directories in this environment (needs cross-checking against the project-level `.opencode/command/*.md` convention)
+  - Project: no repo with `.opencode/` / `opencode.json` observed here. `AGENTS.md` is a shared convention opencode also reads, so the existing `claude_md` surface (symlink dedup included) is reusable
+  - MCP: definition site unverified. This environment's `opencode.json` has no top-level `mcp` key
 
-### 2.2 kilocode (Roo-code 系) — VSCode globalStorage 配下。トークン正本は `ui_messages.json`
+### 2.2 kilocode (Roo-code family) — under VSCode globalStorage. Token source of record is `ui_messages.json`
 
-- セッション: `<VSCode globalStorage>/kilocode.kilo-code/tasks/<uuid>/`
-  - `api_conversation_history.json` — Anthropic 互換: `{role, content:[{type:text|tool_use|tool_result, id/name/input, tool_use_id/content}], ts, reasoning_details?}`。`tool_use.name=execute_command` 等。`tool_use_id` 連結で tool と target が取れる (Claude と同形なので流用しやすい)。**`usage`/`tokens`/`cost` キーは 0 件 (実測) — トークンはこちらにはない**
-  - `ui_messages.json` — `{ts, type:say/ask, say:text/...}` の表示用ログ。人間ターンの区切り (span 終端条件) に使える。**トークン正本はここ**: `say=api_req_started` の `text` が JSON で `{apiProtocol, tokensIn, tokensOut, cacheWrites, cacheReads, cost, usageMissing, inferenceProvider}` を運ぶ (実測 50 件中 49 件が `usageMissing=false` + cost あり)。ts 順に `assistant` 応答の直前に並ぶので、時刻順 join で per-request 行が作れる。model 名は入っていない (`inferenceProvider` のみ) ので代表 model は NULL 運用
-  - `task_metadata.json` — 実測のキーは `files_in_context[]` のみ (read/edited の痕跡)。never-fires-rule の将来材料
-  - task⇔session 対応: `sessions/<id>/session.json` の `taskSessionMap` (taskId → sessionId)
-  - project root: メッセージ内に `cwd` 系キーはなし。`ask=tool` の `text` JSON が `{tool, path, content: <absolute path>, isOutsideWorkspace}` を持つので、先頭の絶対パスの共通 prefix が root 推定の候補 (heuristic として明示)
-  - 承認シグナル: `ask=tool` がツール実行の承認点 (permission 相当)。失敗シグナルは `say=command_output` (exit code を含む出力) と `api_req_retry_delayed` が候補
-- コンフィグ面 (実測):
-  - グローバル: `~/.config/kilo/` — `command/*.md` (`devloop.md`, `graphify.md`, `review-diff.md` = slash-command 相当)、`skills/*/` (skill dir 群)、`kilo.json` (provider/model・agent 別 prompt)、`agent/` (この環境では空)。`settings/mcp_settings.json` (`{mcpServers:{}}`)、`settings/custom_modes.yaml` (この環境では空)
-  - プロジェクト側規約 (`.kilocode/rules/` 等) はこの環境で未確認。要追加調査
-- パスの環境依存が強い (`~/Library/Application Support/Code/...` は VSCode/Cursor 設置依存) ので、adapter は storage root の override (環境変数 or `--projects`) を持たせたい
+- Sessions: `<VSCode globalStorage>/kilocode.kilo-code/tasks/<uuid>/`
+  - `api_conversation_history.json` — Anthropic-compatible: `{role, content:[{type:text|tool_use|tool_result, id/name/input, tool_use_id/content}], ts, reasoning_details?}`. `tool_use.name=execute_command` etc. `tool_use_id` linkage recovers tool and target (same shape as Claude Code, easy to reuse). **Zero `usage`/`tokens`/`cost` keys measured — tokens are not here**
+  - `ui_messages.json` — `{ts, type:say/ask, say:text/...}` display log. Usable for human-turn delimiters (span end conditions). **The token source of record is here**: `say=api_req_started` rows carry JSON text `{apiProtocol, tokensIn, tokensOut, cacheWrites, cacheReads, cost, usageMissing, inferenceProvider}` (49 of 50 sampled rows have `usageMissing=false` with cost). They sort just before their `assistant` replies in `ts` order, so a time-ordered join yields per-request rows. No model name is carried (`inferenceProvider` only), so the representative model stays NULL
+  - `task_metadata.json` — measured keys are `files_in_context[]` only (read/edited traces). Future material for never-fires-rule
+  - Task⇔session mapping: `sessions/<id>/session.json` holds `taskSessionMap` (taskId → sessionId)
+  - Project root: no `cwd`-style key in messages. `ask=tool` text JSON carries `{tool, path, content: <absolute path>, isOutsideWorkspace}`, so the common prefix of leading absolute paths is the root-estimation candidate (stated as a heuristic)
+  - Approval signal: `ask=tool` is the tool-execution approval point (permission equivalent). Failure-signal candidates: `say=command_output` (carries exit codes) and `api_req_retry_delayed`
+- Config side (measured):
+  - Global: `~/.config/kilo/` — `command/*.md` (`devloop.md`, `graphify.md`, `review-diff.md` = slash-command equivalents), `skills/*/` (skill directories), `kilo.json` (providers/models, per-agent prompts), `agent/` (empty in this environment). Plus `settings/mcp_settings.json` (`{mcpServers:{}}`) and `settings/custom_modes.yaml` (empty here)
+  - Project-level conventions (`.kilocode/rules/` etc.) not observed in this environment. Needs follow-up survey
+- Paths are strongly environment-dependent (`~/Library/Application Support/Code/...` varies with the VSCode/Cursor installation), so the adapter wants a storage-root override (env var or `--projects`)
 
-### 2.3 DSH (DeepSeek Harness) — 自前イベントソーシング。zstd 付き JSONL
+### 2.3 DSH (DeepSeek Harness) — home-grown event sourcing. zstd-compressed JSONL
 
-- セッション: `~/.dsh/sessions/<cwd-slug>/<session-id>/session.v4.jsonl.zstd`
-  - 1行1イベント `{type, seq, time, data}`。実測の型分布: `tool/call` / `tool/result` / `step/start` / `assistant/message` / `step/end` / `job/registered` / `job/settled` / `user/message` / `agent/inbox/spliced` / `session/title` / `session` / `permission/preset` / `sandbox/mode` / `approval/policy` / `turn/start` / `system/message` / `request/header` / `request/context` (+ `session/title-llm-request`)
-  - 起点: `type=session` が `{version:4, id, createdAt, cwd, agentPreset}` を持つ。Claude の「先頭 `cwd` を root に」と同じことが確実に取れる
-  - tool 呼び出し: `assistant/message` 内 `content[]` の `{type:tool-call, id, name, arguments}` + 対応する `tool/call{callId,name,arguments}` → `tool/result{content,isError}`。`callId` が join key。実測 tool 名: `bash`, `read`, `web_search` 等 (DSH 自前の動詞)
-  - トークン: `usage{inputTokens,outputTokens,totalTokens,cacheReadTokens?}` を確認 (どの event に付くかは要特定。`assistant/message` の `source.replayState` 付近と `step/end` 付近を次に見る)
-  - user prompt: `user/message{content[], source{kind:user}}`。Claude の `isMeta`/`tool_result` 除外と同等のガードが必要
-  - subagent: `subagent/` 分離はなし。`delegationDepth` と `task` 系 tool (要特定) で spawn を検出する方針
-- コンフィグ面: `~/.dsh/profiles/<name>/` (+ ワークスペースの `cordis.yml` 等)。skill/agent/MCP に相当する定義場所は未特定で要追加調査。`AGENTS.md` 共有規約は流用可
+- Sessions: `~/.dsh/sessions/<cwd-slug>/<session-id>/session.v4.jsonl.zstd`
+  - One event per line, `{type, seq, time, data}`. Measured type distribution: `tool/call` / `tool/result` / `step/start` / `assistant/message` / `step/end` / `job/registered` / `job/settled` / `user/message` / `agent/inbox/spliced` / `session/title` / `session` / `permission/preset` / `sandbox/mode` / `approval/policy` / `turn/start` / `system/message` / `request/header` / `request/context` (+ `session/title-llm-request`)
+  - Origin: `type=session` carries `{version:4, id, createdAt, cwd, agentPreset}`. Same confidence as Claude's first-`cwd` root, with none of the slug lossiness
+  - Tool calls: `{type:tool-call, id, name, arguments}` inside `assistant/message` `content[]`, plus `tool/call{callId,name,arguments}` → `tool/result{content,isError}`. `callId` is the join key. Observed tool names: `bash`, `read`, `web_search`, … (DSH-native verbs)
+  - Tokens: `usage{inputTokens,outputTokens,totalTokens,cacheReadTokens?}` confirmed (hosting event still to pin down — look near `source.replayState` on `assistant/message` and near `step/end` next)
+  - User prompt: `user/message{content[], source{kind:user}}`. Needs the same guard as Claude's `isMeta`/`tool_result` exclusion
+  - Subagents: no `subagent/` split. Planned detection via `delegationDepth` and the `task`-family tool (still to identify)
+- Config side: `~/.dsh/profiles/<name>/` (+ workspace files like `cordis.yml`). Skill/agent/MCP definition sites unidentified — needs follow-up survey. The shared `AGENTS.md` convention is reusable
 
-### 2.4 横断: 共有できるもの・harness 固有のもの
+### 2.4 Cross-cutting: shared vs harness-specific
 
-- 共有可: `AGENTS.md`/`CLAUDE.md` の always-on surface (symlink dedup・`@import` 追跡ごと)、`Scope` (global/project)、`approx_tokens` の static cost、catalog×usage の join・wedges・reporting-honesty の考え方
-- harness 固有: セッションの「どこ・何形式」全文、skill 呼び出しの見分け方、subagent の連結 key、token フィールド名、config の置き場所、permission/denial の語彙。→ すべて adapter 配下に閉じ込める (format-isolation の拡張)
+- Shareable: the `AGENTS.md`/`CLAUDE.md` always-on surface (with symlink dedup and `@import` tracking), `Scope` (global/project), `approx_tokens` static cost, the catalog×usage join, wedges, and reporting-honesty thinking
+- Harness-specific: the full "where and what shape" of sessions, skill-invocation markers, subagent join keys, token field names, config locations, permission/denial vocabulary → all confined under the adapter (an extension of format-isolation)
 
-## 3. 設計案 (決定事項を反映。合意後に spec 差分として起こす)
+## 3. Design (with decisions. Raised as spec diffs once agreed)
 
-決定 (2026-10-25):
-1. **最初のターゲットは opencode** — SQLite 正本 + tokens ありで最初に価値を出せる
-2. **store は harness 共用にしない** — 上流マージを見据え、Claude の既定動作・既定 DB (`cclens.db`) に一切触れない。harness 別に独立した DB ファイルを持つ (`--db` 既定値を harness 別に切る。例: 同一 state dir 下で `cclens-opencode.db` 等。命名は spec 起案時に確定)。`meta` も DB ごとに独立。v1 で cross-harness 集計はしない
-3. **kilocode は追加調査を実施** — §2.2 に反映済み。トークン正本 (`api_req_started`) を確認したので NULL 運用案は撤回し、時刻順 join で per-request 行を作る方針に変更
+Decisions (2026-10-25):
+1. **opencode is the first target** — SQLite source of record plus real tokens gets value out earliest
+2. **No shared store across harnesses** — with upstream merge in mind, Claude's default behavior and default DB (`cclens.db`) stay untouched. Each harness gets its own DB file (`--db` defaults switch per harness, e.g. `cclens-opencode.db` under the same state dir; exact names settled when the spec is drafted). `meta` stays per-DB. No cross-harness aggregation in v1
+3. **kilocode got its follow-up survey** — reflected in §2.2. The token source of record (`api_req_started`) is confirmed, so the NULL-operation plan is withdrawn in favor of a time-ordered join producing per-request rows
 
-- adapter 分割: `adapter::{claude,opencode,kilocode,dsh}` + 共通の domain model (`Record`, `Surface`, `SubagentRun`) は不変。既存 `adapter::{config,transcript}` の中身は `adapter::claude::{config,transcript}` へ移動し、旧パスは re-export のみ残す (境界バグ防止)。DB 分離により `sessions.harness` 列は**不要** — 各 DB が単一 harness を持つ
-- CLI: `analyze`/`doctor`/各 view/`optimize` に `--harness claude|opencode|kilocode|dsh` (既定 `claude` = 現状動作そのまま。`auto` は設けない — 検出順の曖昧さを持ち込まない)。`--projects`/`--config`/`--db` の既定値は harness 別テーブル化 (`~/.local/share/opencode/opencode.db`、`kilocode tasks dir`、`~/.dsh/sessions` 等 + harness 別 DB 名)。`meta` に `harness` を記録し、異なる harness の DB を誤って読んだ場合は警告する
-- kilocode の model 欠落: 代表 model が取れない旨を reporting-honesty ラベルとして扱う (spec `cli.md` 追記。`sub_tokens_estimated` と同列)
-- `optimize`: 起動コマンドが harness 別 (`claude` / `opencode run` / ほか)。まず `--print` の briefing 統一、launch は Claude 互換のみ残して他は後回し
+- Adapter split: `adapter::{claude,opencode,kilocode,dsh}` with the shared domain model (`Record`, `Surface`, `SubagentRun`) unchanged. The existing `adapter::{config,transcript}` bodies move to `adapter::claude::{config,transcript}` with re-exports left on the old paths (prevents boundary bugs). DB separation makes a `sessions.harness` column **unnecessary** — each DB holds a single harness
+- CLI: `--harness claude|opencode|kilocode|dsh` on `analyze`/`doctor`/views/`optimize` (default `claude` = current behavior, unchanged. No `auto` — avoids inventing ambiguous detection order). Per-harness default tables for `--projects`/`--config`/`--db` (opencode DB path, kilocode tasks dir, `~/.dsh/sessions`, plus per-harness DB names). Record `harness` in `meta` and warn when a DB is read under the wrong harness
+- kilocode's missing model: treat the unmappable representative model as a reporting-honesty label (spec `cli.md` addendum, alongside `sub_tokens_estimated`)
+- `optimize`: the launch command differs per harness (`claude` / `opencode run` / …). Unify the `--print` briefing first; keep the launch Claude-compatible and defer the rest
 
-## 4. 難易度順と TDD の進め方 (案)
+## 4. Difficulty order and TDD plan
 
-1. `sessions.harness` + `Harness` enum + 既存 Claude パスの移動 (リファクタのみ、全テスト green を維持)
-2. opencode adapter (DB 読込 → domain records。`step-finish.tokens` で usage 系がそのまま動く = 最初に価値を出す)
-3. DSH adapter (zstd JSONL デコード → records。`tool/call|result` join + `usage` 特定が山場)
-4. kilocode adapter (records は取れるが tokens 欠落の劣化表示設計が本体)
-5. config adapter (harness 別 catalog。`AGENTS.md` 共通部は共通化)
-6. doctor/optimize の harness 対応 + `docs/specs/{session-format,config-format,storage,cli}.md` の harness 別追記
+Status: opencode transcript mapping spec + pure adapter done (`session-format-opencode.md`, `adapter::opencode`, commit `422d4f2`). Remaining:
 
-## 5. 追加調査が必要な項目 (open)
+1. opencode CLI wiring (`--harness opencode`, DB-reading shell, per-harness `--db` default, `meta.harness` guard) — first for user-visible value
+2. opencode config catalog (`config-format-opencode.md`, then catalog implementation) — completes `waste`/`inventory`
+3. DSH adapter (zstd JSONL decode → records; pinning the `usage` host event is the crux)
+4. kilocode adapter (records plus the `api_req_started` time-ordered token join)
+5. doctor/optimize harness handling + harness addenda to `docs/specs/{session-format,config-format,storage,cli}.md`
 
-- [ ] opencode: `permission` 実行時 denial シグナルの有無、`mcp` 定義場所、`.opencode/command|agent` 規約の確定
-- [x] kilocode: トークン量の正本 → `ui_messages.json` の `say=api_req_started` の `text` JSON (`tokensIn/tokensOut/cacheWrites/cacheReads/cost/usageMissing`)。残り open: プロジェクト側 rules/modes 置き場所、storage root の決め方 (Cursor 併用時)
-- [ ] DSH: `usage` を運ぶ event 型の特定、subagent spawn の見分け方、skill/agent/MCP 定義場所
-- [ ] 全般: harness 別 DB の既定ファイル名の確定 (spec 起案時)
+## 5. Open survey items
+
+- [ ] opencode: runtime denial signal for `permission`, MCP definition site, `.opencode/command|agent` convention
+- [x] kilocode: token source of record → `ui_messages.json` `say=api_req_started` text JSON (`tokensIn/tokensOut/cacheWrites/cacheReads/cost/usageMissing`). Still open: project-side rules/modes locations, storage-root choice (Cursor side-by-side case)
+- [ ] DSH: hosting event for `usage`, subagent-spawn markers, skill/agent/MCP definition sites
+- [ ] General: default per-harness DB file names (settled when the harness spec is drafted)
