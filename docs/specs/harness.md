@@ -69,6 +69,13 @@ contract:
   fingerprint would re-ingest every session on each run (opencode appends
   constantly); per-session keys skip what did not move. Replace semantics
   make re-ingest idempotent, as for Claude Code transcripts.
+- **Invalidation has its own version key.** The shared `ANALYZER_VERSION`
+  would force Claude Code users through a full re-analyze on every
+  opencode-only extraction change, so opencode rows stamp
+  `meta.opencode_analyzer_version` instead
+  (`adapter::opencode::OPENCODE_ANALYZER_VERSION`). Bump it under the same
+  rule: whenever opencode extraction changes what an unchanged database
+  yields.
 - **Subagent runs are not ingested.** opencode has no subagent-side
   transcripts, so `sub_tokens`/`sub_agent_count` stay zero and the per-agent
   split is empty. `SplitCoverage::is_unavailable` requires a positive total,

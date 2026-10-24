@@ -88,8 +88,11 @@ Record order within a session is `message.time_created` (ties broken by
 `message.id`), and within a message the part-derived records come **before**
 that message's `Assistant` cost record — so a skill span opens at the
 invocation and includes the calling turn's cost, mirroring the Claude Code
-adapter's ordering. Part timestamps use `state.time.start`, falling back to
-the owning message's `time_created`.
+adapter's ordering. The cost record is stamped with the turn's *end* (the
+latest part time, falling back to the message time): tools run after their
+message is created, so stamping the creation time would invert the stream and
+produce negative span durations. Part timestamps use `state.time.start`,
+falling back to the owning message's `time_created`.
 
 ## Usage signals the adapter extracts
 

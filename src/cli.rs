@@ -1839,7 +1839,13 @@ fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
         );
     }
     let mut store = Store::open(db).context("open store")?;
-    let reuse_ingested = store.is_analyzer_current()?;
+    // The opencode version key lives apart from the shared analyzer version:
+    // an opencode-only extraction change must never force Claude Code users
+    // through a full re-analyze (`adapter::opencode::OPENCODE_ANALYZER_VERSION`).
+    let reuse_ingested = store
+        .meta(opencode_mod::OPENCODE_ANALYZER_META_KEY)?
+        .as_deref()
+        == Some(opencode_mod::OPENCODE_ANALYZER_VERSION);
 
     let snapshot = opencode_mod::read_database(&input)?;
     let mut messages_by_session: std::collections::HashMap<
@@ -1966,7 +1972,10 @@ fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 
-    store.record_analyzer_version()?;
+    store.set_meta(
+        opencode_mod::OPENCODE_ANALYZER_META_KEY,
+        opencode_mod::OPENCODE_ANALYZER_VERSION,
+    )?;
     store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
     store.set_meta("projects_dir", &input.display().to_string())?;
     store.set_meta("config_dir", &config_dir.display().to_string())?;

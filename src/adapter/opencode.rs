@@ -19,6 +19,16 @@ use crate::core::surface::{LoadMode, Scope, Surface};
 /// The model label when a message names none — honest, never a guess.
 const UNKNOWN_MODEL: &str = "unknown";
 
+/// The analysis semantics the opencode rows were built with. **Bump it
+/// whenever opencode extraction changes what an unchanged database yields.**
+/// It lives apart from the shared `ANALYZER_VERSION` (`store.rs`) on
+/// purpose: an opencode-only change must never force every Claude Code user
+/// through a full re-analyze. Stored under its own `meta` key.
+pub const OPENCODE_ANALYZER_VERSION: &str = "2";
+
+/// The `meta` key holding the opencode analysis semantics.
+pub const OPENCODE_ANALYZER_META_KEY: &str = "opencode_analyzer_version";
+
 /// One `message` row: the columns plus its JSON `data` blob.
 pub struct MessageRow<'a> {
     pub id: &'a str,
@@ -41,8 +51,11 @@ pub struct PartRow<'a> {
 ///
 /// Messages order by `time_created` (ties by id); within a message the
 /// part-derived records come before that message's own cost record, so a span
-/// opens at its invocation and includes the calling turn's cost. See
-/// `docs/specs/session-format-opencode.md`.
+/// opens at its invocation and includes the calling turn's cost. The cost
+/// record is stamped with the turn's *end* (the latest part time, falling
+/// back to the message time) — stamping it with the turn's start would invert
+/// the stream whenever tools ran after the message was created, producing
+/// negative durations. See `docs/specs/session-format-opencode.md`.
 pub fn parse_session(messages: &[MessageRow], parts: &[PartRow]) -> Vec<Record> {
     let mut ordered: Vec<&MessageRow> = messages.iter().collect();
     ordered.sort_by_key(|m| (m.time_created_ms, m.id));
@@ -89,7 +102,13 @@ pub fn parse_session(messages: &[MessageRow], parts: &[PartRow]) -> Vec<Record> 
                         });
                     }
                 }
-                records.push(assistant_record(message));
+                let turn_end = message_parts
+                    .iter()
+                    .map(|part| part_time(part))
+                    .max()
+                    .unwrap_or(message.time_created_ms)
+                    .max(message.time_created_ms);
+                records.push(assistant_record(message, turn_end));
             }
             _ => {}
         }
@@ -505,8 +524,9 @@ fn part_record_kind(part: &PartRow<'_>, message: &MessageRow<'_>) -> Option<Reco
 /// One assistant message's cost row. Message-level tokens are authoritative
 /// (at most one `step-finish` part echoes them), so parts are never summed.
 /// `prompt_size` mirrors the Claude Code sum — see
-/// `docs/specs/session-format-opencode.md`.
-fn assistant_record(message: &MessageRow<'_>) -> Record {
+/// `docs/specs/session-format-opencode.md`. Stamped with the turn's end (see
+/// `parse_session`), not the message creation time.
+fn assistant_record(message: &MessageRow<'_>, turn_end_ms: i64) -> Record {
     let tokens = message.data.get("tokens");
     let number = |key: &str| {
         tokens
@@ -522,7 +542,7 @@ fn assistant_record(message: &MessageRow<'_>) -> Record {
             .unwrap_or(0)
     };
     Record {
-        timestamp_ms: message.time_created_ms,
+        timestamp_ms: turn_end_ms,
         kind: RecordKind::Assistant {
             prompt_size: number("input") + cached("read") + cached("write"),
             out_tokens: number("output"),
@@ -988,6 +1008,41 @@ mod tests {
     fn a_missing_database_is_an_error() {
         let path = scratch_db("missing");
         assert!(read_database(&path).is_err());
+    }
+
+    #[test]
+    fn the_cost_record_closes_the_turn_never_opens_it() {
+        // Tools run after their message is created; stamping the cost row
+        // with the creation time would invert the stream and produce
+        // negative span durations.
+        let data = json!({"role": "assistant", "tokens": {"input": 5, "output": 1}});
+        let tool = json!({
+            "type": "tool", "tool": "read", "callID": "call_8",
+            "state": {"status": "completed",
+                      "input": {"filePath": "/tmp/example/a.md"},
+                      "time": {"start": 5_000, "end": 6_000}},
+        });
+        let messages = [MessageRow {
+            id: "msg_2",
+            session_id: "ses_1",
+            time_created_ms: 2_000,
+            parent_id: None,
+            data: &data,
+        }];
+        let parts = [PartRow {
+            id: "prt_1",
+            message_id: "msg_2",
+            session_id: "ses_1",
+            time_created_ms: 2_000,
+            data: &tool,
+        }];
+
+        let records = parse_session(&messages, &parts);
+
+        assert_eq!(records.len(), 2);
+        assert!(records[0].timestamp_ms <= records[1].timestamp_ms);
+        assert_eq!(records[1].timestamp_ms, 5_000);
+        assert!(matches!(records[1].kind, RecordKind::Assistant { .. }));
     }
 
     #[test]
