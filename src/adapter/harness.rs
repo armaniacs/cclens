@@ -65,6 +65,19 @@ impl Harness {
                 .join("opencode.db"),
         )
     }
+
+    /// The opencode config root: `$XDG_CONFIG_HOME/opencode`, else
+    /// `~/.config/opencode`. Same absolute-path rule as the database.
+    pub fn opencode_config_dir(config_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+        if let Some(dir) = config_home.filter(|dir| dir.is_absolute()) {
+            return Some(dir.join("opencode"));
+        }
+        Some(
+            home.filter(|dir| dir.is_absolute())?
+                .join(".config")
+                .join("opencode"),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -135,5 +148,25 @@ mod tests {
     #[test]
     fn opencode_db_without_a_home_has_no_answer() {
         assert_eq!(Harness::opencode_db_path(None, None), None);
+    }
+
+    #[test]
+    fn opencode_config_prefers_an_absolute_config_home() {
+        assert_eq!(
+            Harness::opencode_config_dir(
+                Some(Path::new("/tmp/example/config")),
+                Some(Path::new("/tmp/example/home"))
+            ),
+            Some(PathBuf::from("/tmp/example/config/opencode"))
+        );
+    }
+
+    #[test]
+    fn opencode_config_falls_back_to_home_dot_config() {
+        assert_eq!(
+            Harness::opencode_config_dir(None, Some(Path::new("/tmp/example/home"))),
+            Some(PathBuf::from("/tmp/example/home/.config/opencode"))
+        );
+        assert_eq!(Harness::opencode_config_dir(None, None), None);
     }
 }

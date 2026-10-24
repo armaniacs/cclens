@@ -14,6 +14,7 @@ use crate::adapter::transcript::{ToolError, WorkEvent};
 use crate::core::friction::classify_error;
 use crate::core::path::basename;
 use crate::core::span::{Record, RecordKind, Source};
+use crate::core::surface::{LoadMode, Scope, Surface};
 
 /// The model label when a message names none — honest, never a guess.
 const UNKNOWN_MODEL: &str = "unknown";
@@ -296,6 +297,161 @@ pub fn read_database(path: &Path) -> Result<Snapshot> {
     })
 }
 
+/// Build a `command` surface from one custom-command file. Commands run on
+/// demand; only the frontmatter `description` is startup-listed, so the load
+/// mode is `StartupDescription` — the same assumption as a skill body (see
+/// `docs/specs/config-format-opencode.md`).
+pub fn command_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
+    Surface {
+        kind: "command".to_string(),
+        id: id.to_string(),
+        scope: scope.clone(),
+        config_path: config_path.to_string(),
+        static_tokens: Some(crate::adapter::config::approx_tokens(content)),
+        startup_tokens: Some(description_tokens(content)),
+        load_mode: LoadMode::StartupDescription,
+    }
+}
+
+/// Build an `agent` surface from one custom-agent file. Like commands, only
+/// the description loads at startup.
+pub fn agent_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
+    Surface {
+        kind: "agent".to_string(),
+        id: id.to_string(),
+        scope: scope.clone(),
+        config_path: config_path.to_string(),
+        static_tokens: Some(crate::adapter::config::approx_tokens(content)),
+        startup_tokens: Some(description_tokens(content)),
+        load_mode: LoadMode::StartupDescription,
+    }
+}
+
+/// The startup weight of a description-listed surface: its frontmatter
+/// `description`, or zero when it declares none.
+fn description_tokens(content: &str) -> u64 {
+    frontmatter_description(content).map_or(0, |d| crate::adapter::config::approx_tokens(&d))
+}
+
+/// The YAML frontmatter block of a markdown file, without its `---` fences.
+/// The block ends at the first line that is *only* dashes.
+fn frontmatter(content: &str) -> Option<&str> {
+    let opened = content.trim_start().strip_prefix("---")?;
+    let body = &opened[opened.find('\n')? + 1..];
+    let mut end = 0;
+    for line in body.split_inclusive('\n') {
+        if line.trim() == "---" {
+            return Some(&body[..end]);
+        }
+        end += line.len();
+    }
+    None
+}
+
+/// The frontmatter `description`, folded with its indented continuation
+/// lines. Parsed defensively and opencode-side: a plain or quoted scalar, or
+/// a block scalar; a missing key yields `None`.
+fn frontmatter_description(content: &str) -> Option<String> {
+    let mut lines = frontmatter(content)?.lines();
+    let first = loop {
+        match lines.next()?.strip_prefix("description:") {
+            Some(value) => break value.trim(),
+            None => continue,
+        }
+    };
+    let block = first.starts_with('>') || first.starts_with('|');
+    let mut folded: Vec<&str> = Vec::new();
+    if !(first.is_empty() || block) {
+        folded.push(first);
+    }
+    folded.extend(
+        lines
+            .take_while(|line| line.trim().is_empty() || line.starts_with([' ', '\t']))
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty()),
+    );
+    if folded.is_empty() {
+        return None;
+    }
+    let value = folded.join(" ");
+    Some(unquote(&value).to_string())
+}
+
+/// Strip one layer of matching surrounding quotes, if present.
+fn unquote(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|v| v.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
+}
+
+/// Read every `*.md` command file in a directory into surfaces, keyed by file
+/// stem. A missing directory yields nothing.
+pub fn read_command_surfaces(dir: &Path, scope: &Scope) -> Vec<Surface> {
+    read_markdown_surfaces(dir, scope, command_surface)
+}
+
+/// Read every `*.md` agent file in a directory into surfaces, keyed by file
+/// stem. A missing directory yields nothing.
+pub fn read_agent_surfaces(dir: &Path, scope: &Scope) -> Vec<Surface> {
+    read_markdown_surfaces(dir, scope, agent_surface)
+}
+
+fn read_markdown_surfaces(
+    dir: &Path,
+    scope: &Scope,
+    build: fn(&str, &str, &str, &Scope) -> Surface,
+) -> Vec<Surface> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                let id = path.file_stem()?.to_str()?.to_string();
+                let content = std::fs::read_to_string(&path).ok()?;
+                Some(build(&id, &path.display().to_string(), &content, scope))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Read the global opencode config into surfaces: `command/` and `agent/`
+/// under the config dir. (No global `AGENTS.md` — whether opencode loads one
+/// is unverified; see `docs/specs/config-format-opencode.md`.)
+pub fn read_global_surfaces(config_dir: &Path) -> Vec<Surface> {
+    let scope = Scope::Global;
+    let mut surfaces = read_command_surfaces(&config_dir.join("command"), &scope);
+    surfaces.extend(read_agent_surfaces(&config_dir.join("agent"), &scope));
+    surfaces
+}
+
+/// Read one project's opencode config into surfaces: `.opencode/command/`,
+/// `.opencode/agent/`, and `AGENTS.md` with its `@import`s. `home` resolves
+/// a `~/` import.
+pub fn read_project_surfaces(root: &Path, project: &str, home: Option<&Path>) -> Vec<Surface> {
+    let scope = Scope::Project(project.to_string());
+    let opencode = root.join(".opencode");
+    let mut surfaces = read_command_surfaces(&opencode.join("command"), &scope);
+    surfaces.extend(read_agent_surfaces(&opencode.join("agent"), &scope));
+    let agents_md = root.join("AGENTS.md");
+    surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
+        &[(&agents_md, "AGENTS.md")],
+        &scope,
+        home,
+    ));
+    surfaces
+}
+
 /// A part's tool name, when it is a `tool` part.
 fn part_tool<'a>(part: &PartRow<'a>) -> Option<&'a str> {
     if part.data.get("type").and_then(Value::as_str) != Some("tool") {
@@ -409,6 +565,7 @@ mod tests {
     use super::*;
     use crate::core::friction::ErrorCategory;
     use crate::core::span::Source;
+    use crate::core::surface::{LoadMode, Scope};
     use serde_json::json;
 
     #[test]
@@ -831,5 +988,78 @@ mod tests {
     fn a_missing_database_is_an_error() {
         let path = scratch_db("missing");
         assert!(read_database(&path).is_err());
+    }
+
+    #[test]
+    fn a_command_pays_only_its_description_at_startup() {
+        let content = "---\ndescription: review the branch diff\n---\n$ARGUMENTS";
+        let surface = command_surface("review", "/cfg/command/review.md", content, &Scope::Global);
+
+        assert_eq!(surface.kind, "command");
+        assert_eq!(surface.id, "review");
+        assert_eq!(surface.load_mode, LoadMode::StartupDescription);
+        assert_eq!(
+            surface.static_tokens,
+            Some(crate::adapter::config::approx_tokens(content))
+        );
+        assert!(surface.startup_tokens.unwrap() < surface.static_tokens.unwrap());
+    }
+
+    #[test]
+    fn a_description_less_command_costs_nothing_at_startup() {
+        let surface = command_surface("bare", "/cfg/command/bare.md", "# body", &Scope::Global);
+        assert_eq!(surface.startup_tokens, Some(0));
+    }
+
+    #[test]
+    fn an_agent_pays_only_its_description_at_startup() {
+        let content = "---\ndescription: explores the codebase\n---\nlong body";
+        let surface = agent_surface("explore", "/cfg/agent/explore.md", content, &Scope::Global);
+
+        assert_eq!(surface.kind, "agent");
+        assert_eq!(surface.load_mode, LoadMode::StartupDescription);
+        assert_eq!(surface.startup_tokens, Some(6));
+    }
+
+    #[test]
+    fn a_missing_commands_dir_yields_nothing() {
+        let surfaces = read_command_surfaces(Path::new("/tmp/example/no-such-dir"), &Scope::Global);
+        assert!(surfaces.is_empty());
+    }
+
+    #[test]
+    fn read_project_surfaces_walks_the_opencode_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "cclens-test-opencode-project-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join(".opencode/command")).unwrap();
+        std::fs::write(
+            root.join(".opencode/command/review.md"),
+            "---\ndescription: review\n---\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".opencode/agent")).unwrap();
+        std::fs::write(
+            root.join(".opencode/agent/scout.md"),
+            "---\ndescription: scouts\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(root.join("AGENTS.md"), "project instructions").unwrap();
+
+        let surfaces = read_project_surfaces(&root, "demo", None);
+        std::fs::remove_dir_all(&root).ok();
+
+        let has = |kind: &str, id: &str| surfaces.iter().any(|s| s.kind == kind && s.id == id);
+        assert!(
+            surfaces
+                .iter()
+                .all(|s| s.scope == Scope::Project("demo".to_string()))
+        );
+        assert!(has("command", "review"));
+        assert!(has("agent", "scout"));
+        assert!(has("claude_md", "AGENTS.md"));
     }
 }

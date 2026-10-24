@@ -81,11 +81,14 @@ contract:
   fabricated.
 - **Permission denials count zero.** No runtime denial marker was found in
   the opencode format, and no heuristic stands in for one.
-- **The surface catalog is empty in v1** (`replace_surfaces(&[])`).
-  Config scanning is the next change (`config-format-opencode.md`, not yet
-  written). Until then `inventory`/`waste` report no rows and `doctor`
-  omits the pruning section — the usage views (`usage`, `failures`,
-  `stuck`, `overhead`, `sql`) are fully functional.
+- **The surface catalog covers commands, agents, and `AGENTS.md**. Global
+  `command/` and `agent/` come from the opencode config root; each known
+  project root contributes its `.opencode/` pair plus `AGENTS.md` (with
+  `@import`s). Skills, MCP servers, and permissions stay out until their
+  definition sites and usage joins are both observed
+  (`config-format-opencode.md`); live `Skill` usage meanwhile shows as
+  orphaned rows in `inventory`, which is the honest signal that a catalog
+  site is missing.
 - `meta.config_dir` is recorded empty: no config was scanned. (An empty
   value, not a missing key, so readers can distinguish "nothing scanned"
   from "unknown".)

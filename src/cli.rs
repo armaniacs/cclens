@@ -1947,23 +1947,46 @@ fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
         spans_total += spans.len();
     }
 
-    // No config catalog in v1 — usage joins against an empty set until the
-    // config adapter lands (`docs/specs/harness.md`).
-    store.replace_surfaces(&[])?;
+    // Catalog the installed config — global scope plus every known project
+    // root that still exists on disk — so usage joins against what is
+    // installed. opencode skills, MCP, and permissions stay out of v1 (see
+    // `docs/specs/config-format-opencode.md`); their live usage still shows
+    // as orphaned rows in `inventory`.
+    let config_dir = opencode_home()?;
+    let mut surfaces = opencode_mod::read_global_surfaces(&config_dir);
+    for (root, project) in store.session_roots()? {
+        if Path::new(&root).is_dir() {
+            surfaces.extend(opencode_mod::read_project_surfaces(
+                Path::new(&root),
+                &project,
+                home_dir().map(Path::new),
+            ));
+        }
+    }
+    let surface_count = surfaces.len();
+    store.replace_surfaces(&surfaces)?;
 
     store.record_analyzer_version()?;
     store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
     store.set_meta("projects_dir", &input.display().to_string())?;
-    store.set_meta("config_dir", "")?;
+    store.set_meta("config_dir", &config_dir.display().to_string())?;
     store.set_meta("harness", Harness::Opencode.label())?;
 
     Ok(AnalyzeStats {
         sessions,
         skipped,
         spans_total,
-        surface_count: 0,
+        surface_count,
         denials: 0,
     })
+}
+
+/// The opencode config root for this run: the environment read that
+/// `adapter::harness::opencode_config_dir` deliberately does not do.
+fn opencode_home() -> Result<PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    Harness::opencode_config_dir(config_home.as_deref(), home_dir().map(Path::new))
+        .context("set XDG_CONFIG_HOME or HOME")
 }
 
 /// The opencode database for this run: the environment read that
