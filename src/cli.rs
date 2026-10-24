@@ -12,6 +12,8 @@ use crate::adapter::config::{
     claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_mcp_server_surfaces,
     read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
+use crate::adapter::harness::Harness;
+use crate::adapter::opencode as opencode_mod;
 use crate::adapter::transcript::{
     count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
     parse_session, parse_subagent_sidecar, session_cwd, subagent_id_from_file_name,
@@ -42,6 +44,11 @@ use crate::store::{SessionMeta, Store};
              follow-up command."
 )]
 pub struct Cli {
+    /// Which agent harness to analyze. Global so every command resolves its
+    /// store and input roots through it; the default keeps every existing
+    /// invocation byte-identical in behavior. See `docs/specs/harness.md`.
+    #[arg(long, global = true)]
+    harness: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -228,22 +235,30 @@ enum Command {
 }
 
 pub fn run() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let harness = parse_harness(cli.harness.as_deref())?;
+    match cli.command {
         Command::Analyze {
             projects,
             format,
             db,
-        } => analyze(projects, parse_format(format.as_deref())?, &resolve_db(db)?),
+        } => analyze(
+            &harness,
+            projects,
+            parse_format(format.as_deref())?,
+            &resolve_db(db, &harness)?,
+        ),
         Command::Usage {
             by,
             format,
             frozen,
             db,
         } => usage(
+            &harness,
             by.as_deref(),
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Inventory {
             scope,
@@ -251,10 +266,11 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => inventory(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Waste {
             scope,
@@ -262,46 +278,59 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => waste(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
-        Command::Overhead { format, frozen, db } => {
-            overhead(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
-        }
-        Command::Prompts { format, frozen, db } => {
-            prompts(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
-        }
+        Command::Overhead { format, frozen, db } => overhead(
+            &harness,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db, &harness)?,
+        ),
+        Command::Prompts { format, frozen, db } => prompts(
+            &harness,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db, &harness)?,
+        ),
         Command::Failures {
             scope,
             format,
             frozen,
             db,
         } => failures(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
-        Command::Stuck { format, frozen, db } => {
-            stuck(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
-        }
+        Command::Stuck { format, frozen, db } => stuck(
+            &harness,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db, &harness)?,
+        ),
         Command::Doctor {
             scope,
             format,
             frozen,
             db,
         } => doctor(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Sql { query, format, db } => sql(
+            &harness,
             query.as_deref(),
             parse_format(format.as_deref())?,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Optimize {
             projects,
@@ -310,12 +339,23 @@ pub fn run() -> Result<()> {
             frozen,
             print,
         } => optimize(
+            &harness,
             projects,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
             &parse_scope(scope.as_deref())?,
             frozen,
             print,
         ),
+    }
+}
+
+/// Parse `--harness`. Absent means Claude Code — every pre-flag invocation
+/// keeps its behavior, which is what makes the flag upstream-mergeable.
+fn parse_harness(value: Option<&str>) -> Result<Harness> {
+    match value {
+        None => Ok(Harness::Claude),
+        Some(v) => Harness::parse(v)
+            .with_context(|| format!("unknown --harness '{v}' (claude | opencode)")),
     }
 }
 
@@ -338,6 +378,7 @@ fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
 /// removed as soon as the session ends. `--print` instead writes the full prompt
 /// (briefing inline) to stdout for piping / inspection.
 fn optimize(
+    harness: &Harness,
     projects: Option<PathBuf>,
     db: &Path,
     filter: &ScopeFilter,
@@ -345,7 +386,7 @@ fn optimize(
     print: bool,
 ) -> Result<()> {
     if !frozen {
-        let stats = run_analyze(projects, db)?;
+        let stats = run_analyze(harness, projects, db)?;
         eprintln!(
             "{}",
             Style::stderr().dim(&format!(
@@ -369,6 +410,14 @@ fn optimize(
             optimize_mod::compose_prompt(&findings, &db_display, filter)
         );
         return Ok(());
+    }
+
+    // Launching always starts a `claude` session, which is the wrong agent for
+    // any other harness — refuse instead of seeding it (`docs/specs/harness.md`).
+    if *harness != Harness::Claude {
+        anyhow::bail!(
+            "optimize can only launch a `claude` session in v1 — rerun with --print to inspect the briefing"
+        );
     }
 
     // Sensitive briefing → private temp file; only a data-free pointer on argv.
@@ -709,7 +758,7 @@ fn config_wedges(store: &Store) -> Result<ScopedWedges> {
 /// comes from the argument or, when absent, from stdin — so both
 /// `cclens sql '…'` and `echo '…' | cclens sql` work. The store is
 /// opened read-only so an ad-hoc query can never mutate the derived data.
-fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
+fn sql(harness: &Harness, query: Option<&str>, format: Format, db: &Path) -> Result<()> {
     let query = match query {
         Some(q) => q.to_string(),
         None => {
@@ -728,6 +777,9 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
 
     let store = Store::open_readonly(db)
         .with_context(|| format!("open store {} (run `analyze` first?)", db.display()))?;
+    // A store built by another harness is a wrong-harness read even here —
+    // `sql` cannot migrate or refresh, but it can still refuse loudly.
+    guard_harness(&store, harness, db)?;
     // `sql` never mutates the store, so it cannot auto-refresh — surface the
     // store's age instead so a stale read is at least visible. An old db whose
     // schema predates `meta` just skips the header.
@@ -756,11 +808,17 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
 /// split by the config layer that owns each fix — the global picture first,
 /// then each project's own findings ("optimize my global setup" and "optimize
 /// this project" are different tasks). `--scope` narrows to one layer.
-fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn doctor(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
     if format == Format::Markdown {
         anyhow::bail!("summary has no markdown form — use the default text or --format json");
     }
-    let store = open_for_read(db, frozen)?;
+    let store = open_for_read(harness, db, frozen)?;
     let f = collect_findings(&store)?;
 
     if format == Format::Json {
@@ -794,8 +852,9 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
     println!(
         "{}",
         style.heading(&format!(
-            "Claude Code usage health check — {session_count} sessions across \
-             {project_count} projects"
+            "{} usage health check — {session_count} sessions across \
+             {project_count} projects",
+            harness.display_name()
         ))
     );
 
@@ -938,9 +997,10 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                 style.bold(&fmt_tokens(f.floor))
             );
             println!(
-                "  {} comes from your own global config files; the other {} is Claude Code",
+                "  {} comes from your own global config files; the other {} is {}",
                 fmt_tokens(f.config_tokens),
-                fmt_tokens(residual)
+                fmt_tokens(residual),
+                harness.display_name()
             );
             println!(
                 "  {}",
@@ -1178,10 +1238,10 @@ fn shorten_to_tilde(path: &str, home: Option<&str>) -> String {
 /// stuck and kept retrying, as opposed to a hotspot's healthy spread-out edits.
 /// An episode is one session's edits to one path, so parallel work on a
 /// same-named file is never presented as one agent looping (`core::thrash`).
-fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn stuck(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
-    let store = open_for_read(db, frozen)?;
+    let store = open_for_read(harness, db, frozen)?;
     let episodes = detect_thrash(&store.file_edits()?, GAP_SECS, MIN_EDITS);
     if format == Format::Json {
         let episodes: Vec<serde_json::Value> = episodes
@@ -1247,7 +1307,13 @@ fn note(text: &str) {
 /// `--scope` routes by ownership (`core::scope`): `global` shows the failures
 /// no project owns, `project` each project's majority-owned failures, and
 /// `project:<slug>` everything that happened in that one project.
-fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn failures(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
     struct FrictionRow {
         project: Option<String>,
         category: String,
@@ -1256,7 +1322,7 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
         spread: Option<usize>,
     }
 
-    let store = open_for_read(db, frozen)?;
+    let store = open_for_read(harness, db, frozen)?;
     let cells = store.error_counts_by_project()?;
 
     let counts: Vec<FrictionRow> = match filter {
@@ -1390,8 +1456,8 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
 /// Show the mix of how the user steers the session, and what it suggests. Heavy
 /// steering points to room for more autonomy; frequent corrections point to
 /// clearer upfront specs. The classes are lexical heuristics (`core::prompt`).
-fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let counts = store.prompt_behavior_counts()?;
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
     if format == Format::Json {
@@ -1485,8 +1551,8 @@ fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
 /// leaves the residual — system prompt, built-in tools, and MCP tool schemas the
 /// catalog cannot weigh. The per-project floors let you infer an MCP server's
 /// real cost by comparing a project that enables it against one that does not.
-fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let floor = store.baseline_floor()?;
     let config = store.always_on_config_tokens()?;
     let residual = floor.map(|floor| (floor - config).max(0));
@@ -1586,8 +1652,8 @@ struct AnalyzeStats {
     denials: usize,
 }
 
-fn analyze(projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
-    let stats = run_analyze(projects, db)?;
+fn analyze(harness: &Harness, projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
+    let stats = run_analyze(harness, projects, db)?;
     let store = Store::open(db).context("open store")?;
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
     if format == Format::Json {
@@ -1617,7 +1683,33 @@ fn analyze(projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+/// Analyze raw input into the store, dispatching on the harness. The guard
+/// runs first: a store built by another harness refuses the write rather than
+/// mixing rows (`docs/specs/harness.md`).
+fn run_analyze(harness: &Harness, projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+    guard_harness(&Store::open(db).context("open store")?, harness, db)?;
+    match harness {
+        Harness::Claude => run_analyze_claude(projects, db),
+        Harness::Opencode => run_analyze_opencode(projects, db),
+    }
+}
+
+/// Refuse to analyze into a store another harness built. A store with no
+/// `harness` key predates the flag and is adopted (the Claude default), never
+/// refused.
+fn guard_harness(store: &Store, harness: &Harness, db: &Path) -> Result<()> {
+    if let Some(existing) = store.meta("harness")?
+        && existing != harness.label()
+    {
+        anyhow::bail!(
+            "the store at {} holds {existing} sessions — rerun with --harness {existing} (or pick another --db)",
+            db.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_analyze_claude(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     let projects = projects.map(Ok).unwrap_or_else(default_projects_dir)?;
     let mut store = Store::open(db).context("open store")?;
 
@@ -1719,6 +1811,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
     store.set_meta("projects_dir", &projects.display().to_string())?;
     store.set_meta("config_dir", &config_dir.display().to_string())?;
+    store.set_meta("harness", Harness::Claude.label())?;
 
     Ok(AnalyzeStats {
         sessions,
@@ -1729,12 +1822,164 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     })
 }
 
+/// Analyze an opencode database into the opencode store. The row-to-record
+/// mapping is `adapter::opencode`; this shell reads the database read-only,
+/// groups rows by session, and ingests each session idempotently. See
+/// `docs/specs/harness.md` for the v1 capability boundaries (no subagent
+/// runs, no prompts, no permission denials, empty surface catalog).
+fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+    let input = match input {
+        Some(path) => path,
+        None => default_opencode_db()?,
+    };
+    if !input.is_file() {
+        anyhow::bail!(
+            "no opencode database at {} — is opencode installed (or pass its path via --projects)?",
+            input.display()
+        );
+    }
+    let mut store = Store::open(db).context("open store")?;
+    let reuse_ingested = store.is_analyzer_current()?;
+
+    let snapshot = opencode_mod::read_database(&input)?;
+    let mut messages_by_session: std::collections::HashMap<
+        &str,
+        Vec<&opencode_mod::SnapshotMessage>,
+    > = std::collections::HashMap::new();
+    for message in &snapshot.messages {
+        messages_by_session
+            .entry(message.session_id.as_str())
+            .or_default()
+            .push(message);
+    }
+    let mut parts_by_message: std::collections::HashMap<&str, Vec<&opencode_mod::SnapshotPart>> =
+        std::collections::HashMap::new();
+    for part in &snapshot.parts {
+        parts_by_message
+            .entry(part.message_id.as_str())
+            .or_default()
+            .push(part);
+    }
+
+    let mut sessions = 0;
+    let mut skipped = 0;
+    let mut spans_total = 0;
+    for session in &snapshot.sessions {
+        let session_messages = messages_by_session
+            .get(session.id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        // Per-session fingerprint: the whole-file stat would re-ingest every
+        // session on each run (opencode appends constantly).
+        let fingerprint_key = format!("opencode:{}", session.id);
+        let message_count = session_messages.len() as i64;
+        if reuse_ingested
+            && store.is_ingested(&fingerprint_key, session.time_updated_ms, message_count)?
+        {
+            skipped += 1;
+            continue;
+        }
+        let message_rows: Vec<opencode_mod::MessageRow> = session_messages
+            .iter()
+            .map(|m| opencode_mod::MessageRow {
+                id: m.id.as_str(),
+                session_id: m.session_id.as_str(),
+                time_created_ms: m.time_created_ms,
+                parent_id: m.data.get("parentID").and_then(|v| v.as_str()),
+                data: &m.data,
+            })
+            .collect();
+        let mut part_rows: Vec<opencode_mod::PartRow> = session_messages
+            .iter()
+            .flat_map(|m| {
+                parts_by_message
+                    .get(m.id.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .map(|p| opencode_mod::PartRow {
+                id: p.id.as_str(),
+                message_id: p.message_id.as_str(),
+                session_id: p.session_id.as_str(),
+                time_created_ms: p.time_created_ms,
+                data: &p.data,
+            })
+            .collect();
+        part_rows.sort_by_key(|p| (p.time_created_ms, p.id));
+        let records = opencode_mod::parse_session(&message_rows, &part_rows);
+        let spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
+        let usage = extract_usage_events(&records);
+        let meta = SessionMeta {
+            id: session.id.clone(),
+            project: session.directory.clone(),
+            slug: session.slug.clone(),
+            root: session.directory.clone(),
+            source_path: fingerprint_key.clone(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            start: session_start(&records),
+        };
+        store.ingest_session(&meta, &spans, &usage)?;
+        // `raw_errors` owns the strings; `error_rows` borrows them.
+        let raw_errors = opencode_mod::extract_tool_errors(&part_rows);
+        let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
+            .iter()
+            .map(|e| {
+                (
+                    e.epoch_ms,
+                    e.category.label(),
+                    e.excerpt.as_str(),
+                    e.tool.as_str(),
+                    e.target.as_str(),
+                )
+            })
+            .collect();
+        store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
+        // `work` owns the strings; the rows borrow them.
+        let work = opencode_mod::extract_work_events(&part_rows);
+        let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
+            .iter()
+            .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
+            .collect();
+        store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
+        store.record_ingested_file(&fingerprint_key, session.time_updated_ms, message_count)?;
+        sessions += 1;
+        spans_total += spans.len();
+    }
+
+    // No config catalog in v1 — usage joins against an empty set until the
+    // config adapter lands (`docs/specs/harness.md`).
+    store.replace_surfaces(&[])?;
+
+    store.record_analyzer_version()?;
+    store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
+    store.set_meta("projects_dir", &input.display().to_string())?;
+    store.set_meta("config_dir", "")?;
+    store.set_meta("harness", Harness::Opencode.label())?;
+
+    Ok(AnalyzeStats {
+        sessions,
+        skipped,
+        spans_total,
+        surface_count: 0,
+        denials: 0,
+    })
+}
+
+/// The opencode database for this run: the environment read that
+/// `adapter::harness::opencode_db_path` deliberately does not do.
+fn default_opencode_db() -> Result<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    Harness::opencode_db_path(data_home.as_deref(), home_dir().map(Path::new))
+        .context("set XDG_DATA_HOME or HOME")
+}
+
 /// Open the store for a read command. Unless `--frozen`, the analysis is
 /// refreshed first — incremental, so an up-to-date store costs one stat per
 /// transcript — which makes stale reads structurally impossible (`optimize` has
 /// always worked this way; the views now compose the same stage). A one-line
 /// freshness header goes to **stderr** so piped stdout stays clean.
-fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
+fn open_for_read(harness: &Harness, db: &Path, frozen: bool) -> Result<Store> {
     if !frozen {
         // Re-analyze against the roots the store was built from (recorded in
         // meta); a fresh db falls back to the defaults.
@@ -1745,7 +1990,7 @@ fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
                 .map(PathBuf::from),
             false => None,
         };
-        let stats = run_analyze(projects, db)?;
+        let stats = run_analyze(harness, projects, db)?;
         eprintln!(
             "{}",
             Style::stderr().dim(&format!(
@@ -1923,8 +2168,14 @@ fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
     runs
 }
 
-fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn usage(
+    harness: &Harness,
+    by: Option<&str>,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
 
     if let Some(by) = by {
         let bucket = Bucket::parse(by)
@@ -2131,8 +2382,14 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 /// Join the catalogued surfaces against usage: each installed surface with its
 /// static cost and (for usage-measurable kinds) invocation count, unused ones
 /// flagged. Usage with no matching surface is shown as orphaned.
-fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn inventory(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let catalog: Vec<_> = store
         .effective_catalog()?
         .into_iter()
@@ -2289,8 +2546,14 @@ fn scope_cell(scope: &str, project: &str) -> String {
 /// at session start — real always-on tokens first, then MCP schemas, then
 /// declutter-only (skills/agents, whose body is on-demand). This is the "where
 /// and how to optimize" view, honest about which removals save context.
-fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn waste(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let catalog: Vec<_> = store
         .effective_catalog()?
         .into_iter()
@@ -2576,9 +2839,12 @@ fn claude_home() -> Result<PathBuf> {
 /// exactly the one thing this file cannot survive.
 ///
 /// Pure over its inputs (the environment is read by the caller) so the
-/// resolution is testable.
+/// resolution is testable. Each harness resolves to its own file name, so a
+/// store built by one harness is never reinterpreted as another's rows
+/// (`docs/specs/harness.md`).
 fn store_path(
     db: Option<PathBuf>,
+    harness: &Harness,
     state_home: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf> {
@@ -2597,13 +2863,18 @@ fn store_path(
             .join(".local")
             .join("state"),
     };
-    Ok(base.join("cclens").join("cclens.db"))
+    Ok(base.join("cclens").join(harness.db_file_name()))
 }
 
 /// `store_path` against the live environment.
-fn resolve_db(db: Option<PathBuf>) -> Result<PathBuf> {
+fn resolve_db(db: Option<PathBuf>, harness: &Harness) -> Result<PathBuf> {
     let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
-    store_path(db, state_home.as_deref(), home_dir().map(Path::new))
+    store_path(
+        db,
+        harness,
+        state_home.as_deref(),
+        home_dir().map(Path::new),
+    )
 }
 
 /// Column alignment for the table renderer.
@@ -3047,12 +3318,40 @@ mod tests {
     #[test]
     fn store_path_defaults_under_the_user_state_dir() {
         assert_eq!(
-            store_path(None, Some(Path::new("/tmp/example/state")), None).unwrap(),
+            store_path(
+                None,
+                &Harness::Claude,
+                Some(Path::new("/tmp/example/state")),
+                None
+            )
+            .unwrap(),
             PathBuf::from("/tmp/example/state/cclens/cclens.db")
         );
         assert_eq!(
-            store_path(None, None, Some(Path::new("/tmp/example/home"))).unwrap(),
+            store_path(
+                None,
+                &Harness::Claude,
+                None,
+                Some(Path::new("/tmp/example/home"))
+            )
+            .unwrap(),
             PathBuf::from("/tmp/example/home/.local/state/cclens/cclens.db")
+        );
+    }
+
+    #[test]
+    fn store_path_gives_each_harness_its_own_file() {
+        // One store per harness: an opencode run never lands in the Claude
+        // file, so an old store is never reinterpreted as another harness.
+        assert_eq!(
+            store_path(
+                None,
+                &Harness::Opencode,
+                Some(Path::new("/tmp/example/state")),
+                None
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/example/state/cclens/cclens-opencode.db")
         );
     }
 
@@ -3063,6 +3362,7 @@ mod tests {
         assert_eq!(
             store_path(
                 None,
+                &Harness::Claude,
                 Some(Path::new("relative/state")),
                 Some(Path::new("/tmp/example/home"))
             )
@@ -3073,14 +3373,22 @@ mod tests {
 
     #[test]
     fn store_path_without_a_home_is_an_error() {
-        assert!(store_path(None, None, None).is_err());
+        assert!(store_path(None, &Harness::Claude, None, None).is_err());
     }
 
     #[test]
     fn store_path_refuses_a_relative_home() {
         // The fallback root is held to the same bar as XDG_STATE_HOME: a
         // relative one would put the store back under the current directory.
-        assert!(store_path(None, None, Some(Path::new("relative/home"))).is_err());
+        assert!(
+            store_path(
+                None,
+                &Harness::Claude,
+                None,
+                Some(Path::new("relative/home"))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3089,11 +3397,30 @@ mod tests {
         assert_eq!(
             store_path(
                 Some(PathBuf::from("./cclens.db")),
+                &Harness::Opencode,
                 Some(Path::new("/tmp/example/state")),
                 Some(Path::new("/tmp/example/home"))
             )
             .unwrap(),
             PathBuf::from("./cclens.db")
         );
+    }
+
+    #[test]
+    fn parse_harness_defaults_to_claude_and_rejects_the_rest() {
+        assert_eq!(parse_harness(None).unwrap(), Harness::Claude);
+        assert_eq!(parse_harness(Some("opencode")).unwrap(), Harness::Opencode);
+        assert!(parse_harness(Some("auto")).is_err());
+    }
+
+    #[test]
+    fn guard_harness_adopts_a_store_without_a_key() {
+        // A store predating the flag carries no `harness` key and is adopted
+        // by the Claude default, never refused.
+        let mut store = Store::in_memory().unwrap();
+        assert!(guard_harness(&store, &Harness::Claude, Path::new("/tmp/example/x.db")).is_ok());
+        store.set_meta("harness", Harness::Claude.label()).unwrap();
+        assert!(guard_harness(&store, &Harness::Claude, Path::new("/tmp/example/x.db")).is_ok());
+        assert!(guard_harness(&store, &Harness::Opencode, Path::new("/tmp/example/x.db")).is_err());
     }
 }

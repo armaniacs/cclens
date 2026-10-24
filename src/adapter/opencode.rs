@@ -5,6 +5,9 @@
 //! Claude Code adapter it deserializes defensively: only the needed fields,
 //! unknown types ignored, missing optional ones tolerated.
 
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::adapter::transcript::{ToolError, WorkEvent};
@@ -169,6 +172,128 @@ fn part_time(part: &PartRow<'_>) -> i64 {
         .and_then(|t| t.get("start"))
         .and_then(Value::as_i64)
         .unwrap_or(part.time_created_ms)
+}
+
+/// A whole opencode database, read into owned rows. The CLI shell calls
+/// `read_database` once and lends the rows to the pure mapping above, so no
+/// SQL leaks past the adapter (`docs/specs/harness.md`).
+pub struct Snapshot {
+    pub sessions: Vec<SnapshotSession>,
+    pub messages: Vec<SnapshotMessage>,
+    pub parts: Vec<SnapshotPart>,
+}
+
+/// One `session` row: identity plus the fingerprint and project root.
+pub struct SnapshotSession {
+    pub id: String,
+    pub slug: String,
+    pub directory: String,
+    pub time_created_ms: i64,
+    pub time_updated_ms: i64,
+}
+
+/// One `message` row with its parsed JSON blob.
+pub struct SnapshotMessage {
+    pub id: String,
+    pub session_id: String,
+    pub time_created_ms: i64,
+    pub data: Value,
+}
+
+/// One `part` row with its parsed JSON blob.
+pub struct SnapshotPart {
+    pub id: String,
+    pub message_id: String,
+    pub session_id: String,
+    pub time_created_ms: i64,
+    pub data: Value,
+}
+
+/// Read an opencode database file into a snapshot. Opened read-only: analysis
+/// must never mutate the harness's own data. Rows whose `data` blob is not
+/// readable JSON are skipped, never fatal — the database stays queryable even
+/// when one row comes from a newer opencode.
+pub fn read_database(path: &Path) -> Result<Snapshot> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open opencode database {}", path.display()))?;
+
+    let mut sessions = Vec::new();
+    let mut statement = conn.prepare(
+        "SELECT id, slug, directory, time_created, time_updated
+         FROM session ORDER BY time_created",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        sessions.push(SnapshotSession {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            directory: row.get(2)?,
+            time_created_ms: row.get(3)?,
+            time_updated_ms: row.get(4)?,
+        });
+    }
+
+    // Copy the text out of SQLite before parsing it: the parsed `Value`s are
+    // owned by the snapshot, not borrowed from a row that is already gone.
+    let texts: Vec<(String, String, i64, String)> = conn
+        .prepare("SELECT id, session_id, time_created, data FROM message ORDER BY time_created")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut messages = Vec::new();
+    for (id, session_id, time_created_ms, data) in texts {
+        let Ok(data) = serde_json::from_str(&data) else {
+            continue;
+        };
+        messages.push(SnapshotMessage {
+            id,
+            session_id,
+            time_created_ms,
+            data,
+        });
+    }
+
+    let texts: Vec<(String, String, String, i64, String)> = conn
+        .prepare(
+            "SELECT id, message_id, session_id, time_created, data
+             FROM part ORDER BY time_created",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut parts = Vec::new();
+    for (id, message_id, session_id, time_created_ms, data) in texts {
+        let Ok(data) = serde_json::from_str(&data) else {
+            continue;
+        };
+        parts.push(SnapshotPart {
+            id,
+            message_id,
+            session_id,
+            time_created_ms,
+            data,
+        });
+    }
+
+    Ok(Snapshot {
+        sessions,
+        messages,
+        parts,
+    })
 }
 
 /// A part's tool name, when it is a `tool` part.
@@ -611,5 +736,100 @@ mod tests {
         assert_eq!(events[1].kind, "file_edit");
         assert_eq!(events[1].id, "cli.rs");
         assert_eq!(events[1].path.as_deref(), Some("/tmp/example/cli.rs"));
+    }
+
+    /// A scratch database path unique to the calling test.
+    fn scratch_db(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cclens-test-opencode-{name}-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&path).ok();
+        path
+    }
+
+    #[test]
+    fn reads_a_database_into_owned_rows() {
+        let path = scratch_db("read");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session
+               (id TEXT PRIMARY KEY, slug TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message
+               (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part
+               (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_1', 'example', '/tmp/example', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES
+             ('msg_1', 'ses_1', 1000, '{\"role\":\"user\"}'),
+             ('msg_2', 'ses_1', 2000, '{\"role\":\"assistant\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES
+             ('prt_1', 'msg_1', 'ses_1', 1000, '{\"type\":\"text\"}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshot = read_database(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].directory, "/tmp/example");
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.parts.len(), 1);
+    }
+
+    #[test]
+    fn unreadable_blobs_are_skipped_not_fatal() {
+        let path = scratch_db("blobs");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session
+               (id TEXT PRIMARY KEY, slug TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message
+               (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part
+               (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_1', 'example', '/tmp/example', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES ('msg_1', 'ses_1', 1000, 'not json')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshot = read_database(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(snapshot.messages.is_empty());
+    }
+
+    #[test]
+    fn a_missing_database_is_an_error() {
+        let path = scratch_db("missing");
+        assert!(read_database(&path).is_err());
     }
 }

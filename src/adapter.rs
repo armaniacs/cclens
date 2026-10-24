@@ -4,5 +4,6 @@
 //! `docs/specs/architecture.md` and `.claude/rules/format-isolation.md`.
 
 pub mod config;
+pub mod harness;
 pub mod opencode;
 pub mod transcript;
