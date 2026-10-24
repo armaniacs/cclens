@@ -149,11 +149,15 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         || has("has not been read")
         || has("has been modified")
         || has("file has not been read yet")
+        || has("could not find oldstring")
     {
         ErrorCategory::EditPrecondition
     } else if has("cancelled: parallel tool call")
         || has("request interrupted by user")
         || has("the user doesn't want to proceed")
+        || has("tool execution aborted")
+        || has("user rejected permission")
+        || has("task cancelled")
     {
         // User stop or a sibling failing in a parallel batch — not a code fault.
         ErrorCategory::Cancelled
@@ -162,19 +166,27 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         || has("use perl instead")
         || has("denied by")
         || has("blocked:")
+        || has("prevents you from using")
     {
         ErrorCategory::BlockedByHook
     } else if has("temporarily unavailable") || has("overloaded") {
         ErrorCategory::Transient
-    } else if has("no such tool available") {
+    } else if has("no such tool available") || has("not found. available skills") {
         ErrorCategory::ToolNotAvailable
-    } else if has("inputvalidationerror") || has("input validation error") {
+    } else if has("inputvalidationerror")
+        || has("input validation error")
+        || has("called with invalid arguments")
+    {
         ErrorCategory::InputValidation
     } else if has("mcp error") {
         ErrorCategory::McpError
     } else if has("command not found") || has("is not recognized") {
         ErrorCategory::CommandNotFound
-    } else if has("no such file") || has("does not exist") || has("cannot find the path") {
+    } else if has("no such file")
+        || has("does not exist")
+        || has("cannot find the path")
+        || has("file not found")
+    {
         ErrorCategory::PathNotFound
     } else if has("error[e") || has("mismatched types") || has("cannot borrow") {
         ErrorCategory::CompileError
@@ -245,6 +257,41 @@ mod tests {
         assert_eq!(
             classify_error("cat: /tmp/x: No such file or directory"),
             ErrorCategory::PathNotFound
+        );
+    }
+
+    #[test]
+    fn opencode_phrasings_reach_their_categories() {
+        // Observed opencode tool-error wordings; each is specific enough to
+        // carry no other meaning in either harness's error texts.
+        assert_eq!(
+            classify_error("File not found: /tmp/example/foo.md"),
+            ErrorCategory::PathNotFound
+        );
+        assert_eq!(
+            classify_error("Could not find oldString in the file. It must match exactly,"),
+            ErrorCategory::EditPrecondition
+        );
+        assert_eq!(
+            classify_error("Tool execution aborted"),
+            ErrorCategory::Cancelled
+        );
+        assert_eq!(
+            classify_error("The user rejected permission to use this specific tool call."),
+            ErrorCategory::Cancelled
+        );
+        assert_eq!(classify_error("Task cancelled"), ErrorCategory::Cancelled);
+        assert_eq!(
+            classify_error("The user has specified a rule which prevents you from using bash."),
+            ErrorCategory::BlockedByHook
+        );
+        assert_eq!(
+            classify_error("The edit tool was called with invalid arguments"),
+            ErrorCategory::InputValidation
+        );
+        assert_eq!(
+            classify_error("Skill \"nikki-make\" not found. Available skills: ..."),
+            ErrorCategory::ToolNotAvailable
         );
     }
 
