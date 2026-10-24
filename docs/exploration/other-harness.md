@@ -37,17 +37,19 @@
   - プロジェクト: カレントでは `.opencode/` / `opencode.json` を持つ repo は未確認。`AGENTS.md` は opencode も読む共有規約なので、既存の `claude_md` surface (symlink dedup 付き) を流用できる
   - MCP: `mcp` キー (opencode.json 内 or 別ファイル) を要確認。本環境の `opencode.json` トップレベルキーに `mcp` はなし
 
-### 2.2 kilocode (Roo-code 系) — VSCode globalStorage 配下。tokens が最大の欠落
+### 2.2 kilocode (Roo-code 系) — VSCode globalStorage 配下。トークン正本は `ui_messages.json`
 
 - セッション: `<VSCode globalStorage>/kilocode.kilo-code/tasks/<uuid>/`
-  - `api_conversation_history.json` — Anthropic 互換: `{role, content:[{type:text|tool_use|tool_result, id/name/input, tool_use_id/content}], ts, reasoning_details?}`。`tool_use.name=execute_command` 等。`tool_use_id` 連結で tool と target が取れる (Claude と同形なので流用しやすい)
-  - `ui_messages.json` — `{ts, type:say/ask, say:text/...}` の表示用ログ。人間ターンの区切り (span 終端条件) に使える
-  - `task_metadata.json` — `files_in_context[]` (read/edited の痕跡)。never-fires-rule の将来材料
-  - トークン量: `api_conversation_history.json` に `usage`/`tokens`/`cost` キーは 0 件 (実測)。`ui_messages` 側か別集計かの追加調査が必要。なければ `out_tokens/ctx_*` は NULL 運用になり、`usage`/`overhead` 系 view が harness 別に劣化表示になる
-- コンフィグ面:
-  - `settings/mcp_settings.json` (`{mcpServers:{}}` を確認)、`settings/custom_modes.yaml` (mode = 実質 agent/skill 定義)。グローバル skill dir (`~/.kilocode/skills.bak`?) は命名が不安定で要確認
+  - `api_conversation_history.json` — Anthropic 互換: `{role, content:[{type:text|tool_use|tool_result, id/name/input, tool_use_id/content}], ts, reasoning_details?}`。`tool_use.name=execute_command` 等。`tool_use_id` 連結で tool と target が取れる (Claude と同形なので流用しやすい)。**`usage`/`tokens`/`cost` キーは 0 件 (実測) — トークンはこちらにはない**
+  - `ui_messages.json` — `{ts, type:say/ask, say:text/...}` の表示用ログ。人間ターンの区切り (span 終端条件) に使える。**トークン正本はここ**: `say=api_req_started` の `text` が JSON で `{apiProtocol, tokensIn, tokensOut, cacheWrites, cacheReads, cost, usageMissing, inferenceProvider}` を運ぶ (実測 50 件中 49 件が `usageMissing=false` + cost あり)。ts 順に `assistant` 応答の直前に並ぶので、時刻順 join で per-request 行が作れる。model 名は入っていない (`inferenceProvider` のみ) ので代表 model は NULL 運用
+  - `task_metadata.json` — 実測のキーは `files_in_context[]` のみ (read/edited の痕跡)。never-fires-rule の将来材料
+  - task⇔session 対応: `sessions/<id>/session.json` の `taskSessionMap` (taskId → sessionId)
+  - project root: メッセージ内に `cwd` 系キーはなし。`ask=tool` の `text` JSON が `{tool, path, content: <absolute path>, isOutsideWorkspace}` を持つので、先頭の絶対パスの共通 prefix が root 推定の候補 (heuristic として明示)
+  - 承認シグナル: `ask=tool` がツール実行の承認点 (permission 相当)。失敗シグナルは `say=command_output` (exit code を含む出力) と `api_req_retry_delayed` が候補
+- コンフィグ面 (実測):
+  - グローバル: `~/.config/kilo/` — `command/*.md` (`devloop.md`, `graphify.md`, `review-diff.md` = slash-command 相当)、`skills/*/` (skill dir 群)、`kilo.json` (provider/model・agent 別 prompt)、`agent/` (この環境では空)。`settings/mcp_settings.json` (`{mcpServers:{}}`)、`settings/custom_modes.yaml` (この環境では空)
   - プロジェクト側規約 (`.kilocode/rules/` 等) はこの環境で未確認。要追加調査
-- パスの環境依存が強い (`~/Library/Application Support/Code/...` は VSCode/Cursor 設置依存) ので、adapter は `KILOCODE_STORAGE` 相当の環境変数 override を持たせたい
+- パスの環境依存が強い (`~/Library/Application Support/Code/...` は VSCode/Cursor 設置依存) ので、adapter は storage root の override (環境変数 or `--projects`) を持たせたい
 
 ### 2.3 DSH (DeepSeek Harness) — 自前イベントソーシング。zstd 付き JSONL
 
@@ -65,12 +67,16 @@
 - 共有可: `AGENTS.md`/`CLAUDE.md` の always-on surface (symlink dedup・`@import` 追跡ごと)、`Scope` (global/project)、`approx_tokens` の static cost、catalog×usage の join・wedges・reporting-honesty の考え方
 - harness 固有: セッションの「どこ・何形式」全文、skill 呼び出しの見分け方、subagent の連結 key、token フィールド名、config の置き場所、permission/denial の語彙。→ すべて adapter 配下に閉じ込める (format-isolation の拡張)
 
-## 3. 設計案 (このブランチでは実装しない。合意後に spec 差分として起こす)
+## 3. 設計案 (決定事項を反映。合意後に spec 差分として起こす)
 
-- `Harness`: `claude | opencode | kilocode | dsh` (+ `auto`)。`sessions` に `harness TEXT NOT NULL DEFAULT 'claude'` を additive migration で追加 (`store.rs` の宣言スキーマに列追加 = routine migration)。`surfaces` にも同列を持たせ、catalog×usage join を `(harness, kind, id)` + project shadowing に拡張。`ANALYZER_VERSION` を bump (既存行の再 ingest が必要になるため)
-- adapter 分割: `adapter::{claude,opencode,kilocode,dsh}` + 共通の domain model (`Record`, `Surface`, `SubagentRun`) は不変。既存 `adapter::{config,transcript}` の中身は `adapter::claude::{config,transcript}` へ移動し、旧パスは re-export のみ残す (境界バグ防止)
-- CLI: `analyze`/`doctor`/各 view/`optimize` に `--harness auto|claude|opencode|kilocode|dsh`。`auto` は存在する入力 root から検出。`--projects`/`--config` の既定値は harness 別テーブル化 (`~/.local/share/opencode/opencode.db`、`kilocode tasks dir`、`~/.dsh/sessions` 等)。`meta` に `harness_roots` を記録し、read 系の auto-refresh が同 root を再利用する
-- tokens 欠落の扱い (kilocode): `out_tokens/ctx_*` NULL を許し、`usage`/`overhead` は「この harness では利用不可」表示 + `sql` では生行を参照可能に。`sub_tokens_estimated` と同列の reporting-honesty ラベルを追加する (spec `cli.md` 追記)
+決定 (2026-10-25):
+1. **最初のターゲットは opencode** — SQLite 正本 + tokens ありで最初に価値を出せる
+2. **store は harness 共用にしない** — 上流マージを見据え、Claude の既定動作・既定 DB (`cclens.db`) に一切触れない。harness 別に独立した DB ファイルを持つ (`--db` 既定値を harness 別に切る。例: 同一 state dir 下で `cclens-opencode.db` 等。命名は spec 起案時に確定)。`meta` も DB ごとに独立。v1 で cross-harness 集計はしない
+3. **kilocode は追加調査を実施** — §2.2 に反映済み。トークン正本 (`api_req_started`) を確認したので NULL 運用案は撤回し、時刻順 join で per-request 行を作る方針に変更
+
+- adapter 分割: `adapter::{claude,opencode,kilocode,dsh}` + 共通の domain model (`Record`, `Surface`, `SubagentRun`) は不変。既存 `adapter::{config,transcript}` の中身は `adapter::claude::{config,transcript}` へ移動し、旧パスは re-export のみ残す (境界バグ防止)。DB 分離により `sessions.harness` 列は**不要** — 各 DB が単一 harness を持つ
+- CLI: `analyze`/`doctor`/各 view/`optimize` に `--harness claude|opencode|kilocode|dsh` (既定 `claude` = 現状動作そのまま。`auto` は設けない — 検出順の曖昧さを持ち込まない)。`--projects`/`--config`/`--db` の既定値は harness 別テーブル化 (`~/.local/share/opencode/opencode.db`、`kilocode tasks dir`、`~/.dsh/sessions` 等 + harness 別 DB 名)。`meta` に `harness` を記録し、異なる harness の DB を誤って読んだ場合は警告する
+- kilocode の model 欠落: 代表 model が取れない旨を reporting-honesty ラベルとして扱う (spec `cli.md` 追記。`sub_tokens_estimated` と同列)
 - `optimize`: 起動コマンドが harness 別 (`claude` / `opencode run` / ほか)。まず `--print` の briefing 統一、launch は Claude 互換のみ残して他は後回し
 
 ## 4. 難易度順と TDD の進め方 (案)
@@ -85,6 +91,6 @@
 ## 5. 追加調査が必要な項目 (open)
 
 - [ ] opencode: `permission` 実行時 denial シグナルの有無、`mcp` 定義場所、`.opencode/command|agent` 規約の確定
-- [ ] kilocode: トークン量の正本 (UI 側にあるか)、プロジェクト側 rules/modes 置き場所、storage root の決め方 (Cursor 併用時)
+- [x] kilocode: トークン量の正本 → `ui_messages.json` の `say=api_req_started` の `text` JSON (`tokensIn/tokensOut/cacheWrites/cacheReads/cost/usageMissing`)。残り open: プロジェクト側 rules/modes 置き場所、storage root の決め方 (Cursor 併用時)
 - [ ] DSH: `usage` を運ぶ event 型の特定、subagent spawn の見分け方、skill/agent/MCP 定義場所
-- [ ] 全般: `--harness` の UX (`auto` の検出順、`--db` を harness 別に分けるか共用か)
+- [ ] 全般: harness 別 DB の既定ファイル名の確定 (spec 起案時)
