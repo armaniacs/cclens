@@ -163,16 +163,13 @@ that renders nothing readable says so instead of leaving silence.
 `--verbose` inherits stdio for the raw streaming instead.
 
 Under kilocode the briefing composes from the store either way, so `--print`
-works. Launching runs `kilo run --format json --title 'cclens optimize'
---auto <prompt>` — kilo documents `kilo run [message..]` with `--format json`
-(raw JSON events) and `--title`, the same surface opencode's launch uses (kilo
-is an OpenCode fork). A bare `kilo <text>` positional is treated as a file to
-open (measured), not a prompt — the `run` subcommand is the message surface.
-`--auto` is the autonomous-use tradeoff: unlike opencode, kilo gates every
-tool call (read, bash, edit) and a headless run has no user to approve, so the
-advisor dies on its first read of the briefing without it. The headless
-instructions make the printed plan the final output, and the user reviews the
-plan before anything is applied.
+works. Launching opens an **interactive kilo session** on the pointer prompt —
+`kilo --prompt <prompt>`, the experience the claude launch gives: the user is
+present to approve the briefing read (kilo gates every tool call where
+opencode does not, so a headless run would need `--auto` instead), steer the
+investigation, and apply the fixes themselves. A bare `kilo <text>` positional
+is treated as a file to open (measured), not a prompt — `--prompt` is the
+TUI's message surface.
 
 ## Report copy names the harness
 

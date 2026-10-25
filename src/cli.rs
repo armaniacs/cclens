@@ -396,26 +396,14 @@ fn launch_command(
             optimize_mod::RunMode::Headless,
         )),
         // The `kilo` binary is the measured agent CLI (Homebrew), and kilo is
-        // an OpenCode fork documenting `kilo run [message..]` with `--format
-        // json` (raw JSON events) and `--title` — the same surface as
-        // opencode's launch, so the launch is the opencode shape under kilo's
-        // binary. `--auto` is kilo's autonomous-use flag: unlike opencode,
-        // kilo gates every tool call (read, bash, edit) and a headless run
-        // has no user to approve, so without it the advisor dies on its first
-        // read of the briefing; the headless instructions make the printed
-        // plan the final output.
-        Harness::Kilocode => Some((
-            "kilo",
-            &[
-                "run",
-                "--format",
-                "json",
-                "--title",
-                "cclens optimize",
-                "--auto",
-            ],
-            optimize_mod::RunMode::Headless,
-        )),
+        // an OpenCode fork whose TUI takes a prompt: `kilo [project] --prompt
+        // <prompt>` opens the interactive session on the pointer prompt — the
+        // experience the claude launch gives, with the user present to approve
+        // the briefing read and steer (kilo gates every tool call where
+        // opencode does not, so a headless run would need `--auto` instead).
+        // A bare `kilo <text>` positional is treated as a file to open
+        // (measured), not a prompt — `--prompt` is the TUI's message surface.
+        Harness::Kilocode => Some(("kilo", &["--prompt"], optimize_mod::RunMode::Interactive)),
     }
 }
 ///
@@ -3895,15 +3883,8 @@ mod tests {
             launch_command(&Harness::Kilocode),
             Some((
                 "kilo",
-                &[
-                    "run",
-                    "--format",
-                    "json",
-                    "--title",
-                    "cclens optimize",
-                    "--auto"
-                ] as &[&str],
-                optimize_mod::RunMode::Headless
+                &["--prompt"] as &[&str],
+                optimize_mod::RunMode::Interactive
             ))
         );
     }
