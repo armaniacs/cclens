@@ -314,11 +314,20 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter, copy: &HarnessCopy) -
         if f.floor > 0 {
             let residual = (f.floor - f.config_tokens).max(0);
             out.push_str("\n## Always-on context per session\n");
-            out.push_str(&format!(
-                "~{} tokens — your global config {}; the remaining {} is system + tools + MCP \
-                 (not trimmable from files).\n",
-                f.floor, f.config_tokens, residual
-            ));
+            if residual > 0 {
+                out.push_str(&format!(
+                    "~{} tokens — your global config {}; the remaining {} is the harness \
+                     (system + tools + MCP) plus each project's own config (AGENTS.md, skill \
+                     descriptions).\n",
+                    f.floor, f.config_tokens, residual
+                ));
+            } else {
+                out.push_str(&format!(
+                    "~{} tokens — your global config {} accounts for ~all of it; nothing is \
+                     left over to attribute to the harness itself.\n",
+                    f.floor, f.config_tokens
+                ));
+            }
         }
 
         if !f.friction_global.is_empty() {

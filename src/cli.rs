@@ -122,7 +122,7 @@ enum Command {
         db: Option<PathBuf>,
     },
     /// What every session pays in context before any work starts, and how
-    /// much of that comes from your own config files vs Claude Code itself.
+    /// much of that comes from your own config files vs the harness itself.
     Overhead {
         /// Output format: table | markdown.
         #[arg(long)]
@@ -1182,16 +1182,30 @@ fn doctor(
                 "  Every session starts with ~{} tokens of context before any work:",
                 style.bold(&fmt_tokens(f.floor))
             );
-            println!(
-                "  {} comes from your own global config files; the other {} is {}",
-                fmt_tokens(f.config_tokens),
-                fmt_tokens(residual),
-                harness.display_name()
-            );
-            println!(
-                "  {}",
-                style.dim("itself (system prompt, built-in tools, MCP schemas) — not trimmable from files.")
-            );
+            if residual > 0 {
+                println!(
+                    "  {} comes from your own global config files; the other {} is {}",
+                    fmt_tokens(f.config_tokens),
+                    fmt_tokens(residual),
+                    harness.display_name()
+                );
+                println!(
+                    "  {}",
+                    style.dim(
+                        "itself (system prompt, built-in tools, MCP schemas) plus each \
+                         project's own config (AGENTS.md, skill descriptions) — `cclens \
+                         overhead` splits it per project."
+                    )
+                );
+            } else {
+                // The global config estimate already covers the observed floor —
+                // attributing a "0" to the harness would read as a claim.
+                println!(
+                    "  ~all of it is accounted for by your own config files (skill \
+                     descriptions, AGENTS.md) — nothing is left over to attribute; \
+                     `cclens overhead` splits it per project."
+                );
+            }
         }
         println!(
             "  Output written so far: {} tokens by skills on the main thread, {} by {} subagent runs.",
@@ -1674,7 +1688,17 @@ fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result
         return emit_json(&serde_json::json!({ "total": total, "behaviors": behaviors }));
     }
     if total == 0 {
-        println!("no prompts found — run `cclens analyze` first");
+        // An analyzed store with sessions but no prompts means this harness
+        // harvests no prompt signal (opencode v1 does not) — telling the user
+        // to run `analyze` again would send them in a circle.
+        let (sessions, _) = store.session_stats()?;
+        if sessions > 0 {
+            println!(
+                "no prompts harvested for this harness — the store holds {sessions} analyzed session(s)"
+            );
+        } else {
+            println!("no prompts found — run `cclens analyze` first");
+        }
         return Ok(());
     }
 
