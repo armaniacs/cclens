@@ -5,7 +5,9 @@
 //! Claude Code adapter it deserializes defensively: only the needed fields,
 //! unknown types ignored, missing optional ones tolerated.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -445,23 +447,65 @@ fn read_markdown_surfaces(
 }
 
 /// Read the global opencode config into surfaces: `command/` and `agent/`
-/// under the config dir. (No global `AGENTS.md` — whether opencode loads one
-/// is unverified; see `docs/specs/config-format-opencode.md`.)
-pub fn read_global_surfaces(config_dir: &Path) -> Vec<Surface> {
+/// under the config dir, plus the three global skills sites the docs name
+/// (opencode-native first, then the compatible homes opencode also loads).
+/// (No global `AGENTS.md` — whether opencode loads one is unverified; see
+/// `docs/specs/config-format-opencode.md`.) `seen` carries the canonical
+/// definition paths already catalogued, so the project pass skips the same
+/// files reached through a project symlink.
+pub fn read_global_surfaces(
+    config_dir: &Path,
+    home: Option<&Path>,
+    seen: &mut HashSet<PathBuf>,
+) -> Vec<Surface> {
     let scope = Scope::Global;
     let mut surfaces = read_command_surfaces(&config_dir.join("command"), &scope);
     surfaces.extend(read_agent_surfaces(&config_dir.join("agent"), &scope));
+    add_skill_site(&config_dir.join("skills"), &scope, seen, &mut surfaces);
+    if let Some(home) = home {
+        add_skill_site(
+            &home.join(".claude").join("skills"),
+            &scope,
+            seen,
+            &mut surfaces,
+        );
+        add_skill_site(
+            &home.join(".agents").join("skills"),
+            &scope,
+            seen,
+            &mut surfaces,
+        );
+    }
     surfaces
 }
 
 /// Read one project's opencode config into surfaces: `.opencode/command/`,
-/// `.opencode/agent/`, and `AGENTS.md` with its `@import`s. `home` resolves
-/// a `~/` import.
-pub fn read_project_surfaces(root: &Path, project: &str, home: Option<&Path>) -> Vec<Surface> {
+/// `.opencode/agent/`, the three skills sites under the root, and `AGENTS.md`
+/// with its `@import`s. `home` resolves a `~/` import; `seen` skips skill
+/// definitions already catalogued from the global sites.
+pub fn read_project_surfaces(
+    root: &Path,
+    project: &str,
+    home: Option<&Path>,
+    seen: &mut HashSet<PathBuf>,
+) -> Vec<Surface> {
     let scope = Scope::Project(project.to_string());
     let opencode = root.join(".opencode");
     let mut surfaces = read_command_surfaces(&opencode.join("command"), &scope);
     surfaces.extend(read_agent_surfaces(&opencode.join("agent"), &scope));
+    add_skill_site(&opencode.join("skills"), &scope, seen, &mut surfaces);
+    add_skill_site(
+        &root.join(".claude").join("skills"),
+        &scope,
+        seen,
+        &mut surfaces,
+    );
+    add_skill_site(
+        &root.join(".agents").join("skills"),
+        &scope,
+        seen,
+        &mut surfaces,
+    );
     let agents_md = root.join("AGENTS.md");
     surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
         &[(&agents_md, "AGENTS.md")],
@@ -469,6 +513,25 @@ pub fn read_project_surfaces(root: &Path, project: &str, home: Option<&Path>) ->
         home,
     ));
     surfaces
+}
+
+/// Add one skills site's `skills/*/SKILL.md` surfaces, deduped by canonical
+/// path: the six documented sites may reach one shared directory through
+/// symlinks (`.opencode/skills -> ../.agents/skills` is the observed shape),
+/// and one definition must count once no matter which site reaches it.
+fn add_skill_site(
+    site: &Path,
+    scope: &Scope,
+    seen: &mut HashSet<PathBuf>,
+    surfaces: &mut Vec<Surface>,
+) {
+    for surface in crate::adapter::config::read_skill_surfaces(site, scope) {
+        let key = fs::canonicalize(&surface.config_path)
+            .unwrap_or_else(|_| PathBuf::from(&surface.config_path));
+        if seen.insert(key) {
+            surfaces.push(surface);
+        }
+    }
 }
 
 /// A part's tool name, when it is a `tool` part.
@@ -1104,7 +1167,8 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("AGENTS.md"), "project instructions").unwrap();
 
-        let surfaces = read_project_surfaces(&root, "demo", None);
+        let mut seen = HashSet::new();
+        let surfaces = read_project_surfaces(&root, "demo", None, &mut seen);
         std::fs::remove_dir_all(&root).ok();
 
         let has = |kind: &str, id: &str| surfaces.iter().any(|s| s.kind == kind && s.id == id);
@@ -1116,6 +1180,53 @@ mod tests {
         assert!(has("command", "review"));
         assert!(has("agent", "scout"));
         assert!(has("claude_md", "AGENTS.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_sites_dedup_across_a_symlink() {
+        // The observed shape: one shared skills directory, reached through a
+        // project symlink. One definition must count once — the project row
+        // would shadow the global one and read it as unused.
+        let root = std::env::temp_dir().join(format!(
+            "cclens-dedup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("shared/skills/nikki-make")).unwrap();
+        std::fs::write(
+            root.join("shared/skills/nikki-make/SKILL.md"),
+            "---\nname: nikki-make\ndescription: make a nikki\n---\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("project/.opencode")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("shared/skills"),
+            root.join("project/.opencode/skills"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("home/.agents")).unwrap();
+        std::os::unix::fs::symlink(root.join("shared/skills"), root.join("home/.agents/skills"))
+            .unwrap();
+
+        let mut seen = HashSet::new();
+        let mut surfaces =
+            read_global_surfaces(&root.join("cfg"), Some(&root.join("home")), &mut seen);
+        surfaces.extend(read_project_surfaces(
+            &root.join("project"),
+            "demo",
+            Some(&root.join("home")),
+            &mut seen,
+        ));
+        std::fs::remove_dir_all(&root).ok();
+
+        let skills: Vec<_> = surfaces.iter().filter(|s| s.kind == "skill").collect();
+        assert_eq!(skills.len(), 1, "{skills:?}");
+        assert_eq!(skills[0].id, "nikki-make");
+        assert_eq!(skills[0].scope, Scope::Global);
     }
 }
 

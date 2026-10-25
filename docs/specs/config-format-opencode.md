@@ -81,12 +81,16 @@ loads would invent always-on cost.
 
 ## Deliberately out of v1
 
-- **Skills.** `tool=skill` invocations join a `skill` surface, but no skill
-  definition site was verified (no global `skills/` dir here, no documented
-  project path confirmed against a live tree). Cataloguing an invented path
-  would either miss real files or weigh decorative ones — so v1 catalogs no
-  `skill` surfaces, and live `Skill` usage surfaces as orphaned usage in
-  `inventory`, which is the honest signal that a catalog site is missing.
+- **Skills — catalogued from the six documented sites** (`docs/skills/`):
+  opencode-native (`.opencode/skills/`, `~/.config/opencode/skills/`) first,
+  then the compatible homes opencode also loads (`.claude/skills/`,
+  `.agents/skills/`, and their global forms). Sites may reach one shared
+  directory through symlinks (`.opencode/skills -> ../.agents/skills` is the
+  observed shape), so surfaces dedup by **canonical path** — one row per
+  actual definition, no matter how many sites reach it. Deduping by name
+  instead would mark the shared definition unused at one scope (a wedge the
+  catalog manufactured); deduping by path keeps one honest row joined by
+  every `tool=skill` event.
 - **MCP servers.** No MCP definition was present (`opencode.json` carries no
   `mcp` key here), and no MCP-namespaced tool appeared in the usage sample,
   so the server↔tool join cannot be pinned down. Skipped until both halves

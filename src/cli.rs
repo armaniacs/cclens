@@ -2158,17 +2158,22 @@ fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
 
     // Catalog the installed config — global scope plus every known project
     // root that still exists on disk — so usage joins against what is
-    // installed. opencode skills, MCP, and permissions stay out of v1 (see
-    // `docs/specs/config-format-opencode.md`); their live usage still shows
-    // as orphaned rows in `inventory`.
+    // installed. Skills join from the six documented sites (deduped by
+    // canonical path, since sites may be symlinks to one shared directory);
+    // MCP and permissions stay out of v1 (see
+    // `docs/specs/config-format-opencode.md`), so their live usage still
+    // shows as orphaned rows in `inventory`.
     let config_dir = opencode_home()?;
-    let mut surfaces = opencode_mod::read_global_surfaces(&config_dir);
+    let home = home_dir().map(Path::new);
+    let mut seen = std::collections::HashSet::new();
+    let mut surfaces = opencode_mod::read_global_surfaces(&config_dir, home, &mut seen);
     for (root, project) in store.session_roots()? {
         if Path::new(&root).is_dir() {
             surfaces.extend(opencode_mod::read_project_surfaces(
                 Path::new(&root),
                 &project,
-                home_dir().map(Path::new),
+                home,
+                &mut seen,
             ));
         }
     }
