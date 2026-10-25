@@ -1128,47 +1128,66 @@ mod tests {
 pub enum RunEvent {
     /// Agent-visible text: the narration lines and the final plan.
     Text(String),
-    /// A compact progress marker for a tool call (`bash`, `read`, …).
+    /// A compact one-line progress marker — a tool name (`read`, `shell`) or
+    /// a part type (`step-start`) for events with no agent text.
     Progress(String),
-    /// An event with no agent-visible text (steps, reasoning, unknown shapes).
+    /// A line with nothing to show (not JSON, no type anywhere).
     Silent,
 }
 
-/// Render one `--format json` line. Text parts surface as `Text`, tool parts
-/// as a one-line `Progress` marker, everything else stays `Silent` — so a
-/// headless run streams the plan without the raw tool dumps.
+/// Render one `--format json` line. Text parts surface as `Text`; every other
+/// typed part surfaces as a one-line `Progress` marker — so a headless run
+/// streams the plan and never sits silent while the advisor works. The part
+/// usually sits **nested** under `part` inside an event envelope whose own
+/// `type` names the event (`tool_use`, `step_start`), so the nested part is
+/// what gets rendered, with the top level as the fallback.
 pub fn render_run_line(line: &str) -> RunEvent {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return RunEvent::Silent;
     };
-    // The part may sit at the top level or one level down (`part`, `parts[0]`).
-    for candidate in [
-        Some(&v),
-        v.get("part"),
-        v.get("parts").and_then(|p| p.get(0)),
-    ] {
-        let Some(part) = candidate else { continue };
-        let Some(kind) = part.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        return match kind {
-            "text" => match part.get("text").and_then(Value::as_str) {
-                Some(text) if !text.trim().is_empty() => RunEvent::Text(text.to_string()),
-                _ => RunEvent::Silent,
-            },
-            "tool" => match part
-                .get("tool")
-                .or_else(|| part.get("toolName"))
-                .or_else(|| part.get("name"))
-                .and_then(Value::as_str)
-            {
-                Some(tool) if !tool.is_empty() => RunEvent::Progress(tool.to_string()),
-                _ => RunEvent::Silent,
-            },
-            _ => RunEvent::Silent,
-        };
+    render_run_value(&v)
+}
+
+fn render_run_value(v: &Value) -> RunEvent {
+    match v {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| match render_run_value(item) {
+                RunEvent::Silent => None,
+                event => Some(event),
+            })
+            .unwrap_or(RunEvent::Silent),
+        Value::Object(_) => {
+            let candidates = [
+                v.get("part"),
+                v.get("parts").and_then(|p| p.get(0)),
+                Some(v),
+            ];
+            for candidate in candidates.into_iter().flatten() {
+                let Some(kind) = candidate.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                return match kind {
+                    "text" => match candidate.get("text").and_then(Value::as_str) {
+                        Some(text) if !text.trim().is_empty() => RunEvent::Text(text.to_string()),
+                        _ => RunEvent::Silent,
+                    },
+                    "tool" => match candidate
+                        .get("tool")
+                        .or_else(|| candidate.get("toolName"))
+                        .or_else(|| candidate.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(tool) if !tool.is_empty() => RunEvent::Progress(tool.to_string()),
+                        _ => RunEvent::Progress("tool".to_string()),
+                    },
+                    other => RunEvent::Progress(other.to_string()),
+                };
+            }
+            RunEvent::Silent
+        }
+        _ => RunEvent::Silent,
     }
-    RunEvent::Silent
 }
 
 #[cfg(test)]
@@ -1194,6 +1213,39 @@ mod run_event_tests {
     }
 
     #[test]
+    fn an_event_envelope_renders_the_nested_part() {
+        // The real `--format json` shape: an envelope naming the event kind
+        // (snake_case) wrapping the part (hyphenated types) under `part`.
+        let tool = r#"{"type":"tool_use","timestamp":1792904532992,"sessionID":"ses_demo","part":{"partID":"prt_demo","type":"tool","tool":"read","state":{"status":"completed"}}}"#;
+        assert_eq!(
+            render_run_line(tool),
+            RunEvent::Progress("read".to_string())
+        );
+        let text = r#"{"type":"text","timestamp":1792904882135,"sessionID":"ses_demo","part":{"id":"prt_demo","type":"text","text":"The plan covers three projects"}}"#;
+        assert_eq!(
+            render_run_line(text),
+            RunEvent::Text("The plan covers three projects".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_envelope_renders_the_nested_type() {
+        // A typed part with no agent text still marks progress — a headless
+        // run never sits silent while the advisor works.
+        let step =
+            r#"{"type":"step_start","timestamp":1,"part":{"type":"step-start","snapshot":"abc"}}"#;
+        assert_eq!(
+            render_run_line(step),
+            RunEvent::Progress("step-start".to_string())
+        );
+        let bare = r#"{"type":"tool","state":{"status":"pending"}}"#;
+        assert_eq!(
+            render_run_line(bare),
+            RunEvent::Progress("tool".to_string())
+        );
+    }
+
+    #[test]
     fn a_tool_part_renders_a_progress_marker() {
         let line = r#"{"type":"tool","tool":"bash","state":{"status":"running"}}"#;
         assert_eq!(
@@ -1203,18 +1255,9 @@ mod run_event_tests {
     }
 
     #[test]
-    fn a_tool_part_without_a_name_stays_silent() {
-        let line = r#"{"type":"tool","state":{"status":"pending"}}"#;
-        assert_eq!(render_run_line(line), RunEvent::Silent);
-    }
-
-    #[test]
-    fn step_reasoning_and_unknown_parts_stay_silent() {
+    fn untyped_and_unparseable_lines_stay_silent() {
         for line in [
-            r#"{"type":"step-start"}"#,
-            r#"{"type":"step-finish","tokens":1}"#,
-            r#"{"type":"reasoning","text":"thinking"}"#,
-            r#"{"type":"file","mime":"text/plain"}"#,
+            r#"{"timestamp":1,"sessionID":"ses_demo"}"#,
             "not json at all",
             "",
         ] {
