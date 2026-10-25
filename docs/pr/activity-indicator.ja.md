@@ -52,9 +52,9 @@
 ## 検証方法
 
 - ユニットテストがスピナーフレームの回転、アクティビティラベルの対応、ステータス行の
-  形式、共有状態の詳細をカバーします。
+  形式をカバーします。
 - ゲート全体が通ります。`cargo fmt --check`、`cargo clippy --all-targets
-  --all-features -- -D warnings`、`cargo test` — **304 テスト**。
+  --all-features -- -D warnings`、`cargo test` — **299 テスト**。
 - 実際の opencode ストア（91 セッション）で実行しました。ターミナル上ではステータス行
   がインプレースで書き換わり、stderr をパイプすると改行拍にフォールバックし、
   `| pbcopy` にはナレーションと計画だけが入ります。

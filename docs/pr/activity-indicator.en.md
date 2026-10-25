@@ -57,10 +57,10 @@ Code's activity spinner.
 
 ## How it is verified
 
-- Unit tests cover the spinner frame cycling, the activity-label mapping, the
-  status-line format, and the symlink-level details of the shared state.
+- Unit tests cover the spinner frame cycling, the activity-label mapping, and
+  the status-line format.
 - The full gate passes: `cargo fmt --check`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, and `cargo test` — **304 tests**.
+  --all-features -- -D warnings`, and `cargo test` — **299 tests**.
 - Exercised against a real opencode store (91 sessions): the status line
   rewrites in place on a terminal, falls back to newline beats when stderr is
   piped, and `| pbcopy` receives only the narration and the plan.
