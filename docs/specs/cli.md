@@ -248,7 +248,10 @@ size, verifies before recommending removal (an "unused" skill may be invoked by
 subagents) by inspecting rather than asking, and pauses for exactly one thing —
 approval of the concrete fix-plan before any file is edited. This "drive to a
 plan, gate only on applying it" shape is the design; if it changes, update
-`INSTRUCTIONS` in `core::optimize` and this paragraph together.
+`instructions` in `core::optimize` and this paragraph together.
+`instructions` renders from the harness copy (`HarnessCopy`), not a constant,
+so the advisor identity, config locations, and raw-input pointers name the
+harness whose rows the briefing renders.
 
 Crucially the briefing is the **complete** analysis, not a headline — every
 project's friction breakdown, the full Bash/hotspot/thrash detail, and the actual
@@ -287,5 +290,5 @@ to stdout for piping / inspection, where the user has opted into seeing it.
 
 The split mirrors the rest of the tool: prompt composition is a pure transform
 (`core::optimize` — `render_briefing` for the Markdown report with empty sections
-omitted and long lists capped, `INSTRUCTIONS` for the role, `launch_prompt` for
+omitted and long lists capped, `instructions` for the role, `launch_prompt` for
 the argv pointer), and only the temp-file write and process launch are I/O.

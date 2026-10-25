@@ -92,38 +92,52 @@ impl ErrorCategory {
         )
     }
 
-    /// What recurring instances of this category suggest fixing.
-    pub fn suggestion(self) -> &'static str {
+    /// What recurring instances of this category suggest fixing. The
+    /// instruction file varies by harness (`CLAUDE.md` vs `AGENTS.md`), so it
+    /// arrives as a parameter rather than living in the shared vocabulary.
+    pub fn suggestion(self, instruction_file: &str) -> String {
         match self {
             ErrorCategory::EditPrecondition => {
-                "re-read before editing; a stale or fuzzy match keeps failing"
+                "re-read before editing; a stale or fuzzy match keeps failing".to_string()
             }
             ErrorCategory::BlockedByHook => {
                 "a habit keeps hitting a rule/hook — the rule blocks but doesn't prevent it"
+                    .to_string()
             }
-            ErrorCategory::CommandNotFound => "a missing tool; install it or note its absence",
+            ErrorCategory::CommandNotFound => {
+                "a missing tool; install it or note its absence".to_string()
+            }
             ErrorCategory::PathNotFound => {
-                "paths are being guessed wrong — a file map in CLAUDE.md would help"
+                format!(
+                    "paths are being guessed wrong — a file map in {instruction_file} would help"
+                )
             }
             ErrorCategory::CompileError => {
-                "expected during iteration; spikes may signal a hard spot"
+                "expected during iteration; spikes may signal a hard spot".to_string()
             }
-            ErrorCategory::TestFailure => "flaky or hard tests; worth stabilising the worst",
-            ErrorCategory::Timeout => "slow commands; raise timeout or split the work",
+            ErrorCategory::TestFailure => {
+                "flaky or hard tests; worth stabilising the worst".to_string()
+            }
+            ErrorCategory::Timeout => "slow commands; raise timeout or split the work".to_string(),
             ErrorCategory::ToolNotAvailable => {
-                "a tool was called by a name that doesn't exist — wrong/deferred tool"
+                "a tool was called by a name that doesn't exist — wrong/deferred tool".to_string()
             }
-            ErrorCategory::InputValidation => "tool called with invalid arguments",
-            ErrorCategory::McpError => "an MCP server erroring (auth/validation/upstream)",
+            ErrorCategory::InputValidation => "tool called with invalid arguments".to_string(),
+            ErrorCategory::McpError => {
+                "an MCP server erroring (auth/validation/upstream)".to_string()
+            }
             ErrorCategory::Cancelled => {
                 "not a code failure: a user stop or parallel-cascade cancel; frequent stops \
                  may mean the work went off-track"
+                    .to_string()
             }
             ErrorCategory::Transient => {
-                "transient infra (e.g. model unavailable) — not yours to fix"
+                "transient infra (e.g. model unavailable) — not yours to fix".to_string()
             }
-            ErrorCategory::CommandFailed => "a command exited non-zero; cause unclassified",
-            ErrorCategory::Other => "uncategorised — inspect the raw errors",
+            ErrorCategory::CommandFailed => {
+                "a command exited non-zero; cause unclassified".to_string()
+            }
+            ErrorCategory::Other => "uncategorised — inspect the raw errors".to_string(),
         }
     }
 }
@@ -292,6 +306,20 @@ mod tests {
         assert_eq!(
             classify_error("Skill \"nikki-make\" not found. Available skills: ..."),
             ErrorCategory::ToolNotAvailable
+        );
+    }
+
+    #[test]
+    fn the_path_suggestion_names_the_harness_instruction_file() {
+        assert!(
+            ErrorCategory::PathNotFound
+                .suggestion("CLAUDE.md")
+                .contains("a file map in CLAUDE.md would help")
+        );
+        assert!(
+            ErrorCategory::PathNotFound
+                .suggestion("AGENTS.md")
+                .contains("a file map in AGENTS.md would help")
         );
     }
 

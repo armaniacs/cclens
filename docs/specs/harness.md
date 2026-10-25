@@ -111,10 +111,23 @@ follows with the view-copy pass.)
 
 ## Report copy names the harness
 
-Copy that attributes rows to a harness uses `Harness::display_name`, so
-opencode output never claims to be Claude Code's (v1 covers the `doctor`
-heading and the always-on residual line; deeper view copy still says
-Claude and follows later).
+Copy that attributes rows to a harness uses `Harness` display helpers, so
+opencode output never claims to be Claude Code's:
+
+- `display_name` in the `doctor` heading, the always-on residual line, and
+  the `prompts` framing; the `stuck`/`thrash` lines say "the agent" (neutral
+  for both harnesses).
+- `instruction_file` / `project_config_ref` / `global_config_ref` wherever a
+  finding routes to the config layer owning the fix (`doctor`, `failures`,
+  `inventory` framing, `overhead` breakdown, friction suggestions).
+- The `optimize` briefing and advisor instructions render from a
+  `HarnessCopy` (`core::optimize`), plain data the shell assembles from the
+  harness — the core never names a harness.
+- Freshness lines count the harness's own unit (`transcript(s)` vs
+  `session(s)`).
+
+Static `--help` texts still describe the Claude Code defaults; per-harness
+help generation is out of scope.
 
 ## Forward compatibility
 

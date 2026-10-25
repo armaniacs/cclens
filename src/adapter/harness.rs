@@ -40,6 +40,105 @@ impl Harness {
         }
     }
 
+    /// The indefinite article for the display name in prose ("a Claude Code
+    /// advisor", "an opencode advisor").
+    pub fn article(&self) -> &'static str {
+        match self {
+            Harness::Claude => "a",
+            Harness::Opencode => "an",
+        }
+    }
+
+    /// The instruction file reports point at: the file a file-map or rule
+    /// fix lands in.
+    pub fn instruction_file(&self) -> &'static str {
+        match self {
+            Harness::Claude => "CLAUDE.md",
+            Harness::Opencode => "AGENTS.md",
+        }
+    }
+
+    /// How reports name the project config layer that owns a fix.
+    pub fn project_config_ref(&self) -> &'static str {
+        match self {
+            Harness::Claude => ".claude / CLAUDE.md",
+            Harness::Opencode => ".opencode / AGENTS.md",
+        }
+    }
+
+    /// How reports name the global config layer that owns a fix.
+    pub fn global_config_ref(&self) -> &'static str {
+        match self {
+            Harness::Claude => "~/.claude",
+            Harness::Opencode => "~/.config/opencode",
+        }
+    }
+
+    /// The noun for analyzed input in prose ("their Claude Code session
+    /// transcripts", "their opencode sessions").
+    pub fn source_noun(&self) -> &'static str {
+        match self {
+            Harness::Claude => "session transcripts",
+            Harness::Opencode => "sessions",
+        }
+    }
+
+    /// The raw input advisors must not re-parse ("the raw ~/.claude/projects
+    /// transcripts", "the raw opencode database").
+    pub fn raw_source(&self) -> &'static str {
+        match self {
+            Harness::Claude => "~/.claude/projects transcripts",
+            Harness::Opencode => "opencode database",
+        }
+    }
+
+    /// The config files an advisor opens to pin down a root cause.
+    pub fn config_inventory(&self) -> &'static str {
+        match self {
+            Harness::Claude => "CLAUDE.md, rules, hooks, skills, and settings",
+            Harness::Opencode => "AGENTS.md, commands, agents, and opencode.json",
+        }
+    }
+
+    /// The readable-config breakdown in the `overhead` view.
+    pub fn readable_config(&self) -> &'static str {
+        match self {
+            Harness::Claude => "CLAUDE.md, always-on rules, skill/agent descriptions",
+            Harness::Opencode => "AGENTS.md, commands, agent descriptions",
+        }
+    }
+
+    /// The unit a refresh re-analyzes ("transcript(s)", "session(s)").
+    pub fn input_unit(&self) -> &'static str {
+        match self {
+            Harness::Claude => "transcript(s)",
+            Harness::Opencode => "session(s)",
+        }
+    }
+
+    /// The `inventory` framing block. Kind lists differ per harness, so the
+    /// whole block is per-harness rather than interpolated.
+    pub fn inventory_preamble(&self) -> &'static str {
+        match self {
+            Harness::Claude => {
+                "Everything installed in your config — skills, rules, agents, MCP servers,\n\
+             CLAUDE.md — with where it is installed (scope) and whether it was ever used.\n\
+             \"start tok\" is what every session pays for having it installed; \"static tok\"\n\
+             is the whole definition, which for a skill or agent is paid only on invocation.\n\
+             UNUSED marks delete candidates; rules and CLAUDE.md are catalog-only because\n\
+             using them leaves no trace in transcripts."
+            }
+            Harness::Opencode => {
+                "Everything installed in your config — commands, agents,\n\
+             AGENTS.md — with where it is installed (scope) and whether it was ever used.\n\
+             \"start tok\" is what every session pays for having it installed; \"static tok\"\n\
+             is the whole definition, which for a command or agent is paid only on invocation.\n\
+             UNUSED marks delete candidates; commands and AGENTS.md are catalog-only because\n\
+             using them leaves no trace in sessions."
+            }
+        }
+    }
+
     /// The store file name under the user state dir. Claude keeps the
     /// historical name; every later harness gets its own file, so an old
     /// store is never reinterpreted as another harness's rows.
@@ -103,6 +202,32 @@ mod tests {
     fn display_names_name_the_harness() {
         assert_eq!(Harness::Claude.display_name(), "Claude Code");
         assert_eq!(Harness::Opencode.display_name(), "opencode");
+        assert_eq!(Harness::Claude.article(), "a");
+        assert_eq!(Harness::Opencode.article(), "an");
+    }
+
+    #[test]
+    fn report_copy_names_each_harness_own_config() {
+        assert_eq!(Harness::Claude.instruction_file(), "CLAUDE.md");
+        assert_eq!(Harness::Opencode.instruction_file(), "AGENTS.md");
+        assert_eq!(Harness::Claude.project_config_ref(), ".claude / CLAUDE.md");
+        assert_eq!(
+            Harness::Opencode.project_config_ref(),
+            ".opencode / AGENTS.md"
+        );
+        assert_eq!(Harness::Claude.global_config_ref(), "~/.claude");
+        assert_eq!(Harness::Opencode.global_config_ref(), "~/.config/opencode");
+        assert_eq!(Harness::Claude.source_noun(), "session transcripts");
+        assert_eq!(Harness::Opencode.source_noun(), "sessions");
+        assert_eq!(
+            Harness::Claude.raw_source(),
+            "~/.claude/projects transcripts"
+        );
+        assert_eq!(Harness::Opencode.raw_source(), "opencode database");
+        assert_eq!(Harness::Claude.input_unit(), "transcript(s)");
+        assert_eq!(Harness::Opencode.input_unit(), "session(s)");
+        assert!(Harness::Opencode.inventory_preamble().contains("AGENTS.md"));
+        assert!(!Harness::Opencode.inventory_preamble().contains("CLAUDE.md"));
     }
 
     #[test]

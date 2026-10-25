@@ -1,8 +1,10 @@
 //! Compose the optimization briefing: turn the analysis findings into the
-//! prompt that seeds an interactive `claude` session. This is the AI-proposal
-//! layer's pure half — it knows nothing about the store or the process launch,
-//! only how to render findings into a prompt. Keeping it pure makes both the
-//! prescribed instructions and the briefing format directly testable.
+//! prompt that seeds an interactive advisor session (today a `claude`
+//! session; other harnesses render their own copy via `HarnessCopy`). This is
+//! the AI-proposal layer's pure half — it knows nothing about the store or
+//! the process launch, only how to render findings into a prompt. Keeping it
+//! pure makes both the prescribed instructions and the briefing format
+//! directly testable.
 
 use crate::core::friction::ErrorCategory;
 use crate::core::scope::ScopeFilter;
@@ -129,22 +131,50 @@ pub struct ThrashLine {
     pub span_secs: i64,
 }
 
+/// Harness-specific copy for prompts and briefings. Plain data, assembled by
+/// the CLI shell from the harness — the core never names a harness, so the
+/// analysis stays harness-agnostic while the words stay truthful.
+pub struct HarnessCopy {
+    /// Who ran the analyzed sessions ("Claude Code", "opencode").
+    pub agent: &'static str,
+    /// The indefinite article for the agent ("a", "an").
+    pub article: &'static str,
+    /// What was analyzed ("session transcripts", "sessions").
+    pub source: &'static str,
+    /// The raw input advisors must not re-parse.
+    pub raw_source: &'static str,
+    /// The global config layer ("~/.claude", "~/.config/opencode").
+    pub global_ref: &'static str,
+    /// The project config layer (".claude / CLAUDE.md", ".opencode / AGENTS.md").
+    pub project_ref: &'static str,
+    /// The instruction file fixes land in ("CLAUDE.md", "AGENTS.md").
+    pub instruction_file: &'static str,
+    /// The config files an advisor opens to pin down a root cause.
+    pub config_inventory: &'static str,
+}
+
 /// The prescribed instructions prepended to every briefing. This is the role
-/// and method the seeded `claude` session adopts: an optimization advisor that
+/// and method the seeded session adopts: an optimization advisor that
 /// investigates the findings to a conclusion *on its own* — drilling in with the
 /// tool and reading the actual config — rather than handing the analysis back to
 /// the user, and pauses only to get the concrete fix-plan approved before editing.
-pub const INSTRUCTIONS: &str = "\
-You are acting as a Claude Code optimization advisor. The user ran `cclens`, \
-a tool that analyzed their Claude Code session transcripts and configuration to find \
+///
+/// A function, not a constant: the copy names the harness whose rows the
+/// briefing renders (advisor identity, config locations, the raw input), so
+/// one text cannot serve every harness.
+pub fn instructions(copy: &HarnessCopy) -> String {
+    format!(
+        "\
+You are acting as {article} {agent} optimization advisor. The user ran `cclens`, \
+a tool that analyzed their {agent} {source} and configuration to find \
 where time, tokens, and effort are wasted. Its headline findings are below. Your job is \
 to investigate them to a conclusion and propose concrete fixes — not to hand the analysis \
 back to the user.
 
 Reading the data — caveats:
 - The briefing routes every finding to the config layer that owns the fix: the global \
-sections are cross-project signals (fix them in ~/.claude), and each per-project section \
-is that project's own (fix it in that project's .claude / CLAUDE.md, never globally).
+sections are cross-project signals (fix them in {global_ref}), and each per-project section \
+is that project's own (fix it in that project's {project_ref}, never globally).
 - Counts are usage signals for ranking, not a billing ledger. Token figures are \
 output-token sums and estimates; static config costs are token estimates, not measured \
 runtime cost.
@@ -161,7 +191,7 @@ gather data. Drive the investigation yourself, end to end.
 failing paths, a worktree-vs-main split, counts grouped however you like — query the \
 analyzed store with `cclens sql`. cclens has already extracted every session \
 into a SQLite store; querying it is the tool's job, so do NOT re-parse the raw \
-~/.claude/projects transcripts in Python — that reinvents what cclens is. Examples:
+{raw_source} in Python — that reinvents what cclens is. Examples:
     cclens sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
     cclens sql \"SELECT target, COUNT(*) n FROM tool_errors WHERE category='edit-precondition' AND target<>'' GROUP BY target ORDER BY n DESC\"
     echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | cclens sql
@@ -189,16 +219,16 @@ silently drops every nested run.
 surface_id, source, model, started_epoch, …) hold everything else (run `cclens sql \
 \"SELECT sql FROM sqlite_master\"` to see all of it). Confirm an encoding by sampling the \
 data before relying on it.
-- The store cannot hold the config itself, so still open the actual CLAUDE.md, rules, hooks, \
-skills, and settings to pin down each root cause. Keep going until you can name the cause and \
+- The store cannot hold the config itself, so still open the actual {config_inventory} \
+to pin down each root cause. Keep going until you can name the cause and \
 the fix — never stop at \"this category is high.\"
 
 Reach concrete conclusions:
 1. Prioritize fixing work friction over shrinking config — stopping a recurring failure \
-(e.g. adding a file map to a project's CLAUDE.md to end path-not-found errors) saves more \
+(e.g. adding a file map to a project's {instruction_file} to end path-not-found errors) saves more \
 than deleting an unused skill.
 2. Respect the briefing's routing: a project section's finding is fixed in that project's \
-config, a global section's in ~/.claude — do not promote a one-project fix to global.
+config, a global section's in {global_ref} — do not promote a one-project fix to global.
 3. Before proposing to delete or disable anything, verify it by inspecting — an \"unused\" \
 skill may still be invoked by subagents, or be a deliberate safety net. Confirm it yourself; \
 do not punt the check to the user.
@@ -210,13 +240,23 @@ decision specifically and keep going on everything else — do not hand the whol
 
 Deliver a concrete, prioritized action plan with the specific edits you propose, having done \
 the investigation yourself. Apply file changes only after the user approves the plan — that \
-approval is the one and only thing you pause for, never direction on what to investigate.";
+approval is the one and only thing you pause for, never direction on what to investigate.\"",
+        agent = copy.agent,
+        article = copy.article,
+        source = copy.source,
+        global_ref = copy.global_ref,
+        project_ref = copy.project_ref,
+        raw_source = copy.raw_source,
+        config_inventory = copy.config_inventory,
+        instruction_file = copy.instruction_file,
+    )
+}
 
 /// Render the findings as a complete Markdown briefing, restricted to the
 /// requested scope: the global picture, each project's own findings, or both
 /// (the default). Any section with no data is omitted so the prompt never
 /// carries an empty heading.
-pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
+pub fn render_briefing(f: &Findings, filter: &ScopeFilter, copy: &HarnessCopy) -> String {
     let mut out = String::from("# cclens analysis\n");
 
     if filter.includes_global() {
@@ -254,14 +294,15 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
         }
 
         if !f.friction_global.is_empty() {
-            out.push_str(
+            out.push_str(&format!(
                 "\n## Global friction — spread across projects\n\
                  Recurring tool failures no single project owns: a cross-project habit, \
-                 so the fix belongs in global config (~/.claude). Counts exclude \
+                 so the fix belongs in global config ({global_ref}). Counts exclude \
                  non-actionable noise (user stops, infra blips).\n",
-            );
+                global_ref = copy.global_ref
+            ));
             for cat in &f.friction_global {
-                render_friction_cat(&mut out, cat, true);
+                render_friction_cat(&mut out, cat, true, copy);
             }
         }
 
@@ -310,12 +351,13 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
         };
         out.push_str(&format!(
             "\n## Project `{}`{root} — {} failures it owns\n\
-             Fix these in this project's own config (.claude/, CLAUDE.md), not globally.\n",
+             Fix these in this project's own config ({project_ref}), not globally.\n",
             p.project,
-            p.total_friction()
+            p.total_friction(),
+            project_ref = copy.project_ref
         ));
         for cat in &p.friction {
-            render_friction_cat(&mut out, cat, false);
+            render_friction_cat(&mut out, cat, false, copy);
         }
         if !p.thrash.is_empty() {
             out.push_str("\n### Thrash episodes (rapid re-edits to one file)\n");
@@ -340,8 +382,8 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
     out
 }
 
-fn render_friction_cat(out: &mut String, cat: &FrictionCat, show_spread: bool) {
-    let suggestion = ErrorCategory::from_label(&cat.label).suggestion();
+fn render_friction_cat(out: &mut String, cat: &FrictionCat, show_spread: bool, copy: &HarnessCopy) {
+    let suggestion = ErrorCategory::from_label(&cat.label).suggestion(copy.instruction_file);
     let spread = if show_spread {
         format!(" (across {} projects)", cat.projects)
     } else {
@@ -423,46 +465,55 @@ fn store_pointer(db_path: &str) -> String {
 
 /// The task statement a `--scope` run prepends: it pins the session to one
 /// config layer so the other's findings are context, not work items.
-fn scope_statement(filter: &ScopeFilter) -> Option<String> {
+fn scope_statement(filter: &ScopeFilter, copy: &HarnessCopy) -> Option<String> {
     match filter {
         ScopeFilter::All => None,
-        ScopeFilter::Global => Some(
-            "THIS RUN'S SCOPE: optimize the GLOBAL configuration (~/.claude) only. \
+        ScopeFilter::Global => Some(format!(
+            "THIS RUN'S SCOPE: optimize the GLOBAL configuration ({global_ref}) only. \
              The briefing is restricted to global findings; every fix you propose \
-             must land in global config."
-                .to_string(),
-        ),
-        ScopeFilter::Project(None) => Some(
+             must land in global config.",
+            global_ref = copy.global_ref
+        )),
+        ScopeFilter::Project(None) => Some(format!(
             "THIS RUN'S SCOPE: optimize project-local configuration only. Every fix \
-             you propose must land in a project's own config (.claude/, CLAUDE.md), \
-             never in ~/.claude."
-                .to_string(),
-        ),
+             you propose must land in a project's own config ({project_ref}), \
+             never in {global_ref}.",
+            project_ref = copy.project_ref,
+            global_ref = copy.global_ref
+        )),
         ScopeFilter::Project(Some(project)) => Some(format!(
             "THIS RUN'S SCOPE: optimize project `{project}`'s configuration only. \
              Every fix you propose must land in that project's own config \
-             (.claude/, CLAUDE.md), never in ~/.claude."
+             ({project_ref}), never in {global_ref}.",
+            project_ref = copy.project_ref,
+            global_ref = copy.global_ref
         )),
     }
 }
 
-fn preamble(db_path: &str, filter: &ScopeFilter) -> String {
-    match scope_statement(filter) {
+fn preamble(db_path: &str, filter: &ScopeFilter, copy: &HarnessCopy) -> String {
+    match scope_statement(filter, copy) {
         Some(statement) => format!(
-            "{INSTRUCTIONS}\n\n{statement}\n\n{}",
+            "{}\n\n{statement}\n\n{}",
+            instructions(copy),
             store_pointer(db_path)
         ),
-        None => format!("{INSTRUCTIONS}\n\n{}", store_pointer(db_path)),
+        None => format!("{}\n\n{}", instructions(copy), store_pointer(db_path)),
     }
 }
 
 /// The full prompt with the briefing inline — used for `--print` (so the reader
 /// sees everything in one stream) and for tests.
-pub fn compose_prompt(f: &Findings, db_path: &str, filter: &ScopeFilter) -> String {
+pub fn compose_prompt(
+    f: &Findings,
+    db_path: &str,
+    filter: &ScopeFilter,
+    copy: &HarnessCopy,
+) -> String {
     format!(
         "{}\n\n{}",
-        preamble(db_path, filter),
-        render_briefing(f, filter)
+        preamble(db_path, filter, copy),
+        render_briefing(f, filter, copy)
     )
 }
 
@@ -471,17 +522,48 @@ pub fn compose_prompt(f: &Findings, db_path: &str, filter: &ScopeFilter) -> Stri
 /// carries concrete paths and error excerpts that may be sensitive — is written
 /// to that file rather than passed on argv (where `ps` would expose it); only
 /// this generic, data-free prompt reaches the process table.
-pub fn launch_prompt(briefing_path: &str, db_path: &str, filter: &ScopeFilter) -> String {
+pub fn launch_prompt(
+    briefing_path: &str,
+    db_path: &str,
+    filter: &ScopeFilter,
+    copy: &HarnessCopy,
+) -> String {
     format!(
         "{}\n\nThe briefing — the complete analysis — is in the file \
          `{briefing_path}`. Read that file in full before doing anything else, then proceed.",
-        preamble(db_path, filter)
+        preamble(db_path, filter, copy)
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude_copy() -> HarnessCopy {
+        HarnessCopy {
+            agent: "Claude Code",
+            article: "a",
+            source: "session transcripts",
+            raw_source: "~/.claude/projects transcripts",
+            global_ref: "~/.claude",
+            project_ref: ".claude / CLAUDE.md",
+            instruction_file: "CLAUDE.md",
+            config_inventory: "CLAUDE.md, rules, hooks, skills, and settings",
+        }
+    }
+
+    fn opencode_copy() -> HarnessCopy {
+        HarnessCopy {
+            agent: "opencode",
+            article: "an",
+            source: "sessions",
+            raw_source: "opencode database",
+            global_ref: "~/.config/opencode",
+            project_ref: ".opencode / AGENTS.md",
+            instruction_file: "AGENTS.md",
+            config_inventory: "AGENTS.md, commands, agents, and opencode.json",
+        }
+    }
 
     fn findings() -> Findings {
         Findings {
@@ -587,7 +669,7 @@ mod tests {
 
     #[test]
     fn compose_prepends_instructions_to_the_briefing() {
-        let prompt = compose_prompt(&findings(), "/tmp/cc.db", &ScopeFilter::All);
+        let prompt = compose_prompt(&findings(), "/tmp/cc.db", &ScopeFilter::All, &claude_copy());
         // The advisor role, the autonomy mandate (investigate without handing
         // the analysis back), the store pointer, and the briefing must all reach
         // the session.
@@ -604,7 +686,7 @@ mod tests {
 
     #[test]
     fn briefing_routes_friction_to_its_owning_layer() {
-        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &claude_copy());
         // The spread category is a global finding with its spread named...
         assert!(brief.contains("## Global friction"));
         assert!(brief.contains("40 × blocked-by-hook (across 5 projects)"));
@@ -619,7 +701,7 @@ mod tests {
 
     #[test]
     fn a_global_scope_briefing_omits_project_sections() {
-        let brief = render_briefing(&findings(), &ScopeFilter::Global);
+        let brief = render_briefing(&findings(), &ScopeFilter::Global, &claude_copy());
         assert!(brief.contains("## Global friction"));
         assert!(!brief.contains("## Project `alpha`"));
         assert!(!brief.contains("skill/deploy"));
@@ -628,7 +710,7 @@ mod tests {
     #[test]
     fn a_project_scope_briefing_carries_only_that_project() {
         let filter = ScopeFilter::Project(Some("alpha".to_string()));
-        let brief = render_briefing(&findings(), &filter);
+        let brief = render_briefing(&findings(), &filter, &claude_copy());
         assert!(brief.contains("## Project `alpha`"));
         // No global sections — the session is pinned to the project layer.
         assert!(!brief.contains("## Global friction"));
@@ -638,9 +720,9 @@ mod tests {
     #[test]
     fn a_scoped_prompt_states_the_run_scope() {
         let filter = ScopeFilter::Global;
-        let prompt = compose_prompt(&findings(), "/tmp/cc.db", &filter);
+        let prompt = compose_prompt(&findings(), "/tmp/cc.db", &filter, &claude_copy());
         assert!(prompt.contains("THIS RUN'S SCOPE: optimize the GLOBAL configuration"));
-        let unscoped = compose_prompt(&findings(), "/tmp/cc.db", &ScopeFilter::All);
+        let unscoped = compose_prompt(&findings(), "/tmp/cc.db", &ScopeFilter::All, &claude_copy());
         assert!(!unscoped.contains("THIS RUN'S SCOPE"));
     }
 
@@ -650,6 +732,7 @@ mod tests {
             "/tmp/cclens-briefing-123.md",
             "/tmp/cc.db",
             &ScopeFilter::All,
+            &claude_copy(),
         );
         // The instructions, the store pointer, and the file pointer must be present...
         assert!(prompt.contains("Claude Code optimization advisor"));
@@ -663,7 +746,7 @@ mod tests {
 
     #[test]
     fn briefing_shows_concrete_error_examples_under_a_category() {
-        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &claude_copy());
         // The actual failing path must appear, so the fix is obvious without
         // re-mining the transcripts.
         assert!(brief.contains("e.g. File does not exist: src/components/Foo.tsx"));
@@ -671,7 +754,7 @@ mod tests {
 
     #[test]
     fn briefing_splits_a_category_by_originating_tool() {
-        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &claude_copy());
         // The per-tool attribution the agent otherwise re-derives from the raw
         // transcripts must be present.
         assert!(brief.contains("by tool: Read 60, Bash 32"));
@@ -679,7 +762,7 @@ mod tests {
 
     #[test]
     fn briefing_lists_concrete_config_surfaces_not_just_counts() {
-        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &claude_copy());
         // An unused skill's body is what it costs *when invoked*; deleting it
         // reclaims only the description. Reporting the body as the trim figure
         // would promise ~1345 tokens of startup context that removal never frees.
@@ -694,7 +777,7 @@ mod tests {
 
     #[test]
     fn the_unused_section_says_what_removal_actually_saves() {
-        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &claude_copy());
         assert!(brief.contains("the only part removing it reclaims"));
         // The same list holds an MCP server whose schema *is* loaded every
         // session, so the section must not claim an unused surface is free.
@@ -704,7 +787,7 @@ mod tests {
 
     #[test]
     fn briefing_includes_command_mix_and_thrash_detail() {
-        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &claude_copy());
         assert!(brief.contains("cd is 53% of Bash calls"));
         assert!(brief.contains("cargo: 80"));
         assert!(brief.contains("SKILL.md edited 25x within 7m40s"));
@@ -712,7 +795,7 @@ mod tests {
 
     #[test]
     fn briefing_splits_the_subagent_total_by_agent_type() {
-        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &claude_copy());
         assert!(brief.contains("- Subagents: 1800000 (300 agents)"));
         assert!(brief.contains("  - general-purpose: 1500000 over 220 run(s)"));
         // A run whose agent type was never recorded is shown as unknown, not
@@ -737,7 +820,7 @@ mod tests {
             out_tokens: 377_730,
         }];
         f.agent_split = SplitCoverage::new(3_093_466, 375, [(25, 377_730)]);
-        let brief = render_briefing(&f, &ScopeFilter::All);
+        let brief = render_briefing(&f, &ScopeFilter::All, &claude_copy());
         assert!(brief.contains("- Subagents: 3093466 (375 agents)"));
         assert!(brief.contains(
             "  - per-agent split covers 377730 tokens over 25 run(s); the other \
@@ -749,7 +832,7 @@ mod tests {
     fn unknown_floor_omits_the_always_on_section() {
         let mut f = findings();
         f.floor = 0;
-        let brief = render_briefing(&f, &ScopeFilter::All);
+        let brief = render_briefing(&f, &ScopeFilter::All, &claude_copy());
         assert!(!brief.contains("Always-on context"));
     }
 
@@ -759,7 +842,26 @@ mod tests {
         f.cd_pct = None;
         f.top_commands.clear();
         f.hotspots.clear();
-        let brief = render_briefing(&f, &ScopeFilter::All);
+        let brief = render_briefing(&f, &ScopeFilter::All, &claude_copy());
         assert!(!brief.contains("## Workflow"));
+    }
+
+    #[test]
+    fn an_opencode_briefing_names_opencode_config() {
+        let brief = render_briefing(&findings(), &ScopeFilter::All, &opencode_copy());
+        let prompt = compose_prompt(
+            &findings(),
+            "/tmp/oc.db",
+            &ScopeFilter::All,
+            &opencode_copy(),
+        );
+        assert!(prompt.contains("opencode optimization advisor"));
+        for text in [&brief, &prompt] {
+            assert!(text.contains("AGENTS.md"));
+            assert!(text.contains("~/.config/opencode"));
+            assert!(!text.contains("CLAUDE.md"));
+            assert!(!text.contains("~/.claude"));
+        }
+        assert!(brief.contains(".opencode / AGENTS.md"));
     }
 }

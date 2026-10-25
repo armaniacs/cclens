@@ -390,8 +390,10 @@ fn optimize(
         eprintln!(
             "{}",
             Style::stderr().dim(&format!(
-                "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
-                stats.sessions, stats.skipped
+                "store: refreshed just now ({} {} re-analyzed, {} unchanged)",
+                stats.sessions,
+                harness.input_unit(),
+                stats.skipped
             ))
         );
     }
@@ -404,10 +406,23 @@ fn optimize(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| db.to_string_lossy().into_owned());
 
+    // The harness copy for every prompt and briefing rendered here — plain
+    // data assembled from the harness, so the core stays harness-agnostic.
+    let copy = optimize_mod::HarnessCopy {
+        agent: harness.display_name(),
+        article: harness.article(),
+        source: harness.source_noun(),
+        raw_source: harness.raw_source(),
+        global_ref: harness.global_config_ref(),
+        project_ref: harness.project_config_ref(),
+        instruction_file: harness.instruction_file(),
+        config_inventory: harness.config_inventory(),
+    };
+
     if print {
         println!(
             "{}",
-            optimize_mod::compose_prompt(&findings, &db_display, filter)
+            optimize_mod::compose_prompt(&findings, &db_display, filter, &copy)
         );
         return Ok(());
     }
@@ -421,9 +436,10 @@ fn optimize(
     }
 
     // Sensitive briefing → private temp file; only a data-free pointer on argv.
-    let briefing = optimize_mod::render_briefing(&findings, filter);
+    let briefing = optimize_mod::render_briefing(&findings, filter, &copy);
     let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
-    let prompt = optimize_mod::launch_prompt(&briefing_path.to_string_lossy(), &db_display, filter);
+    let prompt =
+        optimize_mod::launch_prompt(&briefing_path.to_string_lossy(), &db_display, filter, &copy);
 
     // Hand over the terminal: `claude <prompt>` starts an interactive session,
     // inheriting our stdio so the user takes over. Clean up the briefing file
@@ -893,20 +909,21 @@ fn doctor(
                 cat.label,
                 style.dim(&format!(
                     "— {}",
-                    ErrorCategory::from_label(&cat.label).suggestion()
+                    ErrorCategory::from_label(&cat.label).suggestion(harness.instruction_file())
                 ))
             ));
         }
         if let Some(worst) = p.thrash.first() {
             lines.push(format!(
-                "  …and Claude got stuck re-editing {} ({} edits in {}m).",
+                "  …and the agent got stuck re-editing {} ({} edits in {}m).",
                 worst.file,
                 worst.edits,
                 worst.span_secs.div_euclid(60).max(1)
             ));
         }
         lines.push(format!(
-            "  Fix in this project's own CLAUDE.md / .claude — details: {}",
+            "  Fix in this project's own {} — details: {}",
+            harness.project_config_ref(),
             style.command(&format!("cclens failures --scope project:{}", p.project))
         ));
         items.push(Item {
@@ -926,12 +943,14 @@ fn doctor(
                         style.bold(&cat.label),
                         style.dim(&format!(
                             "— {}",
-                            ErrorCategory::from_label(&cat.label).suggestion()
+                            ErrorCategory::from_label(&cat.label)
+                                .suggestion(harness.instruction_file())
                         ))
                     ),
                     format!(
-                        "  No single project owns it, so the fix belongs in ~/.claude — \
+                        "  No single project owns it, so the fix belongs in {} — \
                          details: {}",
+                        harness.global_config_ref(),
                         style.command("cclens failures --scope global")
                     ),
                 ],
@@ -947,8 +966,9 @@ fn doctor(
                 weight: 0,
                 lines: vec![format!(
                     "{} of all Bash commands are just `cd` — a working-directory \
-                     convention in your global CLAUDE.md would cut the churn.",
-                    style.warn(&format!("{cd_pct}%"))
+                     convention in your global {} would cut the churn.",
+                    style.warn(&format!("{cd_pct}%")),
+                    harness.instruction_file()
                 )],
             });
         }
@@ -1027,7 +1047,8 @@ fn doctor(
     let mut pruning: Vec<String> = Vec::new();
     if filter.includes_global() && (!f.unused.is_empty() || !f.always_on_heavy.is_empty()) {
         pruning.push(format!(
-            "  ~/.claude: {} → {}",
+            "  {}: {} → {}",
+            harness.global_config_ref(),
             prune_phrase(&f.unused, &f.always_on_heavy),
             style.command("cclens waste --scope global")
         ));
@@ -1234,10 +1255,10 @@ fn shorten_to_tilde(path: &str, home: Option<&str>) -> String {
     }
 }
 
-/// Thrash bursts: a file edited many times in a short window — where Claude got
-/// stuck and kept retrying, as opposed to a hotspot's healthy spread-out edits.
-/// An episode is one session's edits to one path, so parallel work on a
-/// same-named file is never presented as one agent looping (`core::thrash`).
+/// Thrash bursts: a file edited many times in a short window — where the agent
+/// got stuck and kept retrying, as opposed to a hotspot's healthy spread-out
+/// edits. An episode is one session's edits to one path, so parallel work on
+/// a same-named file is never presented as one agent looping (`core::thrash`).
 fn stuck(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
@@ -1265,7 +1286,7 @@ fn stuck(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<(
     }
     preamble(
         format,
-        "Files Claude kept re-editing in rapid bursts — the signature of getting stuck\n\
+        "Files the agent kept re-editing in rapid bursts — the signature of getting stuck\n\
          and retrying. Worth checking what blocked it there (a rule? missing context?).",
     );
     let rows: Vec<Vec<String>> = episodes
@@ -1289,7 +1310,7 @@ fn stuck(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<(
     );
     note(&format!(
         "bursts of >= {MIN_EDITS} edits to one file within {}m by a single session —\n\
-         likely where Claude got stuck. `--format json` carries the session id and\n\
+         likely where the agent got stuck. `--format json` carries the session id and\n\
          full path to investigate with.",
         GAP_SECS / 60
     ));
@@ -1380,7 +1401,8 @@ fn failures(
                     "category": row.category,
                     "count": row.count,
                     "spread_projects": row.spread,
-                    "suggestion": ErrorCategory::from_label(&row.category).suggestion(),
+                    "suggestion": ErrorCategory::from_label(&row.category)
+                        .suggestion(harness.instruction_file()),
                 })
             })
             .collect();
@@ -1393,22 +1415,32 @@ fn failures(
 
     preamble(
         format,
-        match filter {
+        &match filter {
             ScopeFilter::All => {
                 "Tool calls that kept failing the same way, grouped by kind of failure.\n\
                  Every row wastes turns and tokens; the suggestion says what usually fixes it."
+                    .to_string()
             }
             ScopeFilter::Global => {
-                "Failures spread across several projects — no single project owns them, so\n\
-                 they read as habits or global-config problems. Fix these in ~/.claude."
+                format!(
+                    "Failures spread across several projects — no single project owns them, so\n\
+                     they read as habits or global-config problems. Fix these in {}.",
+                    harness.global_config_ref()
+                )
             }
             ScopeFilter::Project(None) => {
-                "Failures each project owns (it holds the majority of that kind). Fix each\n\
-                 in that project's own CLAUDE.md / .claude, not globally."
+                format!(
+                    "Failures each project owns (it holds the majority of that kind). Fix each\n\
+                     in that project's own {}, not globally.",
+                    harness.project_config_ref()
+                )
             }
             ScopeFilter::Project(Some(_)) => {
-                "Every recurring failure inside this one project, most frequent first.\n\
-                 Fix them in this project's own CLAUDE.md / .claude."
+                format!(
+                    "Every recurring failure inside this one project, most frequent first.\n\
+                     Fix them in this project's own {}.",
+                    harness.project_config_ref()
+                )
             }
         },
     );
@@ -1427,9 +1459,7 @@ fn failures(
             cells.extend([
                 error,
                 row.count.to_string(),
-                ErrorCategory::from_label(&row.category)
-                    .suggestion()
-                    .to_string(),
+                ErrorCategory::from_label(&row.category).suggestion(harness.instruction_file()),
             ]);
             cells
         })
@@ -1484,9 +1514,12 @@ fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result
 
     preamble(
         format,
-        "How you steer Claude, classified per prompt: instruct (substantive asks),\n\
-         steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
-         steering = room for more autonomy; lots of correcting = unclear upfront specs.",
+        &format!(
+            "How you steer {}, classified per prompt: instruct (substantive asks),\n\
+             steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
+             steering = room for more autonomy; lots of correcting = unclear upfront specs.",
+            harness.display_name()
+        ),
     );
     let pct = |n: i64| (n as f64 * 100.0 / total as f64).round() as i64;
     let get = |name: &str| {
@@ -1588,8 +1621,11 @@ fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Resul
                  carries an observable session start. A store written before session-start\n\
                  tracking keeps its old rows (analyze never re-reads a closed session), so\n\
                  the floor appears as newer sessions are analyzed. Discarding the store\n\
-                 would backfill it from the transcripts still on disk, at the cost of every\n\
-                 session whose transcript Claude Code has already pruned."
+                 would backfill it from the {} still on disk, at the cost of every\n\
+                 session whose {} {} has already pruned.",
+                harness.raw_source(),
+                harness.source_noun(),
+                harness.display_name()
             );
         }
         return Ok(());
@@ -1607,7 +1643,8 @@ fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Resul
         style.bold(&format!("{floor} tokens"))
     );
     println!(
-        "  readable config (CLAUDE.md, always-on rules, skill/agent descriptions): {config} tokens"
+        "  readable config ({}): {config} tokens",
+        harness.readable_config()
     );
     println!(
         "  residual (system prompt + built-in tools + MCP schemas):                {residual} tokens"
@@ -2026,8 +2063,10 @@ fn open_for_read(harness: &Harness, db: &Path, frozen: bool) -> Result<Store> {
         eprintln!(
             "{}",
             Style::stderr().dim(&format!(
-                "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
-                stats.sessions, stats.skipped
+                "store: refreshed just now ({} {} re-analyzed, {} unchanged)",
+                stats.sessions,
+                harness.input_unit(),
+                stats.skipped
             ))
         );
         return Store::open(db).context("open store");
@@ -2471,15 +2510,7 @@ fn inventory(
         return Ok(());
     }
 
-    preamble(
-        format,
-        "Everything installed in your config — skills, rules, agents, MCP servers,\n\
-         CLAUDE.md — with where it is installed (scope) and whether it was ever used.\n\
-         \"start tok\" is what every session pays for having it installed; \"static tok\"\n\
-         is the whole definition, which for a skill or agent is paid only on invocation.\n\
-         UNUSED marks delete candidates; rules and CLAUDE.md are catalog-only because\n\
-         using them leaves no trace in transcripts.",
-    );
+    preamble(format, harness.inventory_preamble());
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
