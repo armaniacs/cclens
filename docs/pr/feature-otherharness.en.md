@@ -87,27 +87,12 @@ analysis.
   carries the no-edit mandate (the plan is the agent's final output; no user is
   present to approve anything), and the launch verifies opencode's own
   error message instead of assuming success.
-
-### A live activity indicator for the headless advisor
-
-A headless run used to look hung: quiet stretches (model thinking, a long tool
-call) had no signal, and the raw JSON stream was too noisy to watch. The
-terminal now shows **one in-place status line**, modeled on Claude Code's
-spinner (src/status.rs).
-
-- A turning braille spinner proves liveness, the status names the **current
-  activity** from the last tool call ("running shell", "reading",
-  "spawning subagent", "thinking"), and an elapsed counter makes waiting
-  measurable.
-- On a terminal the line rewrites in place instead of scrolling; when stderr
-  is piped the same beats fall back to newline logs every 10s, so a pipe never
-  receives escape codes. `optimize | pbcopy` still shows the live spinner.
-- Text output clears the line before printing, so narration never interleaves
-  with the spinner; `NO_COLOR` and `TERM=dumb` are respected; error paths stop
-  the indicator through `Drop`.
-- The narration and the final plan go to stdout (pipe-friendly); every raw
-  line and the advisor's stderr go to a private `0600` log whose path is
-  printed up front. `--verbose` restores the raw stream for debugging.
+- The headless terminal stays quiet: the narration and the final plan go to
+  stdout (pipe-friendly, `| pbcopy`), a dim heartbeat line covers quiet
+  stretches so the run never looks hung, and every raw line plus the advisor's
+  stderr go to a private `0600` log whose path is printed up front. A follow-up
+  PR (`feature-activity-indicator`, stacked on this one) replaces the heartbeat
+  with a live in-place status line — spinner, current activity, elapsed time.
 
 ### Hardening found in a real-data trial
 
@@ -161,7 +146,7 @@ Each exclusion is documented with its reason in
 ## How it is verified
 
 - The full gate passes: `cargo fmt --check`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, and `cargo test` — **304 tests** (247 before
+  --all-features -- -D warnings`, and `cargo test` — **301 tests** (247 before
   this branch).
 - Every report view, the guards, and both `optimize` launch modes were
   exercised against a real opencode store (91 sessions, 8 projects), and the
@@ -178,7 +163,7 @@ Each exclusion is documented with its reason in
 
 ## Commit map
 
-The 18 commits build the feature in layers, each green at its own gate.
+The 17 commits build the feature in layers, each green at its own gate.
 
 - `1910e1f`, `2ba235b`, `4211c9c` — exploration notes (formats, decisions,
   kilocode token findings), English rewrite
@@ -188,9 +173,8 @@ The 18 commits build the feature in layers, each green at its own gate.
 - `515c9fd` — opencode config catalog (commands, agents, `AGENTS.md`)
 - `f3508e3` — classify observed opencode error phrasings
 - `c5a8579` — harness-aware copy in reports and briefings
-- `1746587`, `7e54fa8`, `7092a60`, `6a4f410` — headless `optimize` under
-  opencode: launch, quiet terminal, nested-part rendering fix, live activity
-  indicator
-- `de3b628`, `cd59550`, `8369fee`, `7ef7e71` — real-data trial hardening:
+- `1746587`, `7e54fa8`, `7092a60` — headless `optimize` under opencode:
+  launch, quiet terminal, nested-part rendering fix
+- `fc3fec1`, `a1a5d3b`, `3945884`, `9abdfeb` — real-data trial hardening:
   new failure categories, the six skills sites with canonical dedup, the
   unreadable-directory warning, honest attribution
