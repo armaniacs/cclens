@@ -29,7 +29,7 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// lives apart from the shared `ANALYZER_VERSION` (`store.rs`) on purpose:
 /// a kilocode-only change must never force other harnesses through a full
 /// re-analyze. Stored under its own `meta` key.
-pub const KILOCODE_ANALYZER_VERSION: &str = "2";
+pub const KILOCODE_ANALYZER_VERSION: &str = "3";
 
 /// The `meta` key holding the kilocode analysis semantics.
 pub const KILOCODE_ANALYZER_META_KEY: &str = "kilocode_analyzer_version";
@@ -262,14 +262,15 @@ pub fn extract_tool_errors(conversation: &str) -> Vec<ToolError> {
                         Some((name, target)) => (name.clone(), target.clone()),
                         None => ("unknown".into(), String::new()),
                     };
+                    let text = content.map(error_text).unwrap_or_default();
                     errors.push(ToolError {
                         epoch_ms: ts,
-                        // Classified on the JSON form (substring heuristics);
-                        // excerpt from the human-readable text.
-                        category: classify_error(
-                            &content.map(Value::to_string).unwrap_or_default(),
-                        ),
-                        excerpt: content.map(error_excerpt).unwrap_or_default(),
+                        // Classified on the same readable text the excerpt
+                        // carries: kilocode's envelope wraps the message, and
+                        // the envelope's own fields matched the wrong
+                        // vocabulary ("timeout" among them).
+                        category: classify_error(&text),
+                        excerpt: truncate(&text),
                         tool,
                         target,
                     });
@@ -297,17 +298,41 @@ fn tool_target(input: Option<&Value>) -> String {
 
 /// The failure's readable excerpt: the string content, or the text blocks of
 /// the array content, whitespace-collapsed and truncated by Unicode scalar.
-fn error_excerpt(content: &Value) -> String {
-    let raw = match content {
-        Value::String(text) => text.clone(),
+/// The failure's readable text: for kilocode, each text block may be a JSON
+/// envelope around the message — the measured shape is an envelope block
+/// followed by an environment_details block, and joining the block texts made
+/// the joined string non-JSON, so the blob was stored whole. Unwrapping per
+/// block keeps the message and drops the envelope's own fields, which
+/// mis-classified the failure ("does not exist" matched the path vocabulary,
+/// "timeout" matched timeout). Claude-shaped plain text passes through.
+fn error_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => unwrap_envelope(text),
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|block| block.get("text").and_then(Value::as_str))
+            // kilo decorates every tool_result with an environment_details
+            // block — the editor's state, not the failure's cause. Its file
+            // names matched the vocabulary ("timeout" in a test name) and
+            // mis-classified the failure.
+            .filter(|text| !text.trim_start().starts_with("<environment_details>"))
+            .map(unwrap_envelope)
             .collect::<Vec<_>>()
             .join(" "),
         other => other.to_string(),
-    };
-    truncate(&raw)
+    }
+}
+
+fn unwrap_envelope(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| text.to_string())
 }
 
 /// Whitespace-collapse and truncate by Unicode scalar (never mid-character).
@@ -807,6 +832,121 @@ mod tests {
         assert_eq!(error.target, "cargo build --release");
         assert_eq!(error.category, ErrorCategory::CommandNotFound);
         assert_eq!(error.excerpt, "command not found: cargo");
+    }
+
+    #[test]
+    fn an_error_excerpt_is_the_message_not_the_envelope() {
+        // kilocode wraps tool failures in a JSON envelope; truncating the whole
+        // blob mis-classified the failure — the envelope's own wording ("does
+        // not exist") matched the path vocabulary and its fields matched
+        // timeout. The excerpt is the readable message the tool carried.
+        let conversation = conversation(vec![
+            assistant_tool_use(
+                1000,
+                "t1",
+                "search_and_replace",
+                json!({"path": "src/a.rs"}),
+            ),
+            user_tool_result(
+                2000,
+                "t1",
+                true,
+                r#"{"status":"error","message":"The tool execution failed","error":"Tool \"search_and_replace\" is not allowed in code mode."}"#,
+            ),
+        ]);
+        let errors = extract_tool_errors(&conversation);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].excerpt,
+            "Tool \"search_and_replace\" is not allowed in code mode."
+        );
+        assert_eq!(errors[0].category, ErrorCategory::Other);
+    }
+
+    #[test]
+    fn a_tool_result_text_blocks_unwrap_their_envelope() {
+        // The measured shape: the failure rides in a text block as a JSON
+        // envelope, followed by an environment_details block — joining the
+        // block texts made the joined string non-JSON, so the envelope unwrap
+        // never fired and the blob was stored whole. Each block unwraps.
+        let conversation = conversation(vec![
+            assistant_tool_use(
+                1000,
+                "t1",
+                "search_and_replace",
+                json!({"path": "src/a.rs"}),
+            ),
+            json!({"role": "user", "ts": 2000, "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                 "content": [
+                    {"type": "text", "text": r#"{"status":"error","message":"The tool execution failed","error":"Tool \"search_and_replace\" is not allowed in code mode.","timeout":30000}"#},
+                    {"type": "text", "text": "<environment_details>\n# VSCode Visible Files\nsrc/a.rs"}
+                 ]}
+            ]}),
+        ]);
+        let errors = extract_tool_errors(&conversation);
+        assert_eq!(errors.len(), 1);
+        // The environment_details decoration is dropped: the editor's state
+        // is not the failure's cause.
+        assert_eq!(
+            errors[0].excerpt,
+            "Tool \"search_and_replace\" is not allowed in code mode."
+        );
+        assert_eq!(errors[0].category, ErrorCategory::Other);
+    }
+
+    #[test]
+    fn the_environment_decoration_is_not_the_failure() {
+        // kilo appends an environment_details block to every tool_result —
+        // the editor's state, not the failure's cause. Its file names matched
+        // the vocabulary ("timeout" in a test name) and mis-classified the
+        // failure; the decoration is dropped from the message.
+        let conversation = conversation(vec![
+            assistant_tool_use(
+                1000,
+                "t1",
+                "search_and_replace",
+                json!({"path": "src/a.rs"}),
+            ),
+            json!({"role": "user", "ts": 2000, "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                 "content": [
+                    {"type": "text", "text": r#"{"status":"error","message":"The tool execution failed","error":"Tool \"search_and_replace\" is not allowed in code mode."}"#},
+                    {"type": "text", "text": "<environment_details>\n# VSCode Visible Files\ntimeout.test.ts"}
+                 ]}
+            ]}),
+        ]);
+        let errors = extract_tool_errors(&conversation);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::Other);
+        assert_eq!(
+            errors[0].excerpt,
+            "Tool \"search_and_replace\" is not allowed in code mode."
+        );
+    }
+
+    #[test]
+    fn the_failure_is_classified_on_the_message_not_the_envelope() {
+        // The real envelope carries fields of its own — "timeout" among them —
+        // and classifying on the envelope matched the wrong vocabulary. The
+        // category comes from the same readable text the excerpt carries.
+        let conversation = conversation(vec![
+            assistant_tool_use(
+                1000,
+                "t1",
+                "search_and_replace",
+                json!({"path": "src/a.rs"}),
+            ),
+            user_tool_result(
+                2000,
+                "t1",
+                true,
+                r#"{"status":"error","message":"The tool execution failed","error":"Tool \"search_and_replace\" is not allowed in code mode.","timeout":30000}"#,
+            ),
+        ]);
+        let errors = extract_tool_errors(&conversation);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::Other);
     }
 
     #[test]
