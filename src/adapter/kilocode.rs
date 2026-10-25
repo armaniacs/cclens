@@ -29,7 +29,7 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// lives apart from the shared `ANALYZER_VERSION` (`store.rs`) on purpose:
 /// a kilocode-only change must never force other harnesses through a full
 /// re-analyze. Stored under its own `meta` key.
-pub const KILOCODE_ANALYZER_VERSION: &str = "1";
+pub const KILOCODE_ANALYZER_VERSION: &str = "2";
 
 /// The `meta` key holding the kilocode analysis semantics.
 pub const KILOCODE_ANALYZER_META_KEY: &str = "kilocode_analyzer_version";
@@ -287,7 +287,7 @@ fn tool_target(input: Option<&Value>) -> String {
     let Some(input) = input else {
         return String::new();
     };
-    for key in ["path", "command", "pattern", "url"] {
+    for key in ["path", "file_path", "command", "pattern", "url"] {
         if let Some(value) = input.get(key).and_then(Value::as_str) {
             return truncate(value);
         }
@@ -320,12 +320,15 @@ fn truncate(text: &str) -> String {
         .collect()
 }
 
-/// Estimate the session root from tool inputs — a stated heuristic, since
-/// kilocode stamps no `cwd` anywhere. The root is the common parent directory
-/// of the **leading** absolute paths: the first two tool paths seed it, every
-/// later path under it refines it, and the first path outside it ends the run
-/// (a later outlier does not drag the estimate down). `None` when no absolute
-/// path appears — the session is then unrooted, never guessed.
+/// Estimate the session root. The strongest signal is the `cwd` kilocode
+/// carries on every `execute_command` input: the first absolute value is the
+/// root, the same confidence as Claude Code's first-`cwd` field (verified:
+/// every task that carries a cwd names exactly one distinct value, while tool
+/// paths are overwhelmingly relative). A task with no absolute cwd falls back
+/// to the leading tool paths: the first two seed it, every later path under it
+/// refines it, and the first path outside it ends the run (a later outlier
+/// does not drag the estimate down). `None` when neither appears — the session
+/// is then unrooted, never guessed.
 pub fn estimate_root(conversation: &str) -> Option<String> {
     let parsed = serde_json::from_str::<Value>(conversation).ok()?;
     let messages = parsed.as_array()?;
@@ -335,8 +338,7 @@ pub fn estimate_root(conversation: &str) -> Option<String> {
         .collect();
     ordered.sort_by_key(|(_, ts)| *ts);
 
-    // The parent directories and full paths of every absolute tool path, in
-    // `ts` order (within a message, `path` then `files[]`).
+    let mut first_cwd: Option<String> = None;
     let mut parents: Vec<Vec<String>> = Vec::new();
     let mut full_paths: Vec<Vec<String>> = Vec::new();
     for (message, _) in ordered {
@@ -353,6 +355,15 @@ pub fn estimate_root(conversation: &str) -> Option<String> {
             let Some(input) = block.get("input") else {
                 continue;
             };
+            if first_cwd.is_none()
+                && block.get("name").and_then(Value::as_str) == Some("execute_command")
+            {
+                if let Some(cwd) = input.get("cwd").and_then(Value::as_str) {
+                    if cwd.starts_with('/') {
+                        first_cwd = Some(cwd.to_string());
+                    }
+                }
+            }
             for path in input_paths(input) {
                 if !path.starts_with('/') {
                     continue; // a relative path carries no root signal
@@ -369,6 +380,12 @@ pub fn estimate_root(conversation: &str) -> Option<String> {
                 parents.push(components[..components.len() - 1].to_vec());
             }
         }
+    }
+
+    // The first absolute `cwd` wins outright — it is the start working
+    // directory, not a guess from the files the task happened to touch.
+    if let Some(cwd) = first_cwd {
+        return Some(cwd);
     }
 
     let mut root: Vec<String> = match parents.as_slice() {
@@ -453,7 +470,7 @@ pub fn extract_work_events(conversation: &str) -> Vec<WorkEvent> {
                         });
                     }
                 }
-                "apply_diff" | "write_to_file" => {
+                "edit_file" | "apply_diff" | "search_and_replace" | "write_to_file" => {
                     let path = tool_target(input);
                     if !path.is_empty() {
                         events.push(WorkEvent {
@@ -902,6 +919,52 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_file_is_a_file_edit() {
+        // The measured edit tool is `edit_file` (361 of 555 edit calls) and
+        // its path key is `file_path` — `apply_diff` was only 101, so mapping
+        // it alone under-counted the edits by four to one.
+        let conversation = conversation(vec![assistant_tool_use(
+            1000,
+            "t1",
+            "edit_file",
+            json!({"file_path": "src/a.rs", "old_string": "x", "new_string": "y"}),
+        )]);
+        let events = extract_work_events(&conversation);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "file_edit");
+        assert_eq!(events[0].id, "a.rs");
+        assert_eq!(events[0].path.as_deref(), Some("src/a.rs"));
+    }
+
+    #[test]
+    fn a_search_and_replace_is_a_file_edit() {
+        let conversation = conversation(vec![assistant_tool_use(
+            1000,
+            "t1",
+            "search_and_replace",
+            json!({"path": "src/b.rs", "operations": []}),
+        )]);
+        let events = extract_work_events(&conversation);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "file_edit");
+        assert_eq!(events[0].id, "b.rs");
+    }
+
+    #[test]
+    fn an_edit_file_error_carries_its_target() {
+        // `file_path` names the edit_file target; without it every edit_file
+        // failure came out with an unknown target.
+        let conversation = conversation(vec![
+            assistant_tool_use(1000, "t1", "edit_file", json!({"file_path": "src/a.rs"})),
+            user_tool_result(2000, "t1", true, "ENOENT: no such file"),
+        ]);
+        let errors = extract_tool_errors(&conversation);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].tool, "edit_file");
+        assert_eq!(errors[0].target, "src/a.rs");
+    }
+
+    #[test]
     fn the_root_is_the_leading_paths_common_parent_dir() {
         // Tool paths in one directory share it; a later path outside the
         // established root does not drag the estimate down.
@@ -929,6 +992,68 @@ mod tests {
             estimate_root(&conversation).as_deref(),
             Some("/tmp/example/proj")
         );
+    }
+
+    #[test]
+    fn the_first_execute_command_cwd_is_the_root() {
+        // kilocode carries a `cwd` on execute_command inputs, and every task
+        // that carries one names exactly one distinct value — the same
+        // confidence as Claude Code's first-`cwd` root. Tool paths are
+        // overwhelmingly relative (945 of 983 measured), so without this the
+        // per-project cut is empty.
+        let conversation = conversation(vec![
+            assistant_tool_use(
+                1000,
+                "t1",
+                "execute_command",
+                json!({"command": "cargo test", "cwd": "/tmp/example/proj"}),
+            ),
+            assistant_tool_use(
+                2000,
+                "t2",
+                "edit_file",
+                json!({"file_path": "src/a.rs", "old_string": "x", "new_string": "y"}),
+            ),
+        ]);
+        assert_eq!(
+            estimate_root(&conversation).as_deref(),
+            Some("/tmp/example/proj")
+        );
+    }
+
+    #[test]
+    fn the_cwd_wins_even_when_tool_paths_are_deeper() {
+        let conversation = conversation(vec![
+            assistant_tool_use(
+                1000,
+                "t1",
+                "edit_file",
+                json!({"file_path": "/tmp/example/proj/src/a.rs"}),
+            ),
+            assistant_tool_use(
+                2000,
+                "t2",
+                "execute_command",
+                json!({"command": "npm test", "cwd": "/tmp/example/proj"}),
+            ),
+        ]);
+        assert_eq!(
+            estimate_root(&conversation).as_deref(),
+            Some("/tmp/example/proj")
+        );
+    }
+
+    #[test]
+    fn a_relative_cwd_is_skipped() {
+        // A relative cwd carries no root signal; the leading-path rule (or
+        // none) stands in.
+        let conversation = conversation(vec![assistant_tool_use(
+            1000,
+            "t1",
+            "execute_command",
+            json!({"command": "cargo test", "cwd": "src"}),
+        )]);
+        assert_eq!(estimate_root(&conversation), None);
     }
 
     #[test]

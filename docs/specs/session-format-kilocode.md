@@ -132,12 +132,12 @@ opencode adapter's ordering.
 | --- | --- |
 | Skill invocation | **none observed** — kilocode config installs `skills/` and `command/*.md`, but neither file carries an invocation marker in the samples. The signal stays absent until a marker is measured; a later skills catalog would show live `Skill` usage as orphaned rows in `inventory`, which is the honest missing-site signal |
 | Subagent spawn | **none observed** — no spawn marker or join key measured. Subagent runs are not ingested; `sub_tokens`/`sub_agent_count` stay zero and the split reads as unavailable, as under opencode |
-| Tool use | `tool_use` blocks in assistant messages (observed: `execute_command`, `read_file`, `apply_diff`, `update_todo_list`, `ask_followup_question`, `attempt_completion`, …) |
+| Tool use | `tool_use` blocks in assistant messages. Measured across 92 tasks: `execute_command` (754), `read_file` (616), `edit_file` (361), `search_files` (201), `update_todo_list` (155), `attempt_completion` (148), `apply_diff` (101), `search_and_replace` (93) |
 | Tool failure | the `tool_result` paired by `tool_use_id` carrying `is_error == true` (1 of 155 sampled blocks — the Anthropic-compatible failure field). Text from the block content; the target from the paired `tool_use` input |
 | User prompt | a user message carrying text material |
 | Permission denial | **none observed** — `ask=tool` rows appear only where approval was requested (12 rows against 49 tool calls in one sampled task; auto-approved calls emit none), so they undercount and are no usage signal. No denial marker in the samples (0 phrasing hits) |
 | Retry | `say=api_req_retry_delayed` — friction input candidate, not mapped in v1 |
-| Work events | `tool_use` inputs, the same way the other adapters report work: `execute_command`'s `command` leading word (`bash_cmd`), `apply_diff`/`write_to_file`'s `path` basename with the full path alongside (`file_edit`). Reads (`read_file`) are not work |
+| Work events | `tool_use` inputs, the same way the other adapters report work: `execute_command`'s `command` leading word (`bash_cmd`); `edit_file`'s `file_path` and `apply_diff`/`search_and_replace`/`write_to_file`'s `path` — basename with the full path alongside (`file_edit`). Reads (`read_file`, `search_files`) are not work |
 
 `tool_result.tool_use_id` joins each failure back to its exact `tool_use`
 block (`id`), the same join Claude Code uses — the failure inherits the
@@ -157,16 +157,19 @@ already includes cache reads this overstates the floor; the `overhead`
 reconciliation (`surfaces.md`) is the honest check, and this paragraph is
 where the assumption is versioned when kilocode documents it.
 
-## Project root (a stated heuristic)
+## Project root (the cwd field, then a stated heuristic)
 
-Neither file carries a `cwd`-style field. The adapter estimates the root as
-the **common prefix of the leading absolute paths** observed in tool inputs
-(`path`, `files[]`, also mirrored in the `ask=tool` payloads' `path`), and
-states the estimate as a heuristic — its confidence sits below Claude Code's
-first-`cwd` root and DSH's `session.cwd`, because it depends on the tools the
-task happened to run rather than a field the format guarantees. A task whose
-tools name no absolute paths at all yields an unrooted session — `root` stays
-empty, as a Claude Code transcript with no `cwd` does — rather than a guess.
+The format does carry a cwd-style field: every `execute_command` input carries
+`cwd` (640 of 754 measured rows), and every task that carries one names
+exactly one distinct value — the start working directory. The adapter roots
+the session at the **first absolute `cwd`**, the same confidence as Claude
+Code's first-`cwd` root. A task with no absolute cwd falls back to the
+**common prefix of the leading absolute paths** observed in tool inputs — a
+stated heuristic, since tool paths are overwhelmingly relative (945 relative
+vs 38 absolute measured, and the `ask=tool` payloads' `path` is relative too),
+so the fallback is rare. A task with neither yields an unrooted session —
+`root` stays empty, as a Claude Code transcript with no `cwd` does — rather
+than a guess.
 
 ## What is deliberately not mapped (v1)
 
@@ -195,3 +198,11 @@ is missing, unparseable, or marked `usageMissing=true` yields a zero-token
 request record — a missing measurement is recorded as zero, never
 fabricated, and replace semantics make the in-flight case idempotent on
 re-ingest.
+
+**The full 92-task survey corrected the earlier sample.** The small survey
+behind the first draft assumed no cwd-style field and `apply_diff`/
+`write_to_file` as the edit tools; the full run showed `execute_command.cwd`
+(640 rows, one distinct value per task) and `edit_file`/`search_and_replace`
+as the real edit names. Fixing the mapping moved 86 of 92 sessions out of
+unrooted and lifted `file_edit` events from 115 to 570, so it bumped
+`KILOCODE_ANALYZER_VERSION` to `2` — the survey is the version bump's reason.
