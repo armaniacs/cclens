@@ -24,7 +24,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "5";
+const ANALYZER_VERSION: &str = "6";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -628,7 +628,7 @@ impl Store {
                    (session_id, source_path, kind, surface_id, source, model, target,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak)
-                 VALUES (?1, ?2, 'tool_error', ?3, ?4, ?5, ?6, '', ?7, 0, 0, 0, 0, 0)",
+                 VALUES (?1, ?2, 'tool_error', ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, 0)",
                 (
                     session_id,
                     source_path,
@@ -636,6 +636,7 @@ impl Store {
                     *excerpt,
                     *tool,
                     *target,
+                    epoch_ms_to_rfc3339(*epoch_ms),
                     epoch_ms / 1000,
                 ),
             )?;
@@ -663,8 +664,16 @@ impl Store {
                    (session_id, source_path, kind, surface_id, target,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak)
-                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 0, 0, 0, 0, 0)",
-                (session_id, source_path, kind, id, path, epoch_ms / 1000),
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, 0, 0)",
+                (
+                    session_id,
+                    source_path,
+                    kind,
+                    id,
+                    path,
+                    epoch_ms_to_rfc3339(*epoch_ms),
+                    epoch_ms / 1000,
+                ),
             )?;
         }
         tx.commit()?;
@@ -2464,6 +2473,43 @@ mod tests {
         store.ingest_session(&c, &[], &[]).unwrap();
 
         assert_eq!(store.session_stats().unwrap(), (3, 2));
+    }
+
+    #[test]
+    fn work_events_and_tool_errors_carry_a_readable_timestamp() {
+        // The epoch is not enough for a sql read: an advisor drilling into a
+        // session wants the wall-clock time without re-deriving it, and the
+        // headless walkthrough stalled on the empty column.
+        let mut store = Store::in_memory().unwrap();
+        store.ingest_session(&session("a1"), &[], &[]).unwrap();
+        store
+            .ingest_work_events(
+                "a1",
+                "t.jsonl",
+                &[(1_000, "file_edit", "x.rs", Some("/repo/src/x.rs"))],
+            )
+            .unwrap();
+        store
+            .ingest_tool_errors(
+                "a1",
+                "t.jsonl",
+                &[(
+                    2_000,
+                    "path-not-found",
+                    "no such file",
+                    "read_file",
+                    "/repo/src/y.rs",
+                )],
+            )
+            .unwrap();
+
+        let rows = store
+            .query("SELECT kind, started_at FROM events ORDER BY started_epoch")
+            .unwrap()
+            .1;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1], "1970-01-01T00:00:01+00:00");
+        assert_eq!(rows[1][1], "1970-01-01T00:00:02+00:00");
     }
 
     #[test]

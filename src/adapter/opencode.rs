@@ -26,7 +26,7 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// It lives apart from the shared `ANALYZER_VERSION` (`store.rs`) on
 /// purpose: an opencode-only change must never force every Claude Code user
 /// through a full re-analyze. Stored under its own `meta` key.
-pub const OPENCODE_ANALYZER_VERSION: &str = "2";
+pub const OPENCODE_ANALYZER_VERSION: &str = "3";
 
 /// The `meta` key holding the opencode analysis semantics.
 pub const OPENCODE_ANALYZER_META_KEY: &str = "opencode_analyzer_version";
