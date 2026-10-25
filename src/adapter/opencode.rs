@@ -1118,3 +1118,115 @@ mod tests {
         assert!(has("claude_md", "AGENTS.md"));
     }
 }
+
+/// One rendered slice of a `opencode run --format json` output line — what the
+/// terminal shows while a headless optimize session runs. The upstream event
+/// shapes are unversioned and vary across opencode releases, so the parse is
+/// lenient: a line that carries no recognizable text yields `Silent` and the
+/// raw line goes to the log file instead (`docs/specs/harness.md`).
+#[derive(Debug, PartialEq)]
+pub enum RunEvent {
+    /// Agent-visible text: the narration lines and the final plan.
+    Text(String),
+    /// A compact progress marker for a tool call (`bash`, `read`, …).
+    Progress(String),
+    /// An event with no agent-visible text (steps, reasoning, unknown shapes).
+    Silent,
+}
+
+/// Render one `--format json` line. Text parts surface as `Text`, tool parts
+/// as a one-line `Progress` marker, everything else stays `Silent` — so a
+/// headless run streams the plan without the raw tool dumps.
+pub fn render_run_line(line: &str) -> RunEvent {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return RunEvent::Silent;
+    };
+    // The part may sit at the top level or one level down (`part`, `parts[0]`).
+    for candidate in [
+        Some(&v),
+        v.get("part"),
+        v.get("parts").and_then(|p| p.get(0)),
+    ] {
+        let Some(part) = candidate else { continue };
+        let Some(kind) = part.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        return match kind {
+            "text" => match part.get("text").and_then(Value::as_str) {
+                Some(text) if !text.trim().is_empty() => RunEvent::Text(text.to_string()),
+                _ => RunEvent::Silent,
+            },
+            "tool" => match part
+                .get("tool")
+                .or_else(|| part.get("toolName"))
+                .or_else(|| part.get("name"))
+                .and_then(Value::as_str)
+            {
+                Some(tool) if !tool.is_empty() => RunEvent::Progress(tool.to_string()),
+                _ => RunEvent::Silent,
+            },
+            _ => RunEvent::Silent,
+        };
+    }
+    RunEvent::Silent
+}
+
+#[cfg(test)]
+mod run_event_tests {
+    use super::*;
+
+    #[test]
+    fn a_text_part_renders_its_text() {
+        let line = r#"{"type":"text","text":"Plan: batch wiki edits"}"#;
+        assert_eq!(
+            render_run_line(line),
+            RunEvent::Text("Plan: batch wiki edits".to_string())
+        );
+    }
+
+    #[test]
+    fn a_nested_text_part_renders_too() {
+        let line = r#"{"part":{"type":"text","text":"narration"}}"#;
+        assert_eq!(
+            render_run_line(line),
+            RunEvent::Text("narration".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tool_part_renders_a_progress_marker() {
+        let line = r#"{"type":"tool","tool":"bash","state":{"status":"running"}}"#;
+        assert_eq!(
+            render_run_line(line),
+            RunEvent::Progress("bash".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tool_part_without_a_name_stays_silent() {
+        let line = r#"{"type":"tool","state":{"status":"pending"}}"#;
+        assert_eq!(render_run_line(line), RunEvent::Silent);
+    }
+
+    #[test]
+    fn step_reasoning_and_unknown_parts_stay_silent() {
+        for line in [
+            r#"{"type":"step-start"}"#,
+            r#"{"type":"step-finish","tokens":1}"#,
+            r#"{"type":"reasoning","text":"thinking"}"#,
+            r#"{"type":"file","mime":"text/plain"}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(render_run_line(line), RunEvent::Silent, "{line}");
+        }
+    }
+
+    #[test]
+    fn an_empty_text_part_stays_silent() {
+        assert_eq!(
+            render_run_line(r#"{"type":"text","text":"  "}"#),
+            RunEvent::Silent
+        );
+    }
+}

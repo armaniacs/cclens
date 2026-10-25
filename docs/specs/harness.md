@@ -105,10 +105,20 @@ contract:
 The briefing composes from the store either way, so `--print` works under
 every harness. Launching runs the harness's own agent on a data-free pointer
 prompt (the briefing travels via a private temp file, as for Claude Code):
-`claude <prompt>` opens interactively, while `opencode run <prompt>` runs
-the advisor headless — no user is present for the approval gate, so the
-headless instructions (`run_instructions`) make the printed plan the final
-output and forbid edits.
+`claude <prompt>` opens interactively, while `opencode run --format json
+--title 'cclens optimize' <prompt>` runs the advisor headless — no user is
+present for the approval gate, so the headless instructions
+(`run_instructions`) make the printed plan the final output and forbid
+edits.
+
+The headless terminal stays quiet: cclens reads the JSON event stream line
+by line and surfaces only what the agent says — text parts (narration, then
+the plan) on stdout, one-line tool markers on stderr — while every raw line
+and the child's stderr go to a private (`0600`) log file whose path is
+printed up front. Rendering is lenient (the upstream event shapes are
+unversioned): a line with no recognizable text stays in the log, and a run
+that renders nothing readable says so instead of leaving silence.
+`--verbose` inherits stdio for the raw streaming instead.
 
 ## Report copy names the harness
 

@@ -233,15 +233,17 @@ lists the full schema.
 
 ```
 cclens optimize [--projects <dir>] [--db <path>] [--scope global|project[:<slug>]]
-                [--frozen] [--print]
+                [--frozen] [--print] [--verbose]
 ```
 
 The AI-proposal consumer (`architecture.md`): rather than emit static
 "recommendations" the tool cannot safely act on, `optimize` analyzes (unless
 `--frozen`, the same flag the views use), composes the findings with a prescribed advisor prompt, and
 launches the harness's agent seeded with it — `claude` for an interactive
-session that applies edits on agreement, `opencode run` for a headless run
-that prints the plan without editing. The prompt makes
+session that applies edits on agreement, `opencode run --format json` for a
+headless run that streams only the agent's text while the raw tool output
+logs to a private file (`--verbose` restores the raw stream) and prints the
+plan without editing. The prompt makes
 the session **investigate autonomously to a conclusion**: it pins down each root
 cause and proposes a concrete fix, rather than handing the analysis back with a
 "which area do you want to start with?". It prioritises work friction over config

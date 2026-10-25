@@ -229,9 +229,13 @@ enum Command {
         /// Use the existing store as-is; skip the analyze step.
         #[arg(long)]
         frozen: bool,
-        /// Print the composed prompt instead of launching `claude`.
+        /// Print the composed prompt instead of launching the advisor.
         #[arg(long)]
         print: bool,
+        /// Stream the advisor's raw output instead of the quiet render
+        /// (headless opencode runs log raw output to a file by default).
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -339,6 +343,7 @@ pub fn run() -> Result<()> {
             scope,
             frozen,
             print,
+            verbose,
         } => optimize(
             &harness,
             projects,
@@ -346,6 +351,7 @@ pub fn run() -> Result<()> {
             &parse_scope(scope.as_deref())?,
             frozen,
             print,
+            verbose,
         ),
     }
 }
@@ -375,11 +381,16 @@ fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
 /// See `docs/specs/harness.md` for the per-harness launch shape.
 /// Launch the harness's advisor for an optimize session: the binary plus any
 /// leading argv. `claude` opens interactively on the prompt; `opencode run`
-/// investigates headlessly and prints the plan (see `run_instructions`).
+/// investigates headlessly — JSON events (`--format json`) so the raw tool
+/// dumps can be logged while only the agent's text streams, and a title so
+/// the sessions it seeds are recognizable in the store it feeds.
 fn launch_command(harness: &Harness) -> (&'static str, &'static [&'static str]) {
     match harness {
         Harness::Claude => ("claude", &[]),
-        Harness::Opencode => ("opencode", &["run"]),
+        Harness::Opencode => (
+            "opencode",
+            &["run", "--format", "json", "--title", "cclens optimize"],
+        ),
     }
 }
 ///
@@ -395,6 +406,7 @@ fn optimize(
     filter: &ScopeFilter,
     frozen: bool,
     print: bool,
+    verbose: bool,
 ) -> Result<()> {
     if !frozen {
         let stats = run_analyze(harness, projects, db)?;
@@ -455,46 +467,131 @@ fn optimize(
         mode,
     );
 
-    // Hand over the terminal: the advisor starts on the pointer prompt,
-    // inheriting our stdio so the user watches (or takes over). Clean up the
+    // Hand over the terminal. `claude` opens an interactive TUI on the pointer
+    // prompt (stdio inherited, the user takes over); opencode runs headless, so
+    // its raw stream is logged to a private file and only the agent's text
+    // (narration, then the final plan) streams on stdout — the tool dumps stay
+    // in the log, and `--verbose` keeps the old raw streaming. Clean up the
     // briefing file the moment the run ends, whatever the outcome.
     let (binary, leading) = launch_command(harness);
-    let mut launch = std::process::Command::new(binary);
-    for arg in leading {
-        launch.arg(arg);
-    }
-    let result = launch.arg(&prompt).status();
-    let _ = fs::remove_file(&briefing_path);
-
-    let invocation = format!("{} {}", binary, leading.join(" "))
-        .trim_end()
-        .to_string();
-    let status = result.with_context(|| {
+    let launch_note = || {
         format!(
-            "launch `{invocation}` — is {} installed and on PATH?",
+            "launch `{} {}` — is {} installed and on PATH?",
+            binary,
+            leading.join(" ").trim_end(),
             harness.display_name()
         )
-    })?;
+    };
+    let (result, run_log) = if *harness == Harness::Opencode && !verbose {
+        let (status, log) = run_headless(binary, leading, &prompt).with_context(launch_note)?;
+        (Ok(status), Some(log))
+    } else {
+        let status = std::process::Command::new(binary)
+            .args(leading)
+            .arg(&prompt)
+            .status();
+        (status, None)
+    };
+    let _ = fs::remove_file(&briefing_path);
+
+    let status = result.with_context(launch_note)?;
     if !status.success() {
-        anyhow::bail!("{binary} exited with {status}");
+        match run_log {
+            Some(log) => anyhow::bail!(
+                "{binary} exited with {status} — raw output: {}",
+                log.display()
+            ),
+            None => anyhow::bail!("{binary} exited with {status}"),
+        }
     }
     Ok(())
+}
+
+/// Run the headless advisor with its raw output logged: spawn with stdout
+/// piped, write every raw line (and the child's stderr) to a private log, and
+/// surface only what the agent says — text parts on stdout (so a pipe like
+/// `| pbcopy` receives the narration and the plan), one-line tool markers on
+/// stderr. Returns the log path so the caller can point at the full detail.
+/// The raw event shapes are unversioned upstream, so rendering is lenient: a
+/// line with no recognizable text stays in the log, and a run that renders
+/// nothing readable says so instead of leaving silence.
+fn run_headless(
+    binary: &str,
+    leading: &[&str],
+    prompt: &str,
+) -> Result<(std::process::ExitStatus, PathBuf)> {
+    use std::io::{BufRead, Write};
+
+    let log_path = private_temp_path("cclens-run", "log");
+    write_private_file(&log_path, "").context("create run log")?;
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .context("open run log")?;
+    let child_err = fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .context("open run log for the advisor")?;
+
+    eprintln!(
+        "{}",
+        Style::stderr().dim(&format!(
+            "advisor running headlessly — raw progress: {}",
+            log_path.display()
+        ))
+    );
+
+    let mut launch = std::process::Command::new(binary);
+    launch.args(leading).arg(prompt);
+    launch
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(child_err));
+    let mut child = launch.spawn()?;
+    let stdout = child.stdout.take().context("pipe the advisor's stdout")?;
+
+    let mut readable = false;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.context("read the advisor's output")?;
+        writeln!(log, "{line}").context("write the run log")?;
+        match opencode_mod::render_run_line(&line) {
+            opencode_mod::RunEvent::Text(text) => {
+                readable = true;
+                println!("{text}");
+            }
+            opencode_mod::RunEvent::Progress(tool) => {
+                eprintln!("{}", Style::stderr().dim(&format!("  → {tool}")));
+            }
+            opencode_mod::RunEvent::Silent => {}
+        }
+    }
+    let status = child.wait()?;
+    if status.success() && !readable {
+        eprintln!(
+            "{}",
+            Style::stderr().dim(&format!(
+                "the advisor produced no readable text — full output: {}",
+                log_path.display()
+            ))
+        );
+    }
+    Ok((status, log_path))
+}
+
+/// A fresh private temp path for `prefix`, unique per process and call.
+fn private_temp_path(prefix: &str, ext: &str) -> PathBuf {
+    // The clock is here to avoid a collision with a leftover file, not to be
+    // unguessable — exclusive creation is what makes guessing the name useless.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos:x}.{ext}", std::process::id()))
 }
 
 /// Write `contents` to a fresh file in the temp dir. Used for the optimization
 /// briefing, which may hold sensitive paths/excerpts and must not sit on argv or
 /// be world-readable.
 fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
-    // The clock is here to avoid a collision with a leftover file, not to be
-    // unguessable — exclusive creation is what makes guessing the name useless.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "cclens-briefing-{}-{nanos:x}.md",
-        std::process::id()
-    ));
+    let path = private_temp_path("cclens-briefing", "md");
     write_private_file(&path, contents)?;
     Ok(path)
 }
@@ -3509,11 +3606,15 @@ mod tests {
     #[test]
     fn launch_command_runs_each_harness_own_agent() {
         // `claude` opens interactively on the prompt; `opencode run` runs the
-        // advisor headless (see `run_instructions`).
+        // advisor headless on JSON events (raw tool dumps loggable) with a
+        // recognizable session title (see `run_instructions`).
         assert_eq!(launch_command(&Harness::Claude), ("claude", &[] as &[&str]));
         assert_eq!(
             launch_command(&Harness::Opencode),
-            ("opencode", &["run"] as &[&str])
+            (
+                "opencode",
+                &["run", "--format", "json", "--title", "cclens optimize"] as &[&str]
+            )
         );
     }
 
