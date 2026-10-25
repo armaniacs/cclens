@@ -24,7 +24,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "4";
+const ANALYZER_VERSION: &str = "5";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (

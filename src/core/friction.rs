@@ -25,6 +25,11 @@ pub enum ErrorCategory {
     ToolNotAvailable,
     /// A tool was called with invalid arguments.
     InputValidation,
+    /// A fetched URL answered with an HTTP error (404, 500, ...).
+    WebError,
+    /// A file the reader refuses as binary — usually an encoding mismatch,
+    /// not a missing file.
+    BinaryFile,
     /// An MCP server returned an error (auth, validation, upstream).
     McpError,
     /// A user-stopped or cascade-cancelled call — not a code failure.
@@ -49,6 +54,8 @@ impl ErrorCategory {
             ErrorCategory::Timeout => "timeout",
             ErrorCategory::ToolNotAvailable => "tool-not-available",
             ErrorCategory::InputValidation => "input-validation",
+            ErrorCategory::WebError => "web-error",
+            ErrorCategory::BinaryFile => "binary-file",
             ErrorCategory::McpError => "mcp-error",
             ErrorCategory::Cancelled => "cancelled",
             ErrorCategory::Transient => "transient",
@@ -69,6 +76,8 @@ impl ErrorCategory {
             "timeout" => ErrorCategory::Timeout,
             "tool-not-available" => ErrorCategory::ToolNotAvailable,
             "input-validation" => ErrorCategory::InputValidation,
+            "web-error" => ErrorCategory::WebError,
+            "binary-file" => ErrorCategory::BinaryFile,
             "mcp-error" => ErrorCategory::McpError,
             "cancelled" => ErrorCategory::Cancelled,
             "transient" => ErrorCategory::Transient,
@@ -123,6 +132,15 @@ impl ErrorCategory {
                 "a tool was called by a name that doesn't exist — wrong/deferred tool".to_string()
             }
             ErrorCategory::InputValidation => "tool called with invalid arguments".to_string(),
+            ErrorCategory::WebError => {
+                "a fetched URL returned an HTTP error — a dead or moved link; update or drop it"
+                    .to_string()
+            }
+            ErrorCategory::BinaryFile => {
+                "a file the reader refuses as binary — usually an encoding mismatch; convert it \
+                 or stop pointing at it"
+                    .to_string()
+            }
             ErrorCategory::McpError => {
                 "an MCP server erroring (auth/validation/upstream)".to_string()
             }
@@ -185,6 +203,14 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         ErrorCategory::BlockedByHook
     } else if has("temporarily unavailable") || has("overloaded") {
         ErrorCategory::Transient
+    } else if has("non 2xx status code") {
+        // A fetched URL answered with an HTTP error — checked before the file
+        // patterns since the URL may contain any of their phrases.
+        ErrorCategory::WebError
+    } else if has("cannot read binary file") {
+        // The reader refuses the file's encoding, not its existence — checked
+        // before the path patterns for the same reason.
+        ErrorCategory::BinaryFile
     } else if has("no such tool available") || has("not found. available skills") {
         ErrorCategory::ToolNotAvailable
     } else if has("inputvalidationerror")
@@ -219,6 +245,24 @@ pub fn classify_error(text: &str) -> ErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_file_reads_are_their_own_category() {
+        assert_eq!(
+            classify_error("Cannot read binary file: /tmp/example/notes/2026-02-15.md"),
+            ErrorCategory::BinaryFile
+        );
+    }
+
+    #[test]
+    fn http_status_errors_are_their_own_category() {
+        assert_eq!(
+            classify_error(
+                "StatusCode: non 2xx status code (404 GET https://example.com/main/README.md)"
+            ),
+            ErrorCategory::WebError
+        );
+    }
 
     #[test]
     fn edit_precondition_is_detected_first() {

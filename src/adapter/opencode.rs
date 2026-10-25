@@ -859,7 +859,7 @@ mod tests {
         // excerpt under `Other` rather than disappearing.
         let read = json!({
             "type": "tool", "tool": "read", "callID": "call_7",
-            "state": {"status": "error", "error": "Cannot read binary file: /tmp/example/img.png",
+            "state": {"status": "error", "error": "widgets could not be evaluated",
                       "input": {"filePath": "/tmp/example/img.png"}},
         });
         let parts = [PartRow {
