@@ -13,6 +13,7 @@ use crate::adapter::config::{
     read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
 use crate::adapter::harness::Harness;
+use crate::adapter::kilocode as kilocode_mod;
 use crate::adapter::opencode as opencode_mod;
 use crate::adapter::transcript::{
     count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
@@ -362,7 +363,7 @@ fn parse_harness(value: Option<&str>) -> Result<Harness> {
     match value {
         None => Ok(Harness::Claude),
         Some(v) => Harness::parse(v)
-            .with_context(|| format!("unknown --harness '{v}' (claude | opencode)")),
+            .with_context(|| format!("unknown --harness '{v}' (claude | opencode | kilocode)")),
     }
 }
 
@@ -391,6 +392,11 @@ fn launch_command(harness: &Harness) -> (&'static str, &'static [&'static str]) 
             "opencode",
             &["run", "--format", "json", "--title", "cclens optimize"],
         ),
+        // The `kilo` binary is the measured agent CLI (Homebrew), but its
+        // prompt-launch surface is unmeasured — `optimize` defers the launch
+        // for kilocode, so this arm names the shape a measured launch would
+        // take rather than a command that runs.
+        Harness::Kilocode => ("kilo", &[]),
     }
 }
 ///
@@ -458,6 +464,7 @@ fn optimize(
     let mode = match harness {
         Harness::Claude => optimize_mod::RunMode::Interactive,
         Harness::Opencode => optimize_mod::RunMode::Headless,
+        Harness::Kilocode => optimize_mod::RunMode::Interactive,
     };
     let prompt = optimize_mod::launch_prompt(
         &briefing_path.to_string_lossy(),
@@ -1918,6 +1925,7 @@ fn run_analyze(harness: &Harness, projects: Option<PathBuf>, db: &Path) -> Resul
     match harness {
         Harness::Claude => run_analyze_claude(projects, db),
         Harness::Opencode => run_analyze_opencode(projects, db),
+        Harness::Kilocode => run_analyze_kilocode(projects, db),
     }
 }
 
@@ -2236,6 +2244,164 @@ fn default_opencode_db() -> Result<PathBuf> {
     let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     Harness::opencode_db_path(data_home.as_deref(), home_dir().map(Path::new))
         .context("set XDG_DATA_HOME or HOME")
+}
+
+/// Analyze kilocode task directories into the kilocode store. The file-to-
+/// record mapping is `adapter::kilocode`; this shell reads each task's two
+/// JSON files and ingests each task idempotently. See `docs/specs/harness.md`
+/// for the v1 capability boundaries (no subagent runs, no prompts, no
+/// permission denials, no surface catalog yet).
+fn run_analyze_kilocode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+    let input = match input {
+        Some(path) => path,
+        None => default_kilocode_tasks()?,
+    };
+    if !input.is_dir() {
+        anyhow::bail!(
+            "no kilocode tasks directory at {} — is the kilocode extension installed (or pass its path via --projects)?",
+            input.display()
+        );
+    }
+    let mut store = Store::open(db).context("open store")?;
+    // The kilocode version key lives apart from the shared analyzer version:
+    // a kilocode-only extraction change must never force other harnesses
+    // through a full re-analyze (`adapter::kilocode::KILOCODE_ANALYZER_VERSION`).
+    let reuse_ingested = store
+        .meta(kilocode_mod::KILOCODE_ANALYZER_META_KEY)?
+        .as_deref()
+        == Some(kilocode_mod::KILOCODE_ANALYZER_VERSION);
+
+    let mut task_dirs: Vec<PathBuf> = std::fs::read_dir(&input)
+        .with_context(|| format!("read {}", input.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    task_dirs.sort();
+
+    let mut sessions = 0;
+    let mut skipped = 0;
+    let mut spans_total = 0;
+    for task_dir in &task_dirs {
+        let conversation_path = task_dir.join("api_conversation_history.json");
+        let ui_path = task_dir.join("ui_messages.json");
+        if !conversation_path.is_file() || !ui_path.is_file() {
+            continue; // a task directory without both files is not a session
+        }
+        let task_id = task_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Per-task fingerprint: the directory stat would re-ingest every task
+        // on each run (checkpoints move too); the two files are the record.
+        let fingerprint_key = format!("kilocode:{}", task_id);
+        let Some((mtime, size)) = task_fingerprint(&conversation_path, &ui_path) else {
+            continue;
+        };
+        if reuse_ingested && store.is_ingested(&fingerprint_key, mtime, size)? {
+            skipped += 1;
+            continue;
+        }
+        let conversation = fs::read_to_string(&conversation_path)
+            .with_context(|| format!("read {}", conversation_path.display()))?;
+        let ui_messages =
+            fs::read_to_string(&ui_path).with_context(|| format!("read {}", ui_path.display()))?;
+        let records = kilocode_mod::parse_session(&conversation, &ui_messages);
+        let spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
+        let usage = extract_usage_events(&records);
+        // The root is the stated heuristic (`adapter::kilocode::estimate_root`):
+        // kilocode stamps no cwd anywhere, so the common parent directory of
+        // the leading tool paths is the best answer — empty when none appears.
+        let root = kilocode_mod::estimate_root(&conversation).unwrap_or_default();
+        let meta = SessionMeta {
+            id: task_id.clone(),
+            project: root.clone(),
+            slug: task_id.clone(),
+            root,
+            source_path: fingerprint_key.clone(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            start: session_start(&records),
+        };
+        store.ingest_session(&meta, &spans, &usage)?;
+        // `raw_errors` owns the strings; `error_rows` borrows them.
+        let raw_errors = kilocode_mod::extract_tool_errors(&conversation);
+        let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
+            .iter()
+            .map(|error| {
+                (
+                    error.epoch_ms,
+                    error.category.label(),
+                    error.excerpt.as_str(),
+                    error.tool.as_str(),
+                    error.target.as_str(),
+                )
+            })
+            .collect();
+        store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
+        // `work` owns the strings; the rows borrow them.
+        let work = kilocode_mod::extract_work_events(&conversation);
+        let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
+            .iter()
+            .map(|event| {
+                (
+                    event.epoch_ms,
+                    event.kind,
+                    event.id.as_str(),
+                    event.path.as_deref(),
+                )
+            })
+            .collect();
+        store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
+        // Record the size actually consumed, so a file that grows after the
+        // read shows a mismatch next run instead of being skipped forever.
+        store.record_ingested_file(&fingerprint_key, mtime, size)?;
+        sessions += 1;
+        spans_total += spans.len();
+    }
+
+    // The kilocode config catalog is a separate spec and change (the global
+    // `~/.config/kilo` sites are measured but not cataloged yet), so the
+    // surface catalog stays empty — reported as empty, never fabricated.
+    store.replace_surfaces(&[])?;
+
+    store.set_meta(
+        kilocode_mod::KILOCODE_ANALYZER_META_KEY,
+        kilocode_mod::KILOCODE_ANALYZER_VERSION,
+    )?;
+    store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
+    store.set_meta("projects_dir", &input.display().to_string())?;
+    store.set_meta("config_dir", "")?;
+    store.set_meta("harness", Harness::Kilocode.label())?;
+
+    Ok(AnalyzeStats {
+        sessions,
+        skipped,
+        spans_total,
+        surface_count: 0,
+        denials: 0,
+    })
+}
+
+/// The kilocode tasks directory for this run: the first editor globalStorage
+/// candidate that exists (`adapter::harness::kilocode_tasks_candidates` is the
+/// pure candidate list this read probes).
+fn default_kilocode_tasks() -> Result<PathBuf> {
+    let candidates = Harness::kilocode_tasks_candidates(home_dir().map(Path::new));
+    let found = candidates.iter().find(|dir| dir.is_dir());
+    match found {
+        Some(dir) => Ok(dir.clone()),
+        None => anyhow::bail!(
+            "no kilocode tasks directory under any known editor — is the kilocode extension installed (or pass its path via --projects)?"
+        ),
+    }
+}
+
+/// The two files' stat folded into one per-task fingerprint: the latest mtime
+/// (either file moves on activity) and the summed size.
+fn task_fingerprint(conversation: &Path, ui: &Path) -> Option<(i64, i64)> {
+    let conversation = file_fingerprint(conversation)?;
+    let ui = file_fingerprint(ui)?;
+    Some((conversation.0.max(ui.0), conversation.1 + ui.1))
 }
 
 /// Open the store for a read command. Unless `--frozen`, the analysis is
@@ -2704,7 +2870,14 @@ fn inventory(
         return emit_json(&serde_json::json!({ "surfaces": items }));
     }
     if catalog.is_empty() && usage.is_empty() {
-        println!("nothing catalogued — run `cclens analyze` first");
+        if *harness == Harness::Kilocode {
+            // The kilocode config half is a separate spec and change: the
+            // analyze ran (this store holds its sessions) and the catalog is
+            // empty by design — "run analyze first" would be wrong advice.
+            println!("nothing catalogued — the kilocode config catalog is not implemented yet");
+        } else {
+            println!("nothing catalogued — run `cclens analyze` first");
+        }
         return Ok(());
     }
 

@@ -17,6 +17,7 @@ defaults, and existing stores — is untouched by every later harness:
 | --- | --- |
 | `claude` | `${XDG_STATE_HOME:-~/.local/state}/cclens/cclens.db` (unchanged) |
 | `opencode` | same state dir, `cclens-opencode.db` |
+| `kilocode` | same state dir, `cclens-kilocode.db` |
 
 An explicit `--db` always wins, exactly as before. The schema is identical in
 every store (`storage.md`); only the rows' origin differs, which is why no
@@ -24,7 +25,8 @@ every store (`storage.md`); only the rows' origin differs, which is why no
 and a shared file is what this design refuses to create. No cross-harness
 aggregation exists in v1.
 
-Every store records its harness in `meta` (`harness = claude | opencode`).
+Every store records its harness in `meta` (`harness = claude | opencode |
+kilocode`).
 A command reading a store built by another harness **refuses with a hint**
 naming the expected `--harness` (or a matching `--db`), rather than reporting
 one harness's rows as another's. `sql` enforces the same guard: it resolves
@@ -36,7 +38,7 @@ lands on the opencode store without flags.
 A global flag, default `claude`:
 
 ```
-cclens [--harness claude|opencode] <command>
+cclens [--harness claude|opencode|kilocode] <command>
 ```
 
 - The default keeps every existing invocation byte-identical in behavior —
@@ -49,7 +51,11 @@ cclens [--harness claude|opencode] <command>
 
 `--projects` keeps its meaning ("input root") but resolves per harness:
 a directory for Claude Code (`$CLAUDE_CONFIG_DIR/projects`), the opencode
-database file for opencode (default `~/.local/share/opencode/opencode.db`).
+database file for opencode (default `~/.local/share/opencode/opencode.db`),
+and the kilocode tasks directory for kilocode — default the **first existing
+editor globalStorage candidate** (`kilocode_tasks_candidates`), since the
+path varies with the editor install (Code / Cursor / VSCodium) and the
+platform, so the candidate list, not one hardcoded path, is the contract.
 The resolved root is recorded in `meta` (`projects_dir`) and reused by the
 read commands' auto-refresh, unchanged plumbing carrying a new value.
 
@@ -100,6 +106,42 @@ contract:
   value, not a missing key, so readers can distinguish "nothing scanned"
   from "unknown".)
 
+## kilocode analyze (v1 capability)
+
+`--harness kilocode analyze` reads each task directory's two JSON files
+**read-only** and ingests it into the kilocode store. The mapping itself is
+`adapter::kilocode` (`session-format-kilocode.md`); this section is the shell
+contract:
+
+- **Sessions come from the task directories** under the resolved input root,
+  sorted for a deterministic order. A directory without both
+  `api_conversation_history.json` and `ui_messages.json` is not a session and
+  is skipped. One task directory is one cclens session; the task uuid is both
+  the session id and the slug.
+- **The project root is a stated heuristic** (`estimate_root`): the common
+  parent directory of the **leading** tool paths, since kilocode stamps no
+  `cwd` anywhere. A task whose tools name no absolute path stays unrooted —
+  empty, never guessed.
+- **Per-task ingest keys.** `kilocode:<task-uuid>` keys each task, with
+  (mtime = the later of the two files', size = their summed length) as the
+  fingerprint — either file moves on activity, and the directory stat would
+  re-ingest every task on each run (checkpoints move too). Replace semantics
+  make re-ingest idempotent, as for the other harnesses.
+- **Invalidation has its own version key**, `meta.kilocode_analyzer_version`
+  (`adapter::kilocode::KILOCODE_ANALYZER_VERSION`), for the same reason the
+  opencode rows carry theirs: a kilocode-only extraction change must never
+  force other harnesses through a full re-analyze.
+- **Subagent runs, prompts, and permission denials are not ingested.** No
+  spawn marker, no usable prompt pointer (the store's `(source_path,
+  source_line)` coordinate has no line meaning in JSON), and no denial marker
+  was measured in the kilocode format — the counts stay zero and the views
+  read as empty, which is what they are.
+- **The surface catalog is empty.** The global `~/.config/kilo` sites are
+  measured (commands, skills, `kilo.json`) but not cataloged yet — the config
+  half is a separate spec and change. `inventory` says so instead of showing
+  a table that looks like an empty config, and `meta.config_dir` is recorded
+  empty (nothing scanned, distinguishable from unknown).
+
 ## `optimize` under opencode
 
 The briefing composes from the store either way, so `--print` works under
@@ -119,6 +161,12 @@ printed up front. Rendering is lenient (the upstream event shapes are
 unversioned): a line with no recognizable text stays in the log, and a run
 that renders nothing readable says so instead of leaving silence.
 `--verbose` inherits stdio for the raw streaming instead.
+
+Under kilocode the briefing composes from the store either way, so `--print`
+works. **The launch is deferred**: the `kilo` binary is the measured agent CLI
+(Homebrew), but its prompt-launch surface is unmeasured, so `optimize` refuses
+the launch under kilocode and names `--print` — a measured surface beats a
+guessed command.
 
 ## Report copy names the harness
 
