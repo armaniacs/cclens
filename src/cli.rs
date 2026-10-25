@@ -385,18 +385,21 @@ fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
 /// investigates headlessly — JSON events (`--format json`) so the raw tool
 /// dumps can be logged while only the agent's text streams, and a title so
 /// the sessions it seeds are recognizable in the store it feeds.
-fn launch_command(harness: &Harness) -> (&'static str, &'static [&'static str]) {
+fn launch_command(
+    harness: &Harness,
+) -> Option<(&'static str, &'static [&'static str], optimize_mod::RunMode)> {
     match harness {
-        Harness::Claude => ("claude", &[]),
-        Harness::Opencode => (
+        Harness::Claude => Some(("claude", &[], optimize_mod::RunMode::Interactive)),
+        Harness::Opencode => Some((
             "opencode",
             &["run", "--format", "json", "--title", "cclens optimize"],
-        ),
+            optimize_mod::RunMode::Headless,
+        )),
         // The `kilo` binary is the measured agent CLI (Homebrew), but its
-        // prompt-launch surface is unmeasured — `optimize` defers the launch
-        // for kilocode, so this arm names the shape a measured launch would
-        // take rather than a command that runs.
-        Harness::Kilocode => ("kilo", &[]),
+        // prompt-launch surface is unmeasured: a positional argument is
+        // treated as a file to open (measured), not a prompt. `optimize`
+        // refuses the launch under kilocode and names `--print`.
+        Harness::Kilocode => None,
     }
 }
 ///
@@ -458,14 +461,20 @@ fn optimize(
         return Ok(());
     }
 
+    // The measured launch surfaces are Claude Code and opencode. kilo's
+    // prompt-launch surface is unmeasured — a positional argument is treated
+    // as a file to open (measured), not a prompt — so the launch is refused
+    // and `--print` is the path that hands the briefing over.
+    let Some((binary, leading, mode)) = launch_command(harness) else {
+        anyhow::bail!(
+            "the {} launch is not supported yet — use --print to get the briefing for pasting into kilo",
+            harness.display_name()
+        );
+    };
+
     // Sensitive briefing → private temp file; only a data-free pointer on argv.
     let briefing = optimize_mod::render_briefing(&findings, filter, &copy);
     let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
-    let mode = match harness {
-        Harness::Claude => optimize_mod::RunMode::Interactive,
-        Harness::Opencode => optimize_mod::RunMode::Headless,
-        Harness::Kilocode => optimize_mod::RunMode::Interactive,
-    };
     let prompt = optimize_mod::launch_prompt(
         &briefing_path.to_string_lossy(),
         &db_display,
@@ -480,7 +489,6 @@ fn optimize(
     // (narration, then the final plan) streams on stdout — the tool dumps stay
     // in the log, and `--verbose` keeps the old raw streaming. Clean up the
     // briefing file the moment the run ends, whatever the outcome.
-    let (binary, leading) = launch_command(harness);
     let launch_note = || {
         format!(
             "launch `{} {}` — is {} installed and on PATH?",
@@ -3851,15 +3859,23 @@ mod tests {
     fn launch_command_runs_each_harness_own_agent() {
         // `claude` opens interactively on the prompt; `opencode run` runs the
         // advisor headless on JSON events (raw tool dumps loggable) with a
-        // recognizable session title (see `run_instructions`).
-        assert_eq!(launch_command(&Harness::Claude), ("claude", &[] as &[&str]));
+        // recognizable session title (see `run_instructions`). kilo has no
+        // measured launch: a positional argument is treated as a file to open
+        // (measured), not a prompt, so there is no launch command and --print
+        // is the path that hands the briefing over.
+        assert_eq!(
+            launch_command(&Harness::Claude),
+            Some(("claude", &[] as &[&str], optimize_mod::RunMode::Interactive))
+        );
         assert_eq!(
             launch_command(&Harness::Opencode),
-            (
+            Some((
                 "opencode",
-                &["run", "--format", "json", "--title", "cclens optimize"] as &[&str]
-            )
+                &["run", "--format", "json", "--title", "cclens optimize"] as &[&str],
+                optimize_mod::RunMode::Headless
+            ))
         );
+        assert!(launch_command(&Harness::Kilocode).is_none());
     }
 
     #[test]

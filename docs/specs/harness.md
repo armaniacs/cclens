@@ -163,10 +163,11 @@ that renders nothing readable says so instead of leaving silence.
 `--verbose` inherits stdio for the raw streaming instead.
 
 Under kilocode the briefing composes from the store either way, so `--print`
-works. **The launch is deferred**: the `kilo` binary is the measured agent CLI
-(Homebrew), but its prompt-launch surface is unmeasured, so `optimize` refuses
-the launch under kilocode and names `--print` — a measured surface beats a
-guessed command.
+works. **The launch is refused**: the `kilo` binary is the measured agent CLI
+(Homebrew), but its prompt-launch surface is not — a positional argument is
+treated as a file to open (measured), not a prompt, so `optimize` refuses the
+launch under kilocode and names `--print`. A measured surface beats a guessed
+command.
 
 ## Report copy names the harness
 
