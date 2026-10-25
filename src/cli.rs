@@ -209,9 +209,10 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
-    /// Act on the findings: opens an interactive `claude` session pre-loaded
+    /// Act on the findings: opens an advisor session pre-loaded
     /// with the full analysis, which investigates each problem and proposes
-    /// concrete config edits for your approval.
+    /// concrete config fixes (interactively under Claude Code, headless
+    /// under opencode).
     Optimize {
         /// Transcript root (default: $CLAUDE_CONFIG_DIR/projects, or
         /// ~/.claude/projects).
@@ -368,9 +369,19 @@ fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
 }
 
 /// Analyze, compose the advisor prompt from the findings, and hand it to an
-/// interactive `claude` session — the AI-proposal layer's entry point. The pure
+/// advisor session — the AI-proposal layer's entry point. The pure
 /// composition lives in `core::optimize`; this shell does the I/O: run the
-/// analysis, read the store into `Findings`, then launch `claude`.
+/// analysis, read the store into `Findings`, then launch the harness's agent.
+/// See `docs/specs/harness.md` for the per-harness launch shape.
+/// Launch the harness's advisor for an optimize session: the binary plus any
+/// leading argv. `claude` opens interactively on the prompt; `opencode run`
+/// investigates headlessly and prints the plan (see `run_instructions`).
+fn launch_command(harness: &Harness) -> (&'static str, &'static [&'static str]) {
+    match harness {
+        Harness::Claude => ("claude", &[]),
+        Harness::Opencode => ("opencode", &["run"]),
+    }
+}
 ///
 /// The briefing carries concrete paths and error excerpts that may be sensitive,
 /// so it is written to a private (`0600`) temp file and only a pointer is passed
@@ -398,6 +409,8 @@ fn optimize(
         );
     }
     let store = Store::open(db).context("open store")?;
+    // `--frozen` skips the analyze that guards, so guard the launch path here.
+    guard_harness(&store, harness, db)?;
     let findings = collect_findings(&store)?;
 
     // The absolute store path so the session's `cclens sql --db …` hits the
@@ -427,29 +440,43 @@ fn optimize(
         return Ok(());
     }
 
-    // Launching always starts a `claude` session, which is the wrong agent for
-    // any other harness — refuse instead of seeding it (`docs/specs/harness.md`).
-    if *harness != Harness::Claude {
-        anyhow::bail!(
-            "optimize can only launch a `claude` session in v1 — rerun with --print to inspect the briefing"
-        );
-    }
-
     // Sensitive briefing → private temp file; only a data-free pointer on argv.
     let briefing = optimize_mod::render_briefing(&findings, filter, &copy);
     let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
-    let prompt =
-        optimize_mod::launch_prompt(&briefing_path.to_string_lossy(), &db_display, filter, &copy);
+    let mode = match harness {
+        Harness::Claude => optimize_mod::RunMode::Interactive,
+        Harness::Opencode => optimize_mod::RunMode::Headless,
+    };
+    let prompt = optimize_mod::launch_prompt(
+        &briefing_path.to_string_lossy(),
+        &db_display,
+        filter,
+        &copy,
+        mode,
+    );
 
-    // Hand over the terminal: `claude <prompt>` starts an interactive session,
-    // inheriting our stdio so the user takes over. Clean up the briefing file
-    // the moment the session ends, whatever the outcome.
-    let result = std::process::Command::new("claude").arg(&prompt).status();
+    // Hand over the terminal: the advisor starts on the pointer prompt,
+    // inheriting our stdio so the user watches (or takes over). Clean up the
+    // briefing file the moment the run ends, whatever the outcome.
+    let (binary, leading) = launch_command(harness);
+    let mut launch = std::process::Command::new(binary);
+    for arg in leading {
+        launch.arg(arg);
+    }
+    let result = launch.arg(&prompt).status();
     let _ = fs::remove_file(&briefing_path);
 
-    let status = result.context("launch `claude` — is Claude Code installed and on PATH?")?;
+    let invocation = format!("{} {}", binary, leading.join(" "))
+        .trim_end()
+        .to_string();
+    let status = result.with_context(|| {
+        format!(
+            "launch `{invocation}` — is {} installed and on PATH?",
+            harness.display_name()
+        )
+    })?;
     if !status.success() {
-        anyhow::bail!("claude exited with {status}");
+        anyhow::bail!("{binary} exited with {status}");
     }
     Ok(())
 }
@@ -2073,6 +2100,9 @@ fn open_for_read(harness: &Harness, db: &Path, frozen: bool) -> Result<Store> {
     }
 
     let store = Store::open(db).context("open store")?;
+    // No refresh ran, so no guard ran either — refuse a wrong-harness read
+    // here rather than reporting another harness's rows as this one's.
+    guard_harness(&store, harness, db)?;
     eprint_freshness(&freshness_line(store.meta("analyzed_at")?.as_deref()));
     Ok(store)
 }
@@ -3477,6 +3507,17 @@ mod tests {
     }
 
     #[test]
+    fn launch_command_runs_each_harness_own_agent() {
+        // `claude` opens interactively on the prompt; `opencode run` runs the
+        // advisor headless (see `run_instructions`).
+        assert_eq!(launch_command(&Harness::Claude), ("claude", &[] as &[&str]));
+        assert_eq!(
+            launch_command(&Harness::Opencode),
+            ("opencode", &["run"] as &[&str])
+        );
+    }
+
+    #[test]
     fn guard_harness_adopts_a_store_without_a_key() {
         // A store predating the flag carries no `harness` key and is adopted
         // by the Claude default, never refused.
@@ -3485,5 +3526,20 @@ mod tests {
         store.set_meta("harness", Harness::Claude.label()).unwrap();
         assert!(guard_harness(&store, &Harness::Claude, Path::new("/tmp/example/x.db")).is_ok());
         assert!(guard_harness(&store, &Harness::Opencode, Path::new("/tmp/example/x.db")).is_err());
+    }
+
+    #[test]
+    fn frozen_reads_refuse_a_wrong_harness_store() {
+        // `--frozen` skips the analyze that guards, so the read path guards
+        // itself — otherwise a Claude read would report opencode rows.
+        let path = TempPath::new("guard.db");
+        {
+            let mut store = Store::open(&path.0).unwrap();
+            store
+                .set_meta("harness", Harness::Opencode.label())
+                .unwrap();
+        }
+        assert!(open_for_read(&Harness::Opencode, &path.0, true).is_ok());
+        assert!(open_for_read(&Harness::Claude, &path.0, true).is_err());
     }
 }

@@ -100,14 +100,15 @@ contract:
   value, not a missing key, so readers can distinguish "nothing scanned"
   from "unknown".)
 
-## `optimize` under opencode (v1)
+## `optimize` under opencode
 
 The briefing composes from the store either way, so `--print` works under
-every harness. *Launching* composes a `claude` session, which is wrong for
-an opencode setup — so a non-Claude harness without `--print` refuses with
-a message saying so, instead of seeding the wrong agent. (The briefing's own
-advisor preamble still says Claude Code in v1; rewording it per harness
-follows with the view-copy pass.)
+every harness. Launching runs the harness's own agent on a data-free pointer
+prompt (the briefing travels via a private temp file, as for Claude Code):
+`claude <prompt>` opens interactively, while `opencode run <prompt>` runs
+the advisor headless — no user is present for the approval gate, so the
+headless instructions (`run_instructions`) make the printed plan the final
+output and forbid edits.
 
 ## Report copy names the harness
 

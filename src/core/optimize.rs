@@ -153,16 +153,36 @@ pub struct HarnessCopy {
     pub config_inventory: &'static str,
 }
 
+/// How the seeded session runs. Interactive sessions have a user present for
+/// the single approval gate before edits; headless runs (`opencode run`) have
+/// none — they investigate and print the plan, and must not edit anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Interactive,
+    Headless,
+}
+
 /// The prescribed instructions prepended to every briefing. This is the role
 /// and method the seeded session adopts: an optimization advisor that
 /// investigates the findings to a conclusion *on its own* — drilling in with the
 /// tool and reading the actual config — rather than handing the analysis back to
-/// the user, and pauses only to get the concrete fix-plan approved before editing.
+/// the user, and (in interactive runs) pauses only to get the concrete fix-plan
+/// approved before editing.
 ///
 /// A function, not a constant: the copy names the harness whose rows the
 /// briefing renders (advisor identity, config locations, the raw input), so
 /// one text cannot serve every harness.
 pub fn instructions(copy: &HarnessCopy) -> String {
+    instructions_for(copy, RunMode::Interactive)
+}
+
+/// The headless variant: same investigation, but the plan itself is the final
+/// output — no user is present to approve edits, so none happen.
+pub fn run_instructions(copy: &HarnessCopy) -> String {
+    instructions_for(copy, RunMode::Headless)
+}
+
+fn instructions_for(copy: &HarnessCopy, mode: RunMode) -> String {
     format!(
         "\
 You are acting as {article} {agent} optimization advisor. The user ran `cclens`, \
@@ -237,10 +257,7 @@ effect you expect.
 5. Be honest about what the data cannot tell you. If a step is genuinely blocked on a \
 judgement only the user can make (a preference, a secret, an external fact), name that one \
 decision specifically and keep going on everything else — do not hand the whole analysis back.
-
-Deliver a concrete, prioritized action plan with the specific edits you propose, having done \
-the investigation yourself. Apply file changes only after the user approves the plan — that \
-approval is the one and only thing you pause for, never direction on what to investigate.\"",
+{ending}\"",
         agent = copy.agent,
         article = copy.article,
         source = copy.source,
@@ -249,6 +266,17 @@ approval is the one and only thing you pause for, never direction on what to inv
         raw_source = copy.raw_source,
         config_inventory = copy.config_inventory,
         instruction_file = copy.instruction_file,
+        ending = match mode {
+            RunMode::Interactive => {
+                "\nDeliver a concrete, prioritized action plan with the specific edits you propose, having done \
+                 the investigation yourself. Apply file changes only after the user approves the plan — that \
+                 approval is the one and only thing you pause for, never direction on what to investigate."
+            }
+            RunMode::Headless => {
+                "\nDeliver a concrete, prioritized action plan with the specific edits you propose as your \
+                 final output, then stop. Do not edit any files — no user is present to approve anything."
+            }
+        },
     )
 }
 
@@ -492,13 +520,21 @@ fn scope_statement(filter: &ScopeFilter, copy: &HarnessCopy) -> Option<String> {
 }
 
 fn preamble(db_path: &str, filter: &ScopeFilter, copy: &HarnessCopy) -> String {
+    preamble_for(db_path, filter, copy, RunMode::Interactive)
+}
+
+fn preamble_for(db_path: &str, filter: &ScopeFilter, copy: &HarnessCopy, mode: RunMode) -> String {
     match scope_statement(filter, copy) {
         Some(statement) => format!(
             "{}\n\n{statement}\n\n{}",
-            instructions(copy),
+            instructions_for(copy, mode),
             store_pointer(db_path)
         ),
-        None => format!("{}\n\n{}", instructions(copy), store_pointer(db_path)),
+        None => format!(
+            "{}\n\n{}",
+            instructions_for(copy, mode),
+            store_pointer(db_path)
+        ),
     }
 }
 
@@ -517,21 +553,24 @@ pub fn compose_prompt(
     )
 }
 
-/// The argv prompt for launching `claude`: the prescribed instructions, where to
-/// query the store, and a pointer to the briefing file. The briefing — which
-/// carries concrete paths and error excerpts that may be sensitive — is written
-/// to that file rather than passed on argv (where `ps` would expose it); only
-/// this generic, data-free prompt reaches the process table.
+/// The argv prompt for launching the advisor: the prescribed instructions,
+/// where to query the store, and a pointer to the briefing file. The briefing
+/// — which carries concrete paths and error excerpts that may be sensitive —
+/// is written to that file rather than passed on argv (where `ps` would
+/// expose it); only this generic, data-free prompt reaches the process table.
+/// `mode` selects the interactive instructions (a user is present for the
+/// approval gate) or the headless ones (the plan is the final output).
 pub fn launch_prompt(
     briefing_path: &str,
     db_path: &str,
     filter: &ScopeFilter,
     copy: &HarnessCopy,
+    mode: RunMode,
 ) -> String {
     format!(
         "{}\n\nThe briefing — the complete analysis — is in the file \
          `{briefing_path}`. Read that file in full before doing anything else, then proceed.",
-        preamble(db_path, filter, copy)
+        preamble_for(db_path, filter, copy, mode)
     )
 }
 
@@ -733,6 +772,7 @@ mod tests {
             "/tmp/cc.db",
             &ScopeFilter::All,
             &claude_copy(),
+            RunMode::Interactive,
         );
         // The instructions, the store pointer, and the file pointer must be present...
         assert!(prompt.contains("Claude Code optimization advisor"));
@@ -863,5 +903,35 @@ mod tests {
             assert!(!text.contains("~/.claude"));
         }
         assert!(brief.contains(".opencode / AGENTS.md"));
+    }
+
+    #[test]
+    fn headless_instructions_print_the_plan_and_edit_nothing() {
+        let text = run_instructions(&opencode_copy());
+        assert!(text.contains("opencode optimization advisor"));
+        assert!(text.contains("as your final output, then stop"));
+        assert!(text.contains("Do not edit any files"));
+        assert!(!text.contains("only thing you pause for"));
+    }
+
+    #[test]
+    fn interactive_instructions_keep_the_approval_gate() {
+        let text = instructions(&claude_copy());
+        assert!(text.contains("only thing you pause for"));
+        assert!(!text.contains("Do not edit any files"));
+    }
+
+    #[test]
+    fn headless_launch_carries_the_no_edit_mandate_onto_argv() {
+        let prompt = launch_prompt(
+            "/tmp/cclens-briefing-123.md",
+            "/tmp/oc.db",
+            &ScopeFilter::All,
+            &opencode_copy(),
+            RunMode::Headless,
+        );
+        assert!(prompt.contains("Do not edit any files"));
+        assert!(prompt.contains("/tmp/cclens-briefing-123.md"));
+        assert!(!prompt.contains("# cclens analysis"));
     }
 }

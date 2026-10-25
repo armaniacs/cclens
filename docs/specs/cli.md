@@ -229,7 +229,7 @@ category='edit-precondition' GROUP BY target` answers "which files keep failing
 to edit", which the error text alone cannot. `SELECT sql FROM sqlite_master`
 lists the full schema.
 
-## `optimize` — act on the findings with an interactive `claude` session
+## `optimize` — act on the findings with an advisor session
 
 ```
 cclens optimize [--projects <dir>] [--db <path>] [--scope global|project[:<slug>]]
@@ -239,13 +239,14 @@ cclens optimize [--projects <dir>] [--db <path>] [--scope global|project[:<slug>
 The AI-proposal consumer (`architecture.md`): rather than emit static
 "recommendations" the tool cannot safely act on, `optimize` analyzes (unless
 `--frozen`, the same flag the views use), composes the findings with a prescribed advisor prompt, and
-launches `claude` seeded with it — so the user optimizes *interactively*, with an
-agent that can read their config and apply edits on agreement. The prompt makes
+launches the harness's agent seeded with it — `claude` for an interactive
+session that applies edits on agreement, `opencode run` for a headless run
+that prints the plan without editing. The prompt makes
 the session **investigate autonomously to a conclusion**: it pins down each root
 cause and proposes a concrete fix, rather than handing the analysis back with a
 "which area do you want to start with?". It prioritises work friction over config
 size, verifies before recommending removal (an "unused" skill may be invoked by
-subagents) by inspecting rather than asking, and pauses for exactly one thing —
+subagents) by inspecting rather than asking, and — in interactive runs — pauses for exactly one thing —
 approval of the concrete fix-plan before any file is edited. This "drive to a
 plan, gate only on applying it" shape is the design; if it changes, update
 `instructions` in `core::optimize` and this paragraph together.
