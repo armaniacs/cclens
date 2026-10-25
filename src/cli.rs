@@ -399,10 +399,21 @@ fn launch_command(
         // an OpenCode fork documenting `kilo run [message..]` with `--format
         // json` (raw JSON events) and `--title` — the same surface as
         // opencode's launch, so the launch is the opencode shape under kilo's
-        // binary.
+        // binary. `--auto` is kilo's autonomous-use flag: unlike opencode,
+        // kilo gates every tool call (read, bash, edit) and a headless run
+        // has no user to approve, so without it the advisor dies on its first
+        // read of the briefing; the headless instructions make the printed
+        // plan the final output.
         Harness::Kilocode => Some((
             "kilo",
-            &["run", "--format", "json", "--title", "cclens optimize"],
+            &[
+                "run",
+                "--format",
+                "json",
+                "--title",
+                "cclens optimize",
+                "--auto",
+            ],
             optimize_mod::RunMode::Headless,
         )),
     }
@@ -488,12 +499,12 @@ fn optimize(
         mode,
     );
 
-    // Hand over the terminal. `claude` opens an interactive TUI on the pointer
-    // prompt (stdio inherited, the user takes over); opencode runs headless, so
-    // its raw stream is logged to a private file and only the agent's text
-    // (narration, then the final plan) streams on stdout — the tool dumps stay
-    // in the log, and `--verbose` keeps the old raw streaming. Clean up the
-    // briefing file the moment the run ends, whatever the outcome.
+    // Hand over the terminal. Headless harnesses run piped: the raw stream is
+    // logged to a private file and only the agent's text (narration, then the
+    // final plan) streams on stdout — the tool dumps stay in the log, and
+    // `--verbose` keeps the old raw streaming. `claude` opens an interactive
+    // TUI on the pointer prompt (stdio inherited, the user takes over). Clean
+    // up the briefing file the moment the run ends, whatever the outcome.
     let launch_note = || {
         format!(
             "launch `{} {}` — is {} installed and on PATH?",
@@ -502,7 +513,7 @@ fn optimize(
             harness.display_name()
         )
     };
-    let (result, run_log) = if *harness == Harness::Opencode && !verbose {
+    let (result, run_log) = if mode == optimize_mod::RunMode::Headless && !verbose {
         let (status, log) = run_headless(binary, leading, &prompt).with_context(launch_note)?;
         (Ok(status), Some(log))
     } else {
@@ -3884,7 +3895,14 @@ mod tests {
             launch_command(&Harness::Kilocode),
             Some((
                 "kilo",
-                &["run", "--format", "json", "--title", "cclens optimize"] as &[&str],
+                &[
+                    "run",
+                    "--format",
+                    "json",
+                    "--title",
+                    "cclens optimize",
+                    "--auto"
+                ] as &[&str],
                 optimize_mod::RunMode::Headless
             ))
         );

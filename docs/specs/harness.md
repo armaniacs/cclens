@@ -164,10 +164,15 @@ that renders nothing readable says so instead of leaving silence.
 
 Under kilocode the briefing composes from the store either way, so `--print`
 works. Launching runs `kilo run --format json --title 'cclens optimize'
-<prompt>` — kilo documents `kilo run [message..]` with `--format json` (raw
-JSON events) and `--title`, the same surface opencode's launch uses (kilo is
-an OpenCode fork). A bare `kilo <text>` positional is treated as a file to
+--auto <prompt>` — kilo documents `kilo run [message..]` with `--format json`
+(raw JSON events) and `--title`, the same surface opencode's launch uses (kilo
+is an OpenCode fork). A bare `kilo <text>` positional is treated as a file to
 open (measured), not a prompt — the `run` subcommand is the message surface.
+`--auto` is the autonomous-use tradeoff: unlike opencode, kilo gates every
+tool call (read, bash, edit) and a headless run has no user to approve, so the
+advisor dies on its first read of the briefing without it. The headless
+instructions make the printed plan the final output, and the user reviews the
+plan before anything is applied.
 
 ## Report copy names the harness
 
