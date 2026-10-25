@@ -50,14 +50,32 @@ fn description_tokens(content: &str) -> u64 {
     frontmatter_description(content).map_or(0, |d| approx_tokens(&d))
 }
 
+/// Read a config directory, warning when it exists but cannot be read. macOS
+/// protects `~/Documents`, `~/Desktop`, and `~/Downloads` per app, so a
+/// catalog scan of a project there can fail with a permission error — and a
+/// silent empty result would read as "nothing configured here", a wedge the
+/// environment manufactures, not found in usage. One warning line tells the
+/// user why surfaces stay orphaned. A missing directory stays silent (the
+/// scope may simply not exist).
+fn read_dir_warn(dir: &Path) -> Vec<std::fs::DirEntry> {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!(
+                "warning: could not read {}: {e} — config here stays uncatalogued",
+                dir.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Read every `<name>/SKILL.md` under a skills directory into surfaces. A
 /// missing directory yields nothing (the scope may simply not exist).
 pub fn read_skill_surfaces(skills_dir: &Path, scope: &Scope) -> Vec<Surface> {
-    let Ok(entries) = fs::read_dir(skills_dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
+    read_dir_warn(skills_dir)
+        .into_iter()
         .filter_map(|entry| {
             let skill_md = entry.path().join("SKILL.md");
             let id = entry.file_name().to_str()?.to_string();
@@ -449,11 +467,8 @@ fn sanitize_mcp_server_id(name: &str) -> String {
 /// Read every `<name>.md` (recursively) as `(id, path, content)`, id being the
 /// file stem.
 fn read_markdown_files(dir: &Path) -> Vec<(String, String, String)> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
+    read_dir_warn(dir)
+        .into_iter()
         .filter_map(|entry| {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "md") {
@@ -501,6 +516,40 @@ mod tests {
     #[test]
     fn claude_config_dir_without_a_home_has_no_answer() {
         assert_eq!(claude_config_dir(None, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_dir_warns_instead_of_reading_as_absent() {
+        // macOS protects ~/Documents per app, so a scan there can fail with a
+        // permission error. Absence stays silent; a dir that exists but cannot
+        // be read yields nothing here and warns on stderr (not asserted — the
+        // call must simply not read as a missing scope).
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("cclens-test-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let entries = read_dir_warn(&dir);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn a_missing_dir_stays_silent_and_yields_nothing() {
+        let missing = std::env::temp_dir().join(format!(
+            "cclens-test-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(read_dir_warn(&missing).is_empty());
     }
 
     #[test]

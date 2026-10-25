@@ -37,6 +37,16 @@ scope, and the effective join"). Scope is also the routing key for reports: a
 wedge on a project-scoped surface is that project's finding, not a global one
 (`cli.md` `--scope`).
 
+**A directory that exists but cannot be read warns instead of reading as
+absent.** The OS protects some locations per app (macOS gates `~/Documents`,
+`~/Desktop`, `~/Downloads` behind a permission prompt), so a catalog scan of a
+project there can fail with a permission error. A silent empty result would
+read as "nothing configured here" and turn every live surface into orphaned
+usage — a wedge the environment manufactures, not found in the input. So a
+missing directory stays silent (the scope may simply not exist), while any
+other read failure prints one stderr warning naming the directory; the affected
+surfaces stay uncatalogued until the permission is granted or the config moves.
+
 ### Usage-measurable vs catalog-only surfaces
 
 Not every surface kind emits a usage signal, and conflating the two is the
