@@ -18,6 +18,9 @@ use crate::adapter::transcript::{ToolError, WorkEvent};
 use crate::core::friction::classify_error;
 use crate::core::path::basename;
 use crate::core::span::{Record, RecordKind};
+use crate::core::surface::{Scope, Surface};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// The model label when a payload names no model — honest, never a guess.
 /// kilocode's payload carries `inferenceProvider` only: a provider is never a
@@ -513,11 +516,252 @@ pub fn extract_work_events(conversation: &str) -> Vec<WorkEvent> {
     events
 }
 
+/// Read the global kilo config into surfaces: `command/` and `agent/` under
+/// the config dir, the skills sites (kilo-native first, then the shared homes
+/// kilo also loads), the global `AGENTS.md`, and the files in `kilo.json`'s
+/// `instructions[]` — kilo's own addition, the way `kilo.json` loads
+/// always-on instruction files (`docs/specs/config-format-kilocode.md`).
+/// MCP and permissions stay out of v1: the `mcp` key is real but kilocode
+/// emitted zero `mcp__` tool calls, and the permission table has no denial
+/// marker to join, so either catalog would read "unused" — a wedge the
+/// catalog manufactures. `seen` carries the canonical definition paths
+/// already catalogued, so the project pass skips the same files reached
+/// through a project symlink.
+pub fn read_global_surfaces(
+    config_dir: &Path,
+    home: Option<&Path>,
+    seen: &mut HashSet<PathBuf>,
+) -> Vec<Surface> {
+    let scope = Scope::Global;
+    let mut surfaces =
+        crate::adapter::config::read_command_surfaces(&config_dir.join("command"), &scope);
+    surfaces.extend(crate::adapter::config::read_agent_surfaces(
+        &config_dir.join("agent"),
+        &scope,
+    ));
+    crate::adapter::config::add_skill_site(&config_dir.join("skills"), &scope, seen, &mut surfaces);
+    if let Some(home) = home {
+        crate::adapter::config::add_skill_site(
+            &home.join(".claude").join("skills"),
+            &scope,
+            seen,
+            &mut surfaces,
+        );
+        crate::adapter::config::add_skill_site(
+            &home.join(".agents").join("skills"),
+            &scope,
+            seen,
+            &mut surfaces,
+        );
+    }
+    let agents_md = config_dir.join("AGENTS.md");
+    surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
+        &[(&agents_md, "AGENTS.md")],
+        &scope,
+        home,
+    ));
+    surfaces.extend(read_kilo_instructions(
+        &config_dir.join("kilo.json"),
+        config_dir,
+        &scope,
+        home,
+    ));
+    surfaces
+}
+
+/// Read one project's kilo config into surfaces: `.kilo/command/`,
+/// `.kilo/agent/`, the three skills sites under the root, `AGENTS.md` with its
+/// `@import`s, the project `.kilorules` (the rules file kilo loads always-on),
+/// and the files in the project `kilo.json`'s `instructions[]`.
+/// `home` resolves a `~/` import; `seen` skips skill definitions already
+/// catalogued from the global sites.
+pub fn read_project_surfaces(
+    root: &Path,
+    project: &str,
+    home: Option<&Path>,
+    seen: &mut HashSet<PathBuf>,
+) -> Vec<Surface> {
+    let scope = Scope::Project(project.to_string());
+    let kilo = root.join(".kilo");
+    let mut surfaces = crate::adapter::config::read_command_surfaces(&kilo.join("command"), &scope);
+    surfaces.extend(crate::adapter::config::read_agent_surfaces(
+        &kilo.join("agent"),
+        &scope,
+    ));
+    crate::adapter::config::add_skill_site(&kilo.join("skills"), &scope, seen, &mut surfaces);
+    crate::adapter::config::add_skill_site(
+        &root.join(".claude").join("skills"),
+        &scope,
+        seen,
+        &mut surfaces,
+    );
+    crate::adapter::config::add_skill_site(
+        &root.join(".agents").join("skills"),
+        &scope,
+        seen,
+        &mut surfaces,
+    );
+    let agents_md = root.join("AGENTS.md");
+    let kilorules = root.join(".kilorules");
+    surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
+        &[(&agents_md, "AGENTS.md"), (&kilorules, ".kilorules")],
+        &scope,
+        home,
+    ));
+    surfaces.extend(read_kilo_instructions(
+        &root.join("kilo.json"),
+        root,
+        &scope,
+        home,
+    ));
+    surfaces
+}
+
+/// The files in `kilo.json`'s `instructions[]`, as always-on instruction
+/// surfaces — the measured project pointed the array at a gitignored
+/// `AGENTS.local.md` and the measured global config at an absolute path, and
+/// a file only reachable through it is otherwise invisible to the catalog
+/// while costing tokens on every session. Relative paths resolve against
+/// `base_dir` (the config file's directory at the global scope, the project
+/// root at the project scope); absolute paths pass through. A missing config,
+/// a missing key, or a non-array yields nothing.
+fn read_kilo_instructions(
+    config_path: &Path,
+    base_dir: &Path,
+    scope: &Scope,
+    home: Option<&Path>,
+) -> Vec<Surface> {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.get("instructions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let files: Vec<(PathBuf, String)> = entries
+        .iter()
+        .filter_map(|entry| entry.as_str())
+        .filter_map(|entry| {
+            let path = if Path::new(entry).is_absolute() {
+                PathBuf::from(entry)
+            } else {
+                base_dir.join(entry)
+            };
+            let id = path.file_name()?.to_str()?.to_string();
+            Some((path, id))
+        })
+        .collect();
+    let refs: Vec<(&Path, &str)> = files
+        .iter()
+        .map(|(path, id)| (path.as_path(), id.as_str()))
+        .collect();
+    crate::adapter::config::read_claude_md_surfaces(&refs, scope, home)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::friction::ErrorCategory;
+    use crate::core::surface::Scope;
     use serde_json::json;
+    use std::collections::HashSet;
+
+    fn unique_dir(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn read_global_surfaces_walks_the_kilo_layout() {
+        let config_dir = unique_dir("cclens-test-kilo-config");
+        std::fs::remove_dir_all(&config_dir).ok();
+        std::fs::create_dir_all(config_dir.join("command")).unwrap();
+        std::fs::write(
+            config_dir.join("command/review.md"),
+            "---\ndescription: review\n---\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(config_dir.join("agent")).unwrap();
+        std::fs::write(
+            config_dir.join("agent/scout.md"),
+            "---\ndescription: scouts\n---\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(config_dir.join("skills/reviewer")).unwrap();
+        std::fs::write(
+            config_dir.join("skills/reviewer/SKILL.md"),
+            "---\ndescription: reviews\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(config_dir.join("AGENTS.md"), "global instructions").unwrap();
+        // kilo.json's instructions[] is kilo's own addition: an always-on
+        // instruction file otherwise invisible to the catalog.
+        std::fs::write(
+            config_dir.join("kilo.json"),
+            r#"{"instructions": ["RTK.md"]}"#,
+        )
+        .unwrap();
+        std::fs::write(config_dir.join("RTK.md"), "tooling guidance").unwrap();
+
+        let mut seen = HashSet::new();
+        let surfaces = read_global_surfaces(&config_dir, None, &mut seen);
+        std::fs::remove_dir_all(&config_dir).ok();
+
+        let has = |kind: &str, id: &str| surfaces.iter().any(|s| s.kind == kind && s.id == id);
+        assert!(surfaces.iter().all(|s| s.scope == Scope::Global));
+        assert!(has("command", "review"));
+        assert!(has("agent", "scout"));
+        assert!(has("skill", "reviewer"));
+        assert!(has("claude_md", "AGENTS.md"));
+        assert!(has("claude_md", "RTK.md"));
+    }
+
+    #[test]
+    fn read_project_surfaces_walks_the_kilo_layout() {
+        let root = unique_dir("cclens-test-kilo-project");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join(".kilo/command")).unwrap();
+        std::fs::write(
+            root.join(".kilo/command/review.md"),
+            "---\ndescription: review\n---\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".kilo/agent")).unwrap();
+        std::fs::write(
+            root.join(".kilo/agent/scout.md"),
+            "---\ndescription: scouts\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(root.join("AGENTS.md"), "project instructions").unwrap();
+        std::fs::write(root.join(".kilorules"), "project rules").unwrap();
+        std::fs::write(
+            root.join("kilo.json"),
+            r#"{"instructions": ["AGENTS.local.md"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("AGENTS.local.md"), "local instructions").unwrap();
+
+        let mut seen = HashSet::new();
+        let surfaces = read_project_surfaces(&root, "demo", None, &mut seen);
+        std::fs::remove_dir_all(&root).ok();
+
+        let has = |kind: &str, id: &str| surfaces.iter().any(|s| s.kind == kind && s.id == id);
+        assert!(
+            surfaces
+                .iter()
+                .all(|s| s.scope == Scope::Project("demo".to_string()))
+        );
+        assert!(has("command", "review"));
+        assert!(has("agent", "scout"));
+        assert!(has("claude_md", "AGENTS.md"));
+        assert!(has("claude_md", ".kilorules"));
+        assert!(has("claude_md", "AGENTS.local.md"));
+    }
 
     fn conversation(messages: Vec<serde_json::Value>) -> String {
         serde_json::Value::Array(messages).to_string()

@@ -152,10 +152,10 @@ impl Harness {
              using them leaves no trace in sessions."
             }
             Harness::Kilocode => {
-                "Everything installed in your config — AGENTS.md, commands, skills —\n\
-             would be listed here with where it is installed (scope) and whether it was\n\
-             ever used. The kilocode config catalog is not implemented yet, so this\n\
-             view is empty under kilocode."
+                "Everything installed in your config — AGENTS.md, .kilorules, commands,\n\
+             agents, skills — is listed with where it is installed (scope) and whether it\n\
+             was ever used. UNUSED marks delete candidates; commands are catalog-only\n\
+             because using them leaves no trace in sessions."
             }
         }
     }
@@ -225,6 +225,20 @@ impl Harness {
             home.filter(|dir| dir.is_absolute())?
                 .join(".config")
                 .join("opencode"),
+        )
+    }
+
+    /// The global kilo config root: `$XDG_CONFIG_HOME/kilo` when that variable
+    /// names an absolute path, else `~/.config/kilo` — the XDG rule, mirroring
+    /// how the store resolution treats `XDG_STATE_HOME`.
+    pub fn kilocode_config_dir(config_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+        if let Some(dir) = config_home.filter(|dir| dir.is_absolute()) {
+            return Some(dir.join("kilo"));
+        }
+        Some(
+            home.filter(|dir| dir.is_absolute())?
+                .join(".config")
+                .join("kilo"),
         )
     }
 }

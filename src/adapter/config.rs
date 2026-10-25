@@ -112,6 +112,20 @@ pub fn rule_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -
     }
 }
 
+/// Build a `command` surface. Like skills and agents, only the description
+/// loads at startup.
+pub fn command_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
+    Surface {
+        kind: "command".to_string(),
+        id: id.to_string(),
+        scope: scope.clone(),
+        config_path: config_path.to_string(),
+        static_tokens: Some(approx_tokens(content)),
+        startup_tokens: Some(description_tokens(content)),
+        load_mode: LoadMode::StartupDescription,
+    }
+}
+
 /// Build an `agent` surface. Like skills, only the description loads at startup.
 pub fn agent_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
     Surface {
@@ -243,6 +257,36 @@ pub fn read_agent_surfaces(agents_dir: &Path, scope: &Scope) -> Vec<Surface> {
         .into_iter()
         .map(|(id, path, content)| agent_surface(&id, &path, &content, scope))
         .collect()
+}
+
+/// Read every `*.md` command file in a directory into surfaces, keyed by file
+/// stem. A missing directory yields nothing.
+pub fn read_command_surfaces(commands_dir: &Path, scope: &Scope) -> Vec<Surface> {
+    read_markdown_files(commands_dir)
+        .into_iter()
+        .map(|(id, path, content)| command_surface(&id, &path, &content, scope))
+        .collect()
+}
+
+/// Add one skills site to `surfaces`, deduped by **canonical path** against
+/// everything already seen. Sites may reach one shared directory through
+/// symlinks (`.opencode/skills -> ../.agents/skills` is the observed shape),
+/// so one definition must count once — deduping by name instead would mark
+/// the shared definition unused at one scope, a wedge the catalog
+/// manufactures.
+pub fn add_skill_site(
+    site: &Path,
+    scope: &Scope,
+    seen: &mut HashSet<PathBuf>,
+    surfaces: &mut Vec<Surface>,
+) {
+    for surface in read_skill_surfaces(site, scope) {
+        let key = fs::canonicalize(&surface.config_path)
+            .unwrap_or_else(|_| PathBuf::from(&surface.config_path));
+        if seen.insert(key) {
+            surfaces.push(surface);
+        }
+    }
 }
 
 /// Read every `*.md` rule (recursively, so category subdirs are included) into

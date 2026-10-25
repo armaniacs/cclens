@@ -461,15 +461,15 @@ pub fn read_global_surfaces(
     let scope = Scope::Global;
     let mut surfaces = read_command_surfaces(&config_dir.join("command"), &scope);
     surfaces.extend(read_agent_surfaces(&config_dir.join("agent"), &scope));
-    add_skill_site(&config_dir.join("skills"), &scope, seen, &mut surfaces);
+    crate::adapter::config::add_skill_site(&config_dir.join("skills"), &scope, seen, &mut surfaces);
     if let Some(home) = home {
-        add_skill_site(
+        crate::adapter::config::add_skill_site(
             &home.join(".claude").join("skills"),
             &scope,
             seen,
             &mut surfaces,
         );
-        add_skill_site(
+        crate::adapter::config::add_skill_site(
             &home.join(".agents").join("skills"),
             &scope,
             seen,
@@ -493,14 +493,14 @@ pub fn read_project_surfaces(
     let opencode = root.join(".opencode");
     let mut surfaces = read_command_surfaces(&opencode.join("command"), &scope);
     surfaces.extend(read_agent_surfaces(&opencode.join("agent"), &scope));
-    add_skill_site(&opencode.join("skills"), &scope, seen, &mut surfaces);
-    add_skill_site(
+    crate::adapter::config::add_skill_site(&opencode.join("skills"), &scope, seen, &mut surfaces);
+    crate::adapter::config::add_skill_site(
         &root.join(".claude").join("skills"),
         &scope,
         seen,
         &mut surfaces,
     );
-    add_skill_site(
+    crate::adapter::config::add_skill_site(
         &root.join(".agents").join("skills"),
         &scope,
         seen,
@@ -519,21 +519,6 @@ pub fn read_project_surfaces(
 /// path: the six documented sites may reach one shared directory through
 /// symlinks (`.opencode/skills -> ../.agents/skills` is the observed shape),
 /// and one definition must count once no matter which site reaches it.
-fn add_skill_site(
-    site: &Path,
-    scope: &Scope,
-    seen: &mut HashSet<PathBuf>,
-    surfaces: &mut Vec<Surface>,
-) {
-    for surface in crate::adapter::config::read_skill_surfaces(site, scope) {
-        let key = fs::canonicalize(&surface.config_path)
-            .unwrap_or_else(|_| PathBuf::from(&surface.config_path));
-        if seen.insert(key) {
-            surfaces.push(surface);
-        }
-    }
-}
-
 /// A part's tool name, when it is a `tool` part.
 fn part_tool<'a>(part: &PartRow<'a>) -> Option<&'a str> {
     if part.data.get("type").and_then(Value::as_str) != Some("tool") {
