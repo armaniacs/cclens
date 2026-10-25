@@ -112,13 +112,19 @@ present for the approval gate, so the headless instructions
 edits.
 
 The headless terminal stays quiet: cclens reads the JSON event stream line
-by line and surfaces only what the agent says — text parts (narration, then
-the plan) on stdout, one-line tool markers on stderr — while every raw line
-and the child's stderr go to a private (`0600`) log file whose path is
-printed up front. Rendering is lenient (the upstream event shapes are
-unversioned): a line with no recognizable text stays in the log, and a run
-that renders nothing readable says so instead of leaving silence.
-`--verbose` inherits stdio for the raw streaming instead.
+by line and surfaces what the agent says — text parts (narration, then the
+plan) on stdout — under a single in-place activity line on stderr
+(`status::Indicator`): a spinner frame proving liveness, the current
+activity named from the last tool call ("running shell...", "reading..."),
+and an elapsed counter, rewritten in place instead of scrolling. When stderr
+is piped (so ANSI rewrites would corrupt the stream) the same beats fall
+back to newline logs every 10s and progress markers print as lines; `| pbcopy`
+on stdout still gets a live spinner on the terminal. Every raw line and the
+child's stderr go to a private (`0600`) log file whose path is printed up
+front. Rendering is lenient (the upstream event shapes are unversioned): a
+line with no recognizable text stays in the log, and a run that renders
+nothing readable says so instead of leaving silence. `--verbose` inherits
+stdio for the raw streaming instead.
 
 ## Report copy names the harness
 

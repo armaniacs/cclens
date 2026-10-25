@@ -31,6 +31,7 @@ use crate::core::surface::{
 };
 use crate::core::thrash::detect_thrash;
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
+use crate::status;
 use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
@@ -509,23 +510,20 @@ fn optimize(
 
 /// Run the headless advisor with its raw output logged: spawn with stdout
 /// piped, write every raw line (and the child's stderr) to a private log, and
-/// surface only what the agent says — text parts on stdout (so a pipe like
-/// `| pbcopy` receives the narration and the plan), one-line progress markers
-/// on stderr. A heartbeat covers quiet stretches (a long tool call, model
-/// thinking) so the run never looks hung. Returns the log path so the caller
-/// can point at the full detail. The raw event shapes are unversioned
-/// upstream, so rendering is lenient: a line with no recognizable text stays
-/// in the log, and a run that renders nothing readable says so instead of
-/// leaving silence.
+/// surface what the agent says — text parts (narration, then the plan) on
+/// stdout, so a pipe like `| pbcopy` receives exactly those — under a single
+/// in-place activity line on stderr (`status::Indicator`: spinner, current
+/// activity, elapsed; newline beats when stderr is piped). Returns the log
+/// path so the caller can point at the full detail. The raw event shapes are
+/// unversioned upstream, so rendering is lenient: a line with no recognizable
+/// text stays in the log, and a run that renders nothing readable says so
+/// instead of leaving silence.
 fn run_headless(
     binary: &str,
     leading: &[&str],
     prompt: &str,
 ) -> Result<(std::process::ExitStatus, PathBuf)> {
     use std::io::{BufRead, Write};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
 
     let log_path = private_temp_path("cclens-run", "log");
     write_private_file(&log_path, "").context("create run log")?;
@@ -546,39 +544,7 @@ fn run_headless(
         ))
     );
 
-    // A dim beat every 30s while the advisor works: elapsed seconds and how
-    // many events have streamed, so silence reads as waiting, not a hang.
-    let events = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let heartbeat = {
-        let events = Arc::clone(&events);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let start = Instant::now();
-            let mut next = 30u64;
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                let elapsed = start.elapsed().as_secs();
-                if elapsed >= next {
-                    next += 30;
-                    eprintln!(
-                        "{}",
-                        Style::stderr().dim(&format!(
-                            "  … advisor working ({}s, {} events)",
-                            elapsed,
-                            events.load(Ordering::Relaxed)
-                        ))
-                    );
-                }
-            }
-        })
-    };
+    let indicator = status::Indicator::start();
 
     let mut launch = std::process::Command::new(binary);
     launch.args(leading).arg(prompt);
@@ -591,22 +557,22 @@ fn run_headless(
     let mut readable = false;
     for line in std::io::BufReader::new(stdout).lines() {
         let line = line.context("read the advisor's output")?;
-        events.fetch_add(1, Ordering::Relaxed);
         writeln!(log, "{line}").context("write the run log")?;
         match opencode_mod::render_run_line(&line) {
             opencode_mod::RunEvent::Text(text) => {
                 readable = true;
+                // Clear the live line first so the narration never prints on
+                // top of it; the spinner redraws below the text.
+                indicator.clear();
                 println!("{text}");
+                indicator.text_seen();
             }
-            opencode_mod::RunEvent::Progress(tool) => {
-                eprintln!("{}", Style::stderr().dim(&format!("  → {tool}")));
-            }
-            opencode_mod::RunEvent::Silent => {}
+            opencode_mod::RunEvent::Progress(tool) => indicator.progress(&tool),
+            opencode_mod::RunEvent::Silent => indicator.event(),
         }
     }
     let status = child.wait()?;
-    stop.store(true, Ordering::Relaxed);
-    heartbeat.join().ok();
+    indicator.finish();
     if status.success() && !readable {
         eprintln!(
             "{}",
