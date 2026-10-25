@@ -6,7 +6,6 @@
 //! unknown types ignored, missing optional ones tolerated.
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

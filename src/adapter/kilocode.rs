@@ -386,10 +386,12 @@ pub fn estimate_root(conversation: &str) -> Option<String> {
             if first_cwd.is_none()
                 && block.get("name").and_then(Value::as_str) == Some("execute_command")
             {
-                if let Some(cwd) = input.get("cwd").and_then(Value::as_str) {
-                    if cwd.starts_with('/') {
-                        first_cwd = Some(cwd.to_string());
-                    }
+                let absolute = input
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| cwd.starts_with('/'));
+                if let Some(cwd) = absolute {
+                    first_cwd = Some(cwd.to_string());
                 }
             }
             for path in input_paths(input) {
