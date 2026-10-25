@@ -84,7 +84,11 @@ per token) — a ranking signal, not a billing figure.
 - `skill` surfaces join `tool=skill` events by the skill name, the same join
   Claude Code uses. Sites may reach one shared directory through symlinks, so
   surfaces dedup by **canonical path** — one row per actual definition, no
-  matter how many sites reach it.
+  matter how many sites reach it. But kilocode maps **no skill-invocation
+  signal** in v1 (see `session-format-kilocode.md`), so every skill reads
+  `uses 0` / `UNUSED` under kilocode — the same honest absence as the agent
+  rows: reported, not evidence of disuse, and the waste view's suggestion
+  stays "declutter only" because the startup saving is the description alone.
 - A surface existing at both scopes under one `(kind, id)` resolves per
   project (project shadows global), exactly as for Claude Code.
 
