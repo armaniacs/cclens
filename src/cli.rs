@@ -395,11 +395,16 @@ fn launch_command(
             &["run", "--format", "json", "--title", "cclens optimize"],
             optimize_mod::RunMode::Headless,
         )),
-        // The `kilo` binary is the measured agent CLI (Homebrew), but its
-        // prompt-launch surface is unmeasured: a positional argument is
-        // treated as a file to open (measured), not a prompt. `optimize`
-        // refuses the launch under kilocode and names `--print`.
-        Harness::Kilocode => None,
+        // The `kilo` binary is the measured agent CLI (Homebrew), and kilo is
+        // an OpenCode fork documenting `kilo run [message..]` with `--format
+        // json` (raw JSON events) and `--title` — the same surface as
+        // opencode's launch, so the launch is the opencode shape under kilo's
+        // binary.
+        Harness::Kilocode => Some((
+            "kilo",
+            &["run", "--format", "json", "--title", "cclens optimize"],
+            optimize_mod::RunMode::Headless,
+        )),
     }
 }
 ///
@@ -3859,10 +3864,10 @@ mod tests {
     fn launch_command_runs_each_harness_own_agent() {
         // `claude` opens interactively on the prompt; `opencode run` runs the
         // advisor headless on JSON events (raw tool dumps loggable) with a
-        // recognizable session title (see `run_instructions`). kilo has no
-        // measured launch: a positional argument is treated as a file to open
-        // (measured), not a prompt, so there is no launch command and --print
-        // is the path that hands the briefing over.
+        // recognizable session title (see `run_instructions`). kilo is an
+        // OpenCode fork and documents `kilo run [message..]` with `--format
+        // json` (raw JSON events) and `--title` — the same surface, so the
+        // launch is the opencode shape under kilo's binary.
         assert_eq!(
             launch_command(&Harness::Claude),
             Some(("claude", &[] as &[&str], optimize_mod::RunMode::Interactive))
@@ -3875,7 +3880,14 @@ mod tests {
                 optimize_mod::RunMode::Headless
             ))
         );
-        assert!(launch_command(&Harness::Kilocode).is_none());
+        assert_eq!(
+            launch_command(&Harness::Kilocode),
+            Some((
+                "kilo",
+                &["run", "--format", "json", "--title", "cclens optimize"] as &[&str],
+                optimize_mod::RunMode::Headless
+            ))
+        );
     }
 
     #[test]

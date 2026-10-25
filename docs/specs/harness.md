@@ -163,11 +163,11 @@ that renders nothing readable says so instead of leaving silence.
 `--verbose` inherits stdio for the raw streaming instead.
 
 Under kilocode the briefing composes from the store either way, so `--print`
-works. **The launch is refused**: the `kilo` binary is the measured agent CLI
-(Homebrew), but its prompt-launch surface is not — a positional argument is
-treated as a file to open (measured), not a prompt, so `optimize` refuses the
-launch under kilocode and names `--print`. A measured surface beats a guessed
-command.
+works. Launching runs `kilo run --format json --title 'cclens optimize'
+<prompt>` — kilo documents `kilo run [message..]` with `--format json` (raw
+JSON events) and `--title`, the same surface opencode's launch uses (kilo is
+an OpenCode fork). A bare `kilo <text>` positional is treated as a file to
+open (measured), not a prompt — the `run` subcommand is the message surface.
 
 ## Report copy names the harness
 
