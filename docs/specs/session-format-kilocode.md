@@ -133,7 +133,7 @@ opencode adapter's ordering.
 | Skill invocation | **none observed** — kilocode config installs `skills/` and `command/*.md`, but neither file carries an invocation marker in the samples. The signal stays absent until a marker is measured; a later skills catalog would show live `Skill` usage as orphaned rows in `inventory`, which is the honest missing-site signal |
 | Subagent spawn | **none observed** — no spawn marker or join key measured. Subagent runs are not ingested; `sub_tokens`/`sub_agent_count` stay zero and the split reads as unavailable, as under opencode |
 | Tool use | `tool_use` blocks in assistant messages. Measured across 92 tasks: `execute_command` (754), `read_file` (616), `edit_file` (361), `search_files` (201), `update_todo_list` (155), `attempt_completion` (148), `apply_diff` (101), `search_and_replace` (93) |
-| Tool failure | the `tool_result` paired by `tool_use_id` carrying `is_error == true` (1 of 155 sampled blocks — the Anthropic-compatible failure field). Text from the block content; the target from the paired `tool_use` input |
+| Tool failure | the `tool_result` paired by `tool_use_id` carrying `is_error == true` (1 of 155 sampled blocks — the Anthropic-compatible failure field). The failure rides as a JSON envelope (`{"status":"error",...,"error":"..."}`) inside a text block, followed by an `environment_details` block — the envelope is unwrapped per block and the decoration dropped, so the excerpt is the readable message and the classification reads the message, not the envelope's own fields |
 | User prompt | a user message carrying text material |
 | Permission denial | **none observed** — `ask=tool` rows appear only where approval was requested (12 rows against 49 tool calls in one sampled task; auto-approved calls emit none), so they undercount and are no usage signal. No denial marker in the samples (0 phrasing hits) |
 | Retry | `say=api_req_retry_delayed` — friction input candidate, not mapped in v1 |
@@ -142,11 +142,14 @@ opencode adapter's ordering.
 `tool_result.tool_use_id` joins each failure back to its exact `tool_use`
 block (`id`), the same join Claude Code uses — the failure inherits the
 paired tool's name and input, and the text is classified with the shared
-`core::friction` vocabulary. A phrasing outside that vocabulary lands in
-`Other` with its tool, target, and excerpt intact — never dropped. Teaching
-the classifier new phrasings is a cross-harness change (it re-labels
-already-ingested sessions, so it needs an `ANALYZER_VERSION` bump) and is
-out of scope here.
+`core::friction` vocabulary on the readable message (the envelope and the
+`environment_details` decoration are stripped first: the envelope's own
+wording matched the path vocabulary and the decoration's file names matched
+timeout). A phrasing outside that vocabulary lands in `Other` with its tool,
+target, and excerpt intact — never dropped. Teaching the classifier new
+phrasings is a cross-harness change (it re-labels already-ingested sessions,
+so it needs an `ANALYZER_VERSION` bump); one landed already ("Unknown tool"
+names the missing tool, not a missing path).
 
 **`prompt_size` is a documented assumption.** kilocode reports `tokensIn`
 plus `cacheReads`/`cacheWrites` but never states whether `tokensIn` already

@@ -98,6 +98,34 @@ Status: opencode is fully landed (mapping spec, pure adapter commit `422d4f2`, C
 
 ## 5. Open survey items
 
+### 6. The headless walkthrough result (measured)
+
+The kilocode optimize launch was exercised end to end twice — first headless
+(`kilo run --format json --title ... --auto <prompt>`, ~7 min, 141 events, the
+advisor investigated autonomously and produced a prioritized plan without
+editing), then interactively (`kilo --prompt <prompt>`, the article's
+experience — the user approves the briefing read and steers). The v1 launch is
+the interactive one.
+
+The headless run also found three real defects in cclens itself, all landed:
+
+- Tool-failure excerpts stored the JSON envelope whole (the measured
+  `tool_result` carries an envelope text block plus an `environment_details`
+  decoration), which mis-classified failures twice — the envelope's "does not
+  exist" matched the path vocabulary and the decoration's file names matched
+  timeout. Each block now unwraps, the decoration drops, and the category
+  reads the message (`KILOCODE_ANALYZER_VERSION` 3).
+- A wrong tool name ("Unknown tool \"edit\"") mis-classified as path-not-found;
+  "unknown tool" joined the tool-not-available vocabulary (`ANALYZER_VERSION`
+  6, opencode 3).
+- Work events and tool errors left `started_at` empty while carrying the
+  epoch — a shared store defect, not kilocode-specific.
+
+Deferred: a mode-restriction category ("is not allowed in code mode" reads
+`Other` honestly today); kilocode token amounts (out_tokens stay zero, the
+floor only); the per-project config split the advisor's plan proposes for the
+target project.
+
 - [ ] opencode: runtime denial signal for `permission`, MCP definition site, `.opencode/command|agent` convention
 - [x] kilocode: token source of record → `ui_messages.json` `say=api_req_started` text JSON (`tokensIn/tokensOut/cacheWrites/cacheReads/cost/usageMissing`). Storage-root choice resolved in the v1 wiring (`kilocode_tasks_candidates`: Code → Cursor → VSCodium, first existing). Still open: project-side rules/modes locations
 - [ ] DSH: hosting event for `usage`, subagent-spawn markers, skill/agent/MCP definition sites
