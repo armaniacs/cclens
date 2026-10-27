@@ -20,9 +20,7 @@ categories = ["command-line-utilities", "development-tools"]
 # it, and it is what explains the code.
 exclude = [
   ".claude/",
-  ".claude-plugin/",
   ".github/",
-  "plugins/",
   "AGENTS.md",
   "flake.lock",
   "flake.nix",

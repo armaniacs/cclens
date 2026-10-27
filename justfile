@@ -1,4 +1,4 @@
-# cclens task runner. Run inside the Nix dev shell so rustc / clippy / cargo
+# saniwalens task runner. Run inside the Nix dev shell so rustc / clippy / cargo
 # resolve to the pinned versions:  nix develop -c just <recipe>
 # (or `nix develop` once, then `just <recipe>`).
 

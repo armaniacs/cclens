@@ -1,5 +1,5 @@
 {
-  description = "saniwalens — a lens onto your Claude Code usage";
+  description = "saniwalens — a lens onto your coding-agent usage";
 
   # Advertise the shared Cachix cache so `nix run github:armaniacs/saniwalens`
   # pulls prebuilt artifacts instead of compiling from source. Trusted users

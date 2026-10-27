@@ -1,6 +1,7 @@
 # saniwalens
 
-A lens onto your Claude Code usage. `saniwalens` reads your session transcripts and
+A lens onto your coding-agent usage. `saniwalens` reads your agent session
+transcripts and
 live configuration, extracts them into a local SQLite store, and shows **where
 time, tokens, and effort are being wasted — and how to fix it**: unused or heavy
 config, recurring tool failures, where the work gets stuck, and the cost picture
@@ -67,27 +68,6 @@ names the config tree directly when it is set to a non-empty path, as it does
 for Claude Code itself. Otherwise — including when the variable is set but
 empty — `~/.claude` is located through `HOME`, falling back to `USERPROFILE`
 where Windows leaves `HOME` unset.
-
-## Claude Code plugin
-
-The repository is also a Claude Code plugin marketplace
-([`.claude-plugin/`](.claude-plugin/) + [`plugins/saniwalens/`](plugins/saniwalens/)),
-so you can drive saniwalens from inside a Claude Code session:
-
-```
-/plugin marketplace add armaniacs/saniwalens
-/plugin install saniwalens@saniwalens
-```
-
-| Skill | What it does |
-| --- | --- |
-| `/saniwalens:doctor` | Analyze and present the one-screen health check in the session. |
-| `/saniwalens:optimize` | The `saniwalens optimize` advisor, in the **current** session: investigate the findings to root cause and propose concrete config fixes. |
-| `/saniwalens:query` | Answer an ad-hoc usage question with read-only SQL over the store. |
-
-The skills use the `saniwalens` binary when it is on PATH and fall back to
-`nix run github:armaniacs/saniwalens` otherwise. They read and write the same
-per-user store as the CLI.
 
 ## Quick start
 
@@ -196,12 +176,12 @@ derived store.
 ## What it covers
 
 - **Every configuration surface** — skills, rules, agents, MCP servers,
-  `CLAUDE.md` — catalogued with its startup and on-demand token costs and load
+  `CLAUDE.md` / `AGENTS.md` — catalogued with its startup and on-demand token costs and load
   mode, joined
   against actual usage to flag unused (delete), always-on heavy (slim), and
   costly+rare (trim).
 - **Where the work stumbles** — recurring tool failures by category and
-  originating tool (`failures`), files Claude got stuck re-editing (`stuck`),
+  originating tool (`failures`), files the agent got stuck re-editing (`stuck`),
   each with concrete examples and the project it concentrates in.
 - **Where tokens go** — main-thread skill output vs. subagent cost, the subagent
   half split per agent type (which agents actually spent it, nested spawns
