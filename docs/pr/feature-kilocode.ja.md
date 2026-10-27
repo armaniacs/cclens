@@ -1,6 +1,6 @@
 # この PR が追加するもの: kilocode ハーネス(マルチハーネス対応に積む第二弾)
 
-`cclens` はコーディングエージェントの利用実績を解析し、設定のどこを最適化できるかを
+`agentlens` はコーディングエージェントの利用実績を解析し、設定のどこを最適化できるかを
 見せるツールです。積み替えの土台 PR(`feature-otherharness`)が `--harness` フラグと
 ハーネス単位の分離によってツールを他のエージェントへ一般化し、第一弾として opencode を
 対応させました。この PR は同じフラグの下に第二のハーネスとして **kilocode**
@@ -56,7 +56,7 @@ Kilo Code にセッションがあるユーザーは何も得られませんで�
 `--harness kilocode optimize` は `kilo --prompt <ポインタ>` を起動します — claude
 起動と同じ体験で、ユーザーが同席してブリーフィング読みを承認できます(opencode と違
 い kilo は全ツール呼び出しにゲートがあるため、headless では `--auto` が必要 — 動作
-することも、なしでは死ぬことも実測済み)。この試行で cclens 自身の実欠陥 3 件が見つか
+することも、なしでは死ぬことも実測済み)。この試行で agentlens 自身の実欠陥 3 件が見つか
 り修正されました:上記の excerpt 欠陥、未知のツール名が path-not-found に誤分類された
 件("unknown tool" を tool-not-available 語彙に追加)、そして work events が epoch を
 持ったまま `started_at` を空のまま残していた件 — これは kilocode 固有ではなく共有の

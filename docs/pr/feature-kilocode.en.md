@@ -1,6 +1,6 @@
 # What this PR adds: a kilocode harness, stacked on multi-harness support
 
-`cclens` analyzes coding-agent usage to show where an agent's configuration can
+`agentlens` analyzes coding-agent usage to show where an agent's configuration can
 be optimized. The stacked base PR (`feature-otherharness`) generalized the tool
 to other coding agents, starting with opencode, via a `--harness` flag with
 per-harness isolation. This PR adds **kilocode** (Kilo Code / the `kilo` CLI)
@@ -60,7 +60,7 @@ surfaces catalogued, and `waste`/`inventory` join against them.
 interactive session the claude launch gives, with the user present to approve
 the briefing read (kilo gates every tool call where opencode does not, so a
 headless run would need `--auto` instead — measured working, and measured
-dying without it). The exercise found and fixed three real defects in cclens
+dying without it). The exercise found and fixed three real defects in agentlens
 itself: the excerpt defect above, an unknown tool name mis-classified as
 path-not-found ("unknown tool" joined the tool-not-available vocabulary), and
 work events leaving `started_at` empty while carrying the epoch — a shared
