@@ -23,7 +23,7 @@ jobs:
       # the auth token; forks/PRs without the secret fall back to pull-only.
       - uses: cachix/cachix-action@v17
         with:
-          name: agentlens
+          name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       # Same pinned tools as local dev (flake devShell) — see flake.nix / justfile.
       - run: nix develop -c just check
@@ -39,7 +39,7 @@ jobs:
             experimental-features = nix-command flakes
       - uses: cachix/cachix-action@v17
         with:
-          name: agentlens
+          name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - run: nix develop -c just test
 
@@ -51,11 +51,11 @@ jobs:
   #
   # Built from the archive GitHub serves for the commit rather than from the
   # checkout: only the archive has VERSION filled in, so only its build is the
-  # one `nix run github:armaniacs/agentlens` looks up in the cache.
+  # one `nix run github:armaniacs/saniwalens` looks up in the cache.
   build:
     uses: lambdalisue/nix-github-release/.github/workflows/build.yml@v0.1.0
     with:
-      cachix-cache: agentlens
+      cachix-cache: saniwalens
     secrets:
       cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 

@@ -571,7 +571,7 @@ mod tests {
         // call must simply not read as a missing scope).
         use std::os::unix::fs::PermissionsExt;
         let dir =
-            std::env::temp_dir().join(format!("agentlens-test-unreadable-{}", std::process::id()));
+            std::env::temp_dir().join(format!("saniwalens-test-unreadable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn a_missing_dir_stays_silent_and_yields_nothing() {
         let missing = std::env::temp_dir().join(format!(
-            "agentlens-test-absent-{}-{}",
+            "saniwalens-test-absent-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn an_mcp_server_startup_cost_is_unknown_not_zero() {
-        let dir = std::env::temp_dir().join(format!("agentlens-test-mcp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("saniwalens-test-mcp-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".mcp.json");
         fs::write(&path, r#"{"mcpServers":{"playwright":{}}}"#).unwrap();
@@ -804,7 +804,7 @@ mod tests {
     fn read_project_surfaces_walks_the_project_layout() {
         // A synthetic project directory (privacy rule: fixtures are fabricated).
         let root =
-            std::env::temp_dir().join(format!("agentlens-test-project-{}", std::process::id()));
+            std::env::temp_dir().join(format!("saniwalens-test-project-{}", std::process::id()));
         let claude = root.join(".claude");
         fs::create_dir_all(claude.join("skills/deploy")).unwrap();
         fs::write(claude.join("skills/deploy/SKILL.md"), "deploy skill").unwrap();
@@ -840,7 +840,7 @@ mod tests {
         // paths would double the always-on figure and suggest deleting a link
         // that costs nothing.
         let root = std::env::temp_dir().join(format!(
-            "agentlens-test-symlink-{}-{:?}",
+            "saniwalens-test-symlink-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -865,7 +865,7 @@ mod tests {
         // Only the *same file* is deduplicated: a standalone AGENTS.md is real
         // extra always-on context.
         let root = std::env::temp_dir().join(format!(
-            "agentlens-test-distinct-{}-{:?}",
+            "saniwalens-test-distinct-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -891,7 +891,7 @@ mod tests {
     /// An empty scratch directory unique to the calling test.
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "agentlens-test-{name}-{}-{:?}",
+            "saniwalens-test-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

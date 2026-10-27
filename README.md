@@ -1,6 +1,6 @@
-# agentlens
+# saniwalens
 
-A lens onto your Claude Code usage. `agentlens` reads your session transcripts and
+A lens onto your Claude Code usage. `saniwalens` reads your session transcripts and
 live configuration, extracts them into a local SQLite store, and shows **where
 time, tokens, and effort are being wasted — and how to fix it**: unused or heavy
 config, recurring tool failures, where the work gets stuck, and the cost picture
@@ -14,22 +14,22 @@ run it.
 With Homebrew (macOS and Linux, Intel and arm):
 
 ```sh
-brew install armaniacs/agentlens/agentlens
+brew install armaniacs/saniwalens/saniwalens
 ```
 
-With Cargo, from [crates.io](https://crates.io/crates/agentlens) (builds from
+With Cargo, from [crates.io](https://crates.io/crates/saniwalens) (builds from
 source; bundled SQLite needs a C compiler):
 
 ```sh
-cargo install agentlens
+cargo install saniwalens
 ```
 
 With Nix (no toolchain to set up):
 
 ```sh
-nix run github:armaniacs/agentlens -- doctor   # run without installing
-nix profile install github:armaniacs/agentlens  # install `agentlens` onto PATH
-nix profile install github:armaniacs/agentlens/vX.Y.Z  # a specific release
+nix run github:armaniacs/saniwalens -- doctor   # run without installing
+nix profile install github:armaniacs/saniwalens  # install `saniwalens` onto PATH
+nix profile install github:armaniacs/saniwalens/vX.Y.Z  # a specific release
 ```
 
 From source — dev tools are pinned by the Nix flake, tasks run via `just`:
@@ -39,7 +39,7 @@ nix develop          # enter the dev shell (pinned rust, just, sqlite, …)
 just                 # list tasks
 just check           # rustfmt --check + clippy (the CI gate)
 just test            # cargo test
-just build           # release binary at target/release/agentlens
+just build           # release binary at target/release/saniwalens
 ```
 
 Plain Cargo also works (`cargo build --release`) if you have a recent stable
@@ -48,7 +48,7 @@ Rust; the flake just pins it. CI runs `nix develop -c just check` / `just test`.
 Publishing a GitHub Release for a `vX.Y.Z` tag builds binaries for Linux, macOS,
 and Windows (x86_64 and arm64 each), attaches them to that release with
 `.sha256` files, points the
-[`armaniacs/homebrew-agentlens`](https://github.com/armaniacs/homebrew-agentlens)
+[`armaniacs/homebrew-saniwalens`](https://github.com/armaniacs/homebrew-saniwalens)
 tap at the new archives, and publishes the crate to crates.io. The release is
 published before its assets are built, so the notes are visible for a few
 minutes with nothing attached yet.
@@ -71,22 +71,22 @@ where Windows leaves `HOME` unset.
 ## Claude Code plugin
 
 The repository is also a Claude Code plugin marketplace
-([`.claude-plugin/`](.claude-plugin/) + [`plugins/agentlens/`](plugins/agentlens/)),
-so you can drive agentlens from inside a Claude Code session:
+([`.claude-plugin/`](.claude-plugin/) + [`plugins/saniwalens/`](plugins/saniwalens/)),
+so you can drive saniwalens from inside a Claude Code session:
 
 ```
-/plugin marketplace add armaniacs/agentlens
-/plugin install agentlens@agentlens
+/plugin marketplace add armaniacs/saniwalens
+/plugin install saniwalens@saniwalens
 ```
 
 | Skill | What it does |
 | --- | --- |
-| `/agentlens:doctor` | Analyze and present the one-screen health check in the session. |
-| `/agentlens:optimize` | The `agentlens optimize` advisor, in the **current** session: investigate the findings to root cause and propose concrete config fixes. |
-| `/agentlens:query` | Answer an ad-hoc usage question with read-only SQL over the store. |
+| `/saniwalens:doctor` | Analyze and present the one-screen health check in the session. |
+| `/saniwalens:optimize` | The `saniwalens optimize` advisor, in the **current** session: investigate the findings to root cause and propose concrete config fixes. |
+| `/saniwalens:query` | Answer an ad-hoc usage question with read-only SQL over the store. |
 
-The skills use the `agentlens` binary when it is on PATH and fall back to
-`nix run github:armaniacs/agentlens` otherwise. They read and write the same
+The skills use the `saniwalens` binary when it is on PATH and fall back to
+`nix run github:armaniacs/saniwalens` otherwise. They read and write the same
 per-user store as the CLI.
 
 ## Quick start
@@ -94,40 +94,40 @@ per-user store as the CLI.
 ```sh
 # 1. Start here — a one-screen health check, split into what to fix globally
 #    (~/.claude) vs per project. Analyzes automatically on first run.
-agentlens doctor
+saniwalens doctor
 
 # 2. Narrow to the layer you're optimizing.
-agentlens doctor --scope global
-agentlens doctor --scope project:<slug>
+saniwalens doctor --scope global
+saniwalens doctor --scope project:<slug>
 
 # 3. Act on the findings: hand them to an interactive `claude` session that
 #    investigates each root cause and proposes concrete fixes.
-agentlens optimize --scope global
+saniwalens optimize --scope global
 ```
 
 Analysis reads your transcripts (`~/.claude/projects`) and live config —
 `~/.claude/*` plus each analyzed project's own `.claude/` / `CLAUDE.md` —
 **read-only** and incrementally, writing the store. Nothing is sent anywhere;
 the store is a local file. Every command takes `--db <path>`; it defaults to
-`${XDG_STATE_HOME:-~/.local/state}/agentlens/agentlens.db` — one per-user store,
+`${XDG_STATE_HOME:-~/.local/state}/saniwalens/saniwalens.db` — one per-user store,
 because what is analyzed spans every project, not the directory you run from.
-Pass `--db ./agentlens.db` if you deliberately want a project-local one (and
+Pass `--db ./saniwalens.db` if you deliberately want a project-local one (and
 `.gitignore` it). Read commands refresh the store automatically before reporting
 (unchanged transcripts are skipped, so this is fast) and print a freshness line
 on stderr; pass `--frozen` to read the store exactly as it is. Running
-`agentlens analyze` yourself is only needed to refresh without reading.
+`saniwalens analyze` yourself is only needed to refresh without reading.
 
 ## Other agent harnesses
 
 The same lens works on opencode and Kilo Code transcripts via `--harness`:
 
 ```sh
-agentlens analyze --harness kilocode      # reads the editor's globalStorage task files
-agentlens doctor --harness kilocode
-agentlens optimize --harness kilocode     # opens an interactive `kilo --prompt` session
+saniwalens analyze --harness kilocode      # reads the editor's globalStorage task files
+saniwalens doctor --harness kilocode
+saniwalens optimize --harness kilocode     # opens an interactive `kilo --prompt` session
 ```
 
-Each harness keeps its own store (`agentlens-opencode.db`, `agentlens-kilocode.db`)
+Each harness keeps its own store (`saniwalens-opencode.db`, `saniwalens-kilocode.db`)
 and reads its own config — `~/.config/opencode/`, `~/.config/kilo/` plus each
 analyzed project's own files — so findings stay per harness, never mixed. The
 flag is explicit and the default stays `claude`; [`docs/specs/harness.md`](docs/specs/harness.md)
@@ -139,10 +139,10 @@ holds the per-harness contract.
 
 | Command | What it does |
 | --- | --- |
-| `agentlens doctor` | The health check, split global / per-project — **start here**. |
-| `agentlens analyze` | Extract transcripts + config into the store (incremental). Reads run it automatically. |
-| `agentlens sql '<query>'` | Run an arbitrary read-only SQL query against the store (see below). |
-| `agentlens optimize` | Hand the findings to an interactive `claude` session to act on. |
+| `saniwalens doctor` | The health check, split global / per-project — **start here**. |
+| `saniwalens analyze` | Extract transcripts + config into the store (incremental). Reads run it automatically. |
+| `saniwalens sql '<query>'` | Run an arbitrary read-only SQL query against the store (see below). |
+| `saniwalens optimize` | Hand the findings to an interactive `claude` session to act on. |
 
 `--scope global | project | project:<slug>` (on `doctor`, `failures`,
 `waste`, `inventory`, `optimize`) restricts a report to the config layer being
@@ -160,17 +160,17 @@ freshness chatter goes to stderr. Human output is colorized on a terminal;
 `NO_COLOR` or piping turns it off.
 
 ```sh
-agentlens waste                 # ranked optimization opportunities, with a suggested action
-agentlens waste --scope global  # …only what a global-config cleanup should touch
-agentlens inventory               # every installed surface (with its scope) × its actual usage
-agentlens overhead               # always-on context per session, reconciled vs your config
-agentlens usage                  # per-skill usage, most-invoked first
-agentlens usage --by month       # usage per time bucket (JST: year|month|week|day|hour)
-agentlens failures               # recurring tool failures by category, ranked, with fixes
-agentlens failures --scope global          # failures no project owns (a cross-project habit)
-agentlens failures --scope project:<slug>  # one project's failures (fix lands in its config)
-agentlens prompts                # how you steer the session (steer/correct/question/instruct)
-agentlens stuck                 # files Claude got stuck re-editing in rapid bursts
+saniwalens waste                 # ranked optimization opportunities, with a suggested action
+saniwalens waste --scope global  # …only what a global-config cleanup should touch
+saniwalens inventory               # every installed surface (with its scope) × its actual usage
+saniwalens overhead               # always-on context per session, reconciled vs your config
+saniwalens usage                  # per-skill usage, most-invoked first
+saniwalens usage --by month       # usage per time bucket (JST: year|month|week|day|hour)
+saniwalens failures               # recurring tool failures by category, ranked, with fixes
+saniwalens failures --scope global          # failures no project owns (a cross-project habit)
+saniwalens failures --scope project:<slug>  # one project's failures (fix lands in its config)
+saniwalens prompts                # how you steer the session (steer/correct/question/instruct)
+saniwalens stuck                 # files Claude got stuck re-editing in rapid bursts
 ```
 
 ### `sql` — query the store directly
@@ -180,13 +180,13 @@ point. The query is an argument, or read from **stdin**:
 
 ```sh
 # Which tool produces each failure category?
-agentlens sql "SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC"
+saniwalens sql "SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC"
 
 # The actual failing paths behind path-not-found (stdin form):
-echo "SELECT excerpt FROM tool_errors WHERE category='path-not-found'" | agentlens sql
+echo "SELECT excerpt FROM tool_errors WHERE category='path-not-found'" | saniwalens sql
 
 # Discover the schema:
-agentlens sql "SELECT sql FROM sqlite_master"
+saniwalens sql "SELECT sql FROM sqlite_master"
 ```
 
 The `tool_errors` view names the failure columns (`category`, `excerpt`,
@@ -214,11 +214,11 @@ derived store.
 - Counts are usage signals for ranking, **not a billing ledger**; static cost is
   a token estimate, not a measured runtime figure.
 - The store outlives your transcripts. Claude Code prunes those on its own
-  retention schedule, and agentlens keeps the rows it already extracted — so the db
+  retention schedule, and saniwalens keeps the rows it already extracted — so the db
   holds history that `~/.claude/projects` no longer can, and deleting it is a
   real loss, not a cache flush. That is why it lives under
-  `${XDG_STATE_HOME:-~/.local/state}/agentlens/` rather than a cache directory a
-  cleaner may empty. Upgrading agentlens across a schema change migrates the file
+  `${XDG_STATE_HOME:-~/.local/state}/saniwalens/` rather than a cache directory a
+  cleaner may empty. Upgrading saniwalens across a schema change migrates the file
   in place; you never need to delete it.
 - `optimize` launches the harness's own interactive session (`claude` by
   default, `kilo --prompt` under `--harness kilocode`) seeded with the

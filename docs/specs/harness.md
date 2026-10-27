@@ -1,6 +1,6 @@
 # Harness Specification
 
-agentlens analyzes sessions from more than one agent harness (Claude Code,
+saniwalens analyzes sessions from more than one agent harness (Claude Code,
 opencode; kilocode and DSH to follow). This spec owns the **harness contract**:
 how the CLI selects a harness, where each harness's input and store live, and
 what each harness can and cannot report in v1. The per-harness *formats* live
@@ -15,9 +15,9 @@ defaults, and existing stores — is untouched by every later harness:
 
 | Harness | Default store (`--db`) |
 | --- | --- |
-| `claude` | `${XDG_STATE_HOME:-~/.local/state}/agentlens/agentlens.db` (unchanged) |
-| `opencode` | same state dir, `agentlens-opencode.db` |
-| `kilocode` | same state dir, `agentlens-kilocode.db` |
+| `claude` | `${XDG_STATE_HOME:-~/.local/state}/saniwalens/saniwalens.db` (unchanged) |
+| `opencode` | same state dir, `saniwalens-opencode.db` |
+| `kilocode` | same state dir, `saniwalens-kilocode.db` |
 
 An explicit `--db` always wins, exactly as before. The schema is identical in
 every store (`storage.md`); only the rows' origin differs, which is why no
@@ -30,7 +30,7 @@ kilocode`).
 A command reading a store built by another harness **refuses with a hint**
 naming the expected `--harness` (or a matching `--db`), rather than reporting
 one harness's rows as another's. `sql` enforces the same guard: it resolves
-its default `--db` through `--harness`, so `agentlens --harness opencode sql`
+its default `--db` through `--harness`, so `saniwalens --harness opencode sql`
 lands on the opencode store without flags.
 
 ## `--harness`
@@ -38,7 +38,7 @@ lands on the opencode store without flags.
 A global flag, default `claude`:
 
 ```
-agentlens [--harness claude|opencode|kilocode] <command>
+saniwalens [--harness claude|opencode|kilocode] <command>
 ```
 
 - The default keeps every existing invocation byte-identical in behavior —
@@ -116,7 +116,7 @@ contract:
 - **Sessions come from the task directories** under the resolved input root,
   sorted for a deterministic order. A directory without both
   `api_conversation_history.json` and `ui_messages.json` is not a session and
-  is skipped. One task directory is one agentlens session; the task uuid is both
+  is skipped. One task directory is one saniwalens session; the task uuid is both
   the session id and the slug.
 - **The project root is a stated heuristic** (`estimate_root`): the common
   parent directory of the **leading** tool paths, since kilocode stamps no
@@ -148,12 +148,12 @@ The briefing composes from the store either way, so `--print` works under
 every harness. Launching runs the harness's own agent on a data-free pointer
 prompt (the briefing travels via a private temp file, as for Claude Code):
 `claude <prompt>` opens interactively, while `opencode run --format json
---title 'agentlens optimize' <prompt>` runs the advisor headless — no user is
+--title 'saniwalens optimize' <prompt>` runs the advisor headless — no user is
 present for the approval gate, so the headless instructions
 (`run_instructions`) make the printed plan the final output and forbid
 edits.
 
-The headless terminal stays quiet: agentlens reads the JSON event stream line
+The headless terminal stays quiet: saniwalens reads the JSON event stream line
 by line and surfaces only what the agent says — text parts (narration, then
 the plan) on stdout, one-line tool markers on stderr — while every raw line
 and the child's stderr go to a private (`0600`) log file whose path is
