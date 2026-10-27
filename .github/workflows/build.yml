@@ -80,7 +80,7 @@ jobs:
           esac
           export VERSION
           perl -0pi -e 's/^version = "0\.0\.0"/version = "$ENV{VERSION}"/m' Cargo.toml
-          perl -0pi -e 's/(name = "cclens"\r?\nversion = )"0\.0\.0"/$1"$ENV{VERSION}"/' Cargo.lock
+          perl -0pi -e 's/(name = "agentlens"\r?\nversion = )"0\.0\.0"/$1"$ENV{VERSION}"/' Cargo.lock
           grep -Fq "version = \"${VERSION}\"" Cargo.toml
           grep -Fq "version = \"${VERSION}\"" Cargo.lock
       # rusqlite is built with `bundled`, so SQLite compiles from C against each
@@ -96,13 +96,13 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          bin=cclens
-          if [ "$RUNNER_OS" = Windows ]; then bin=cclens.exe; fi
+          bin=agentlens
+          if [ "$RUNNER_OS" = Windows ]; then bin=agentlens.exe; fi
           tar -C "target/${{ matrix.target }}/release" -czf \
-            "cclens-${TAG}-${{ matrix.target }}.tar.gz" "$bin"
+            "agentlens-${TAG}-${{ matrix.target }}.tar.gz" "$bin"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: cclens-${{ matrix.target }}
-          path: cclens-*.tar.gz
+          name: agentlens-${{ matrix.target }}
+          path: agentlens-*.tar.gz
           if-no-files-found: error

@@ -35,7 +35,7 @@ opencode's did.
   editor install (Code / Cursor / VSCodium), so the adapter resolves the
   tasks directory from the harness's input root — `--projects`, whose
   default the `harness.md` addendum settles when the wiring lands.
-- One task directory is **one cclens session**. kilocode's own
+- One task directory is **one agentlens session**. kilocode's own
   task⇔session mapping (`sessions/<id>/session.json`, holding
   `taskSessionMap`) lives outside the tasks tree and is not read — the
   adapter never needs it.

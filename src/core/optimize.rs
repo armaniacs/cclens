@@ -185,7 +185,7 @@ pub fn run_instructions(copy: &HarnessCopy) -> String {
 fn instructions_for(copy: &HarnessCopy, mode: RunMode) -> String {
     format!(
         "\
-You are acting as {article} {agent} optimization advisor. The user ran `cclens`, \
+You are acting as {article} {agent} optimization advisor. The user ran `agentlens`, \
 a tool that analyzed their {agent} {source} and configuration to find \
 where time, tokens, and effort are wasted. Its headline findings are below. Your job is \
 to investigate them to a conclusion and propose concrete fixes — not to hand the analysis \
@@ -209,17 +209,17 @@ Investigate autonomously — this is your work, not the user's:
 gather data. Drive the investigation yourself, end to end.
 - The briefing below is the headline analysis. For ANY deeper slice — the full list of \
 failing paths, a worktree-vs-main split, counts grouped however you like — query the \
-analyzed store with `cclens sql`. cclens has already extracted every session \
+analyzed store with `agentlens sql`. agentlens has already extracted every session \
 into a SQLite store; querying it is the tool's job, so do NOT re-parse the raw \
-{raw_source} in Python — that reinvents what cclens is. Examples:
-    cclens sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
-    cclens sql \"SELECT target, COUNT(*) n FROM tool_errors WHERE category='edit-precondition' AND target<>'' GROUP BY target ORDER BY n DESC\"
-    echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | cclens sql
-  If `cclens` is not on your PATH — e.g. this session was started via \
-`nix run github:lambdalisue/cclens` — run it through Nix wherever these instructions say \
-`cclens`, with the same subcommands and flags: \
-`nix run github:lambdalisue/cclens -- sql --db <path> \"SELECT …\"`.
-  Re-running `cclens analyze` is unnecessary — the store is already current. Schema crib:
+{raw_source} in Python — that reinvents what agentlens is. Examples:
+    agentlens sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
+    agentlens sql \"SELECT target, COUNT(*) n FROM tool_errors WHERE category='edit-precondition' AND target<>'' GROUP BY target ORDER BY n DESC\"
+    echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | agentlens sql
+  If `agentlens` is not on your PATH — e.g. this session was started via \
+`nix run github:armaniacs/agentlens` — run it through Nix wherever these instructions say \
+`agentlens`, with the same subcommands and flags: \
+`nix run github:armaniacs/agentlens -- sql --db <path> \"SELECT …\"`.
+  Re-running `agentlens analyze` is unnecessary — the store is already current. Schema crib:
     - tool_errors(session_id, project, category, excerpt, tool, target, started_epoch): one row \
 per failed tool call. `category` = friction class, `excerpt` = the actual error text (carries \
 the failing path/file — including any worktree segment like `/.wt/`, so a worktree-vs-main \
@@ -236,7 +236,7 @@ run's own `tool_use_id` names a call inside its parent subagent's transcript, wh
 `events` row at all (only main transcripts produce events). Joining on `tool_use_id` therefore \
 silently drops every nested run.
     - sessions(id, project, slug, source_path, started_at, …) and events(session_id, kind, \
-surface_id, source, model, started_epoch, …) hold everything else (run `cclens sql \
+surface_id, source, model, started_epoch, …) hold everything else (run `agentlens sql \
 \"SELECT sql FROM sqlite_master\"` to see all of it). Confirm an encoding by sampling the \
 data before relying on it.
 - The store cannot hold the config itself, so still open the actual {config_inventory} \
@@ -285,7 +285,7 @@ decision specifically and keep going on everything else — do not hand the whol
 /// (the default). Any section with no data is omitted so the prompt never
 /// carries an empty heading.
 pub fn render_briefing(f: &Findings, filter: &ScopeFilter, copy: &HarnessCopy) -> String {
-    let mut out = String::from("# cclens analysis\n");
+    let mut out = String::from("# agentlens analysis\n");
 
     if filter.includes_global() {
         out.push_str("\n## Where tokens go\n");
@@ -491,11 +491,11 @@ fn render_surface(s: &SurfaceRef) -> String {
     format!("{}/{} ({cost})", s.kind, s.id)
 }
 
-/// How to reach the analyzed store for `cclens sql` — appended so the
+/// How to reach the analyzed store for `agentlens sql` — appended so the
 /// `--db` the agent should query is the one this run actually built.
 fn store_pointer(db_path: &str) -> String {
     format!(
-        "The analyzed store is at `{db_path}`; pass `--db {db_path}` to `cclens sql` \
+        "The analyzed store is at `{db_path}`; pass `--db {db_path}` to `agentlens sql` \
          (the default store path is used when `--db` is omitted)."
     )
 }
@@ -724,12 +724,12 @@ mod tests {
         assert!(prompt.contains("Claude Code optimization advisor"));
         assert!(prompt.contains("Do NOT ask the user which area"));
         assert!(prompt.contains("Apply file changes only after the user approves"));
-        assert!(prompt.contains("cclens sql"));
+        assert!(prompt.contains("agentlens sql"));
         assert!(prompt.contains("--db /tmp/cc.db"));
-        assert!(prompt.contains("# cclens analysis"));
-        // The session may have been launched via `nix run` (cclens not on PATH),
+        assert!(prompt.contains("# agentlens analysis"));
+        // The session may have been launched via `nix run` (agentlens not on PATH),
         // so the prompt must document the Nix invocation as a substitution rule.
-        assert!(prompt.contains("nix run github:lambdalisue/cclens"));
+        assert!(prompt.contains("nix run github:armaniacs/agentlens"));
     }
 
     #[test]
@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn launch_prompt_points_at_the_file_and_carries_no_briefing_data() {
         let prompt = launch_prompt(
-            "/tmp/cclens-briefing-123.md",
+            "/tmp/agentlens-briefing-123.md",
             "/tmp/cc.db",
             &ScopeFilter::All,
             &claude_copy(),
@@ -786,11 +786,11 @@ mod tests {
         // The instructions, the store pointer, and the file pointer must be present...
         assert!(prompt.contains("Claude Code optimization advisor"));
         assert!(prompt.contains("--db /tmp/cc.db"));
-        assert!(prompt.contains("/tmp/cclens-briefing-123.md"));
+        assert!(prompt.contains("/tmp/agentlens-briefing-123.md"));
         assert!(prompt.contains("Read that file in full"));
-        assert!(prompt.contains("nix run github:lambdalisue/cclens"));
+        assert!(prompt.contains("nix run github:armaniacs/agentlens"));
         // ...but none of the analysis (which goes to the file) leaks onto argv.
-        assert!(!prompt.contains("# cclens analysis"));
+        assert!(!prompt.contains("# agentlens analysis"));
     }
 
     #[test]
@@ -933,14 +933,14 @@ mod tests {
     #[test]
     fn headless_launch_carries_the_no_edit_mandate_onto_argv() {
         let prompt = launch_prompt(
-            "/tmp/cclens-briefing-123.md",
+            "/tmp/agentlens-briefing-123.md",
             "/tmp/oc.db",
             &ScopeFilter::All,
             &opencode_copy(),
             RunMode::Headless,
         );
         assert!(prompt.contains("Do not edit any files"));
-        assert!(prompt.contains("/tmp/cclens-briefing-123.md"));
-        assert!(!prompt.contains("# cclens analysis"));
+        assert!(prompt.contains("/tmp/agentlens-briefing-123.md"));
+        assert!(!prompt.contains("# agentlens analysis"));
     }
 }

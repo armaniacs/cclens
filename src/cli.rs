@@ -36,12 +36,12 @@ use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
 #[command(
-    name = "cclens",
+    name = "agentlens",
     // Cargo.toml holds a placeholder that the release workflow and the flake
     // both stamp from the tag before building.
     version,
-    about = "See where your Claude Code time and tokens go, and which config to fix.\n\
-             Start with `cclens doctor`; every report explains itself and names the\n\
+    about = "See where your coding-agent time and tokens go, and which config to fix.\n\
+             Start with `agentlens doctor`; every report explains itself and names the\n\
              follow-up command."
 )]
 pub struct Cli {
@@ -67,7 +67,7 @@ enum Command {
         /// Output format: table | json (the run's counters).
         #[arg(long)]
         format: Option<String>,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -83,7 +83,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -100,7 +100,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -118,7 +118,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -131,7 +131,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -145,7 +145,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -163,7 +163,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -176,7 +176,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -193,7 +193,7 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -206,7 +206,7 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        /// Store path (default: $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -220,7 +220,7 @@ enum Command {
         #[arg(long)]
         projects: Option<PathBuf>,
         /// Store to analyze into / read from (default:
-        /// $XDG_STATE_HOME/cclens/cclens.db).
+        /// $XDG_STATE_HOME/agentlens/agentlens.db).
         #[arg(long)]
         db: Option<PathBuf>,
         /// Optimize one config layer only: global (~/.claude) | project |
@@ -392,7 +392,7 @@ fn launch_command(
         Harness::Claude => Some(("claude", &[], optimize_mod::RunMode::Interactive)),
         Harness::Opencode => Some((
             "opencode",
-            &["run", "--format", "json", "--title", "cclens optimize"],
+            &["run", "--format", "json", "--title", "agentlens optimize"],
             optimize_mod::RunMode::Headless,
         )),
         // The `kilo` binary is the measured agent CLI (Homebrew), and kilo is
@@ -438,7 +438,7 @@ fn optimize(
     guard_harness(&store, harness, db)?;
     let findings = collect_findings(&store)?;
 
-    // The absolute store path so the session's `cclens sql --db …` hits the
+    // The absolute store path so the session's `agentlens sql --db …` hits the
     // store this run built, wherever it is launched from.
     let db_display = std::fs::canonicalize(db)
         .map(|p| p.to_string_lossy().into_owned())
@@ -546,7 +546,7 @@ fn run_headless(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    let log_path = private_temp_path("cclens-run", "log");
+    let log_path = private_temp_path("agentlens-run", "log");
     write_private_file(&log_path, "").context("create run log")?;
     let mut log = fs::OpenOptions::new()
         .append(true)
@@ -652,7 +652,7 @@ fn private_temp_path(prefix: &str, ext: &str) -> PathBuf {
 /// briefing, which may hold sensitive paths/excerpts and must not sit on argv or
 /// be world-readable.
 fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
-    let path = private_temp_path("cclens-briefing", "md");
+    let path = private_temp_path("agentlens-briefing", "md");
     write_private_file(&path, contents)?;
     Ok(path)
 }
@@ -957,7 +957,7 @@ fn config_wedges(store: &Store) -> Result<ScopedWedges> {
 
 /// Run a read-only SQL query against the store and print the result. The query
 /// comes from the argument or, when absent, from stdin — so both
-/// `cclens sql '…'` and `echo '…' | cclens sql` work. The store is
+/// `agentlens sql '…'` and `echo '…' | agentlens sql` work. The store is
 /// opened read-only so an ad-hoc query can never mutate the derived data.
 fn sql(harness: &Harness, query: Option<&str>, format: Format, db: &Path) -> Result<()> {
     let query = match query {
@@ -1041,13 +1041,13 @@ fn doctor(
         }));
     }
 
-    // The text form is written for someone who has never seen cclens's
+    // The text form is written for someone who has never seen agentlens's
     // vocabulary: every item says what happened, why it costs, and what to do
     // — prioritized, so the report reads top to bottom as a to-do list.
     let style = Style::stdout();
     let (session_count, project_count) = store.session_stats()?;
     if session_count == 0 {
-        println!("nothing analyzed yet — run `cclens analyze` first");
+        println!("nothing analyzed yet — run `agentlens analyze` first");
         return Ok(());
     }
     println!(
@@ -1109,7 +1109,7 @@ fn doctor(
         lines.push(format!(
             "  Fix in this project's own {} — details: {}",
             harness.project_config_ref(),
-            style.command(&format!("cclens failures --scope project:{}", p.project))
+            style.command(&format!("agentlens failures --scope project:{}", p.project))
         ));
         items.push(Item {
             weight: p.total_friction(),
@@ -1136,7 +1136,7 @@ fn doctor(
                         "  No single project owns it, so the fix belongs in {} — \
                          details: {}",
                         harness.global_config_ref(),
-                        style.command("cclens failures --scope global")
+                        style.command("agentlens failures --scope global")
                     ),
                 ],
             });
@@ -1165,7 +1165,7 @@ fn doctor(
                 lines: vec![format!(
                     "{steer}% of your prompts steer and {correct}% correct — rework that \
                      clearer upfront specs could cut. Details: {}",
-                    style.command("cclens prompts")
+                    style.command("agentlens prompts")
                 )],
             });
         }
@@ -1187,7 +1187,7 @@ fn doctor(
         println!(
             "  {}",
             style.dim(&format!(
-                "… and {dropped_items} smaller recurring problem(s) — see `cclens failures --scope project`"
+                "… and {dropped_items} smaller recurring problem(s) — see `agentlens failures --scope project`"
             ))
         );
     }
@@ -1212,7 +1212,7 @@ fn doctor(
                     "  {}",
                     style.dim(
                         "itself (system prompt, built-in tools, MCP schemas) plus each \
-                         project's own config (AGENTS.md, skill descriptions) — `cclens \
+                         project's own config (AGENTS.md, skill descriptions) — `agentlens \
                          overhead` splits it per project."
                     )
                 );
@@ -1222,7 +1222,7 @@ fn doctor(
                 println!(
                     "  ~all of it is accounted for by your own config files (skill \
                      descriptions, AGENTS.md) — nothing is left over to attribute; \
-                     `cclens overhead` splits it per project."
+                     `agentlens overhead` splits it per project."
                 );
             }
         }
@@ -1233,7 +1233,7 @@ fn doctor(
             f.sub_agents
         );
         warn_missing_agent_split(&f.agent_split);
-        for line in doctor_agent_lines(&f, &style.command("cclens usage")) {
+        for line in doctor_agent_lines(&f, &style.command("agentlens usage")) {
             if line.starts_with('…') {
                 println!("  {}", style.dim(&line));
             } else {
@@ -1249,7 +1249,7 @@ fn doctor(
             "  {}: {} → {}",
             harness.global_config_ref(),
             prune_phrase(&f.unused, &f.always_on_heavy),
-            style.command("cclens waste --scope global")
+            style.command("agentlens waste --scope global")
         ));
     }
     let mut prunable: Vec<_> = visible
@@ -1262,7 +1262,7 @@ fn doctor(
             "  {}: {} → {}",
             display(p),
             prune_phrase(&p.unused, &p.always_on_heavy),
-            style.command(&format!("cclens waste --scope project:{}", p.project))
+            style.command(&format!("agentlens waste --scope project:{}", p.project))
         ));
     }
     if !pruning.is_empty() {
@@ -1278,7 +1278,7 @@ fn doctor(
             println!(
                 "  {}",
                 style.dim(&format!(
-                    "… and {} more project(s) with prunable config — see `cclens waste --scope project`",
+                    "… and {} more project(s) with prunable config — see `agentlens waste --scope project`",
                     prunable.len() - 3
                 ))
             );
@@ -1608,7 +1608,7 @@ fn failures(
         return emit_json(&serde_json::json!({ "total": total, "failures": failures }));
     }
     if total == 0 {
-        println!("no tool failures found for this scope — run `cclens analyze` first?");
+        println!("no tool failures found for this scope — run `agentlens analyze` first?");
         return Ok(());
     }
 
@@ -1716,7 +1716,7 @@ fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result
                 "no prompts harvested for this harness — the store holds {sessions} analyzed session(s)"
             );
         } else {
-            println!("no prompts found — run `cclens analyze` first");
+            println!("no prompts found — run `agentlens analyze` first");
         }
         return Ok(());
     }
@@ -1823,7 +1823,7 @@ fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Resul
     let Some(floor) = floor else {
         let (sessions, _) = store.session_stats()?;
         if sessions == 0 {
-            println!("no data — run `cclens analyze` first");
+            println!("no data — run `agentlens analyze` first");
         } else {
             println!(
                 "always-on floor unavailable — none of the {sessions} analyzed session(s)\n\
@@ -2498,7 +2498,7 @@ fn warn_missing_agent_split(coverage: &SplitCoverage) {
             "{}",
             Style::stderr().warn(
                 "store: per-agent subagent split unavailable (store predates it) \
-                 — run `cclens analyze` (or drop --frozen) to fill it in"
+                 — run `agentlens analyze` (or drop --frozen) to fill it in"
             )
         );
     }
@@ -2508,7 +2508,7 @@ fn warn_missing_agent_split(coverage: &SplitCoverage) {
 /// when it carries a staleness hint the user should act on.
 fn eprint_freshness(line: &str) {
     let style = Style::stderr();
-    if line.contains("cclens analyze") {
+    if line.contains("agentlens analyze") {
         eprintln!("{}", style.warn(line));
     } else {
         eprintln!("{}", style.dim(line));
@@ -2520,11 +2520,12 @@ fn eprint_freshness(line: &str) {
 fn freshness_line(analyzed_at: Option<&str>) -> String {
     let Some(parsed) = analyzed_at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
     else {
-        return "store: freshness unknown (no analyze recorded) — run `cclens analyze`".to_string();
+        return "store: freshness unknown (no analyze recorded) — run `agentlens analyze`"
+            .to_string();
     };
     let age_secs = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
     let hint = if age_secs >= 24 * 3600 {
-        " — run `cclens analyze` (or drop --frozen) to refresh"
+        " — run `agentlens analyze` (or drop --frozen) to refresh"
     } else {
         ""
     };
@@ -2692,7 +2693,7 @@ fn usage(
     // it is a store whose per-agent split has not been extracted yet, and saying
     // "no usage" there would be false.
     if skills.is_empty() && agents.is_empty() && sub_tokens == 0 {
-        println!("no skill usage found — run `cclens analyze` first");
+        println!("no skill usage found — run `agentlens analyze` first");
         return Ok(());
     }
     preamble(
@@ -2797,7 +2798,7 @@ fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
         return emit_json(&serde_json::json!({ "buckets": buckets }));
     }
     if events.is_empty() {
-        println!("no skill usage found — run `cclens analyze` first");
+        println!("no skill usage found — run `agentlens analyze` first");
         return Ok(());
     }
 
@@ -2908,7 +2909,7 @@ fn inventory(
         return emit_json(&serde_json::json!({ "surfaces": items }));
     }
     if catalog.is_empty() && usage.is_empty() {
-        println!("nothing catalogued — run `cclens analyze` first");
+        println!("nothing catalogued — run `agentlens analyze` first");
         return Ok(());
     }
 
@@ -3097,7 +3098,7 @@ fn waste(
         return emit_json(&serde_json::json!({ "wedges": wedges }));
     }
     if found.is_empty() {
-        println!("nothing wasteful found — run `cclens analyze` first");
+        println!("nothing wasteful found — run `agentlens analyze` first");
         return Ok(());
     }
 
@@ -3293,7 +3294,7 @@ fn claude_home() -> Result<PathBuf> {
 /// Resolve `--db`, defaulting to a **user-level** store rather than a
 /// cwd-relative file. What gets analyzed is every transcript under
 /// `~/.claude/projects` — one cross-project dataset — so a per-directory
-/// default would build a separate copy of the same store per directory cclens
+/// default would build a separate copy of the same store per directory agentlens
 /// happens to run from, and leave a database inside unrelated Git working
 /// trees.
 ///
@@ -3328,14 +3329,66 @@ fn store_path(
             .join(".local")
             .join("state"),
     };
-    Ok(base.join("cclens").join(harness.db_file_name()))
+    Ok(base.join("agentlens").join(harness.db_file_name()))
+}
+
+/// Move a pre-rename store into place. The store outlives the transcripts it
+/// was parsed from (`storage.md`), so the rename must never orphan it: when
+/// the directory this version resolves to does not exist and the directory
+/// the binary was called `agentlens` still does, the legacy one moves — renamed
+/// under the new name with its per-harness files, never deleted, never copied
+/// over an existing store.
+fn migrate_legacy_store(resolved: &Path) {
+    let Some(new_dir) = resolved.parent() else {
+        return;
+    };
+    let Some(state_base) = new_dir.parent() else {
+        return;
+    };
+    let legacy_dir = state_base.join("cclens");
+    if new_dir.exists() || !legacy_dir.is_dir() {
+        return;
+    }
+    if std::fs::rename(&legacy_dir, new_dir).is_err() {
+        return; // a move we cannot make is not ours to force
+    }
+    // The per-harness files carry the old name too.
+    let Ok(entries) = std::fs::read_dir(new_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = stem.strip_prefix("cclens") else {
+            continue;
+        };
+        let _ = std::fs::rename(entry.path(), new_dir.join(format!("agentlens{rest}")));
+    }
+}
+
+/// `store_path` plus the legacy-store move, testable without touching the
+/// environment: the caller supplies both roots. An explicit `--db` is the
+/// user's own choice — the rename is not ours to apply to it.
+fn resolve_db_from(
+    db: Option<&Path>,
+    harness: &Harness,
+    state_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf> {
+    let path = store_path(db.map(PathBuf::from), harness, state_home, home)?;
+    if db.is_none() {
+        migrate_legacy_store(&path);
+    }
+    Ok(path)
 }
 
 /// `store_path` against the live environment.
 fn resolve_db(db: Option<PathBuf>, harness: &Harness) -> Result<PathBuf> {
     let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
-    store_path(
-        db,
+    resolve_db_from(
+        db.as_deref(),
         harness,
         state_home.as_deref(),
         home_dir().map(Path::new),
@@ -3497,12 +3550,12 @@ mod tests {
     fn version_flag_prints_the_crate_version() {
         use clap::CommandFactory;
         let err = Cli::command()
-            .try_get_matches_from(["cclens", "--version"])
+            .try_get_matches_from(["agentlens", "--version"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert_eq!(
             err.to_string(),
-            format!("cclens {}\n", env!("CARGO_PKG_VERSION"))
+            format!("agentlens {}\n", env!("CARGO_PKG_VERSION"))
         );
     }
 
@@ -3539,12 +3592,12 @@ mod tests {
             10,
             vec![agent("a", 4, 700_000), agent("b", 6, 300_000)],
         );
-        let lines = doctor_agent_lines(&f, "cclens usage");
+        let lines = doctor_agent_lines(&f, "agentlens usage");
         assert_eq!(
             lines,
             vec![
                 "Most of that subagent output: a 700.0k (4 runs), b 300.0k (6 runs). \
-                 Full split: cclens usage"
+                 Full split: agentlens usage"
             ]
         );
     }
@@ -3557,12 +3610,12 @@ mod tests {
             .map(|i| agent(&format!("t{i}"), 1, 100_000))
             .collect();
         let f = findings_with_agents(1_000_000, 10, agents);
-        let lines = doctor_agent_lines(&f, "cclens usage");
+        let lines = doctor_agent_lines(&f, "agentlens usage");
         assert_eq!(
             lines,
             vec![
                 "The largest agent types: t0 100.0k (1 run), t1 100.0k (1 run), t2 100.0k \
-                 (1 run). Full split: cclens usage",
+                 (1 run). Full split: agentlens usage",
                 "… and 7 more agent type(s) not shown",
             ]
         );
@@ -3580,14 +3633,14 @@ mod tests {
                 agent("codex:codex-rescue", 14, 62_067),
             ],
         );
-        let lines = doctor_agent_lines(&f, "cclens usage");
+        let lines = doctor_agent_lines(&f, "agentlens usage");
         assert_eq!(
             lines,
             vec![
                 "Only 377.7k of those tokens (25 of 375 runs) have a per-agent split — the \
                  rest were analyzed before runs were extracted and their transcripts are gone.",
                 "Among the runs that have one: general-purpose 315.7k (11 runs), \
-                 codex:codex-rescue 62.1k (14 runs). Full split: cclens usage",
+                 codex:codex-rescue 62.1k (14 runs). Full split: agentlens usage",
             ]
         );
     }
@@ -3597,7 +3650,7 @@ mod tests {
         // The gap is reported on stderr with its refresh hint; there is
         // nothing to list in-band.
         let f = findings_with_agents(3_093_466, 375, vec![]);
-        assert!(doctor_agent_lines(&f, "cclens usage").is_empty());
+        assert!(doctor_agent_lines(&f, "agentlens usage").is_empty());
     }
 
     /// A path in the temp dir that no other test uses, removed on drop so a
@@ -3607,7 +3660,7 @@ mod tests {
     impl TempPath {
         fn new(tag: &str) -> Self {
             let mut path = std::env::temp_dir();
-            path.push(format!("cclens-test-{}-{tag}", std::process::id()));
+            path.push(format!("agentlens-test-{}-{tag}", std::process::id()));
             let _ = fs::remove_file(&path);
             Self(path)
         }
@@ -3790,7 +3843,7 @@ mod tests {
                 None
             )
             .unwrap(),
-            PathBuf::from("/tmp/example/state/cclens/cclens.db")
+            PathBuf::from("/tmp/example/state/agentlens/agentlens.db")
         );
         assert_eq!(
             store_path(
@@ -3800,7 +3853,7 @@ mod tests {
                 Some(Path::new("/tmp/example/home"))
             )
             .unwrap(),
-            PathBuf::from("/tmp/example/home/.local/state/cclens/cclens.db")
+            PathBuf::from("/tmp/example/home/.local/state/agentlens/agentlens.db")
         );
     }
 
@@ -3816,7 +3869,7 @@ mod tests {
                 None
             )
             .unwrap(),
-            PathBuf::from("/tmp/example/state/cclens/cclens-opencode.db")
+            PathBuf::from("/tmp/example/state/agentlens/agentlens-opencode.db")
         );
     }
 
@@ -3832,7 +3885,7 @@ mod tests {
                 Some(Path::new("/tmp/example/home"))
             )
             .unwrap(),
-            PathBuf::from("/tmp/example/home/.local/state/cclens/cclens.db")
+            PathBuf::from("/tmp/example/home/.local/state/agentlens/agentlens.db")
         );
     }
 
@@ -3861,14 +3914,109 @@ mod tests {
         // The escape hatch for a deliberately project-local store.
         assert_eq!(
             store_path(
-                Some(PathBuf::from("./cclens.db")),
+                Some(PathBuf::from("./agentlens.db")),
                 &Harness::Opencode,
                 Some(Path::new("/tmp/example/state")),
                 Some(Path::new("/tmp/example/home"))
             )
             .unwrap(),
-            PathBuf::from("./cclens.db")
+            PathBuf::from("./agentlens.db")
         );
+    }
+
+    #[test]
+    fn first_open_moves_a_legacy_store_and_renames_its_files() {
+        // The store outlives the transcripts it was parsed from, so the
+        // rename must never orphan it: the pre-rename directory moves under
+        // the new name, its per-harness files included — never deleted.
+        let dir =
+            std::env::temp_dir().join(format!("agentlens-migrate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cclens")).unwrap();
+        std::fs::write(dir.join("cclens/cclens.db"), b"rows").unwrap();
+        std::fs::write(dir.join("cclens/cclens-opencode.db"), b"rows").unwrap();
+
+        migrate_legacy_store(&dir.join("agentlens/agentlens.db"));
+
+        assert_eq!(
+            std::fs::read(dir.join("agentlens/agentlens.db")).unwrap(),
+            b"rows"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("agentlens/agentlens-opencode.db")).unwrap(),
+            b"rows"
+        );
+        assert!(!dir.join("cclens").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_migration_never_touches_an_existing_store() {
+        // A move never overwrites: a store already living under the new name
+        // stays, and the legacy one survives beside it rather than being
+        // deleted to make room.
+        let dir = std::env::temp_dir().join(format!(
+            "agentlens-migrate-keep-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cclens")).unwrap();
+        std::fs::write(dir.join("cclens/cclens.db"), b"legacy").unwrap();
+        std::fs::create_dir_all(dir.join("agentlens")).unwrap();
+        std::fs::write(dir.join("agentlens/agentlens.db"), b"current").unwrap();
+
+        migrate_legacy_store(&dir.join("agentlens/agentlens.db"));
+
+        assert_eq!(
+            std::fs::read(dir.join("agentlens/agentlens.db")).unwrap(),
+            b"current"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("cclens/cclens.db")).unwrap(),
+            b"legacy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_migration_is_silent_when_nothing_is_to_move() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentlens-migrate-none-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        migrate_legacy_store(&dir.join("agentlens/agentlens.db"));
+
+        assert!(!dir.join("agentlens").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_rename_applies_only_to_the_default_resolution() {
+        // An explicit `--db` is the user's own choice — the rename is not
+        // ours to apply to it. The default resolution moves the legacy store
+        // into place under the new name.
+        let dir =
+            std::env::temp_dir().join(format!("agentlens-migrate-db-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cclens")).unwrap();
+        std::fs::write(dir.join("cclens/cclens.db"), b"rows").unwrap();
+        let explicit = dir.join("chosen.db");
+
+        let resolved =
+            resolve_db_from(Some(&explicit), &Harness::Claude, Some(&dir), Some(&dir)).unwrap();
+
+        assert_eq!(resolved, explicit);
+        assert!(dir.join("cclens/cclens.db").exists());
+
+        let default = resolve_db_from(None, &Harness::Claude, Some(&dir), Some(&dir)).unwrap();
+
+        assert_eq!(default, dir.join("agentlens/agentlens.db"));
+        assert!(default.exists());
+        assert!(!dir.join("cclens").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3894,7 +4042,7 @@ mod tests {
             launch_command(&Harness::Opencode),
             Some((
                 "opencode",
-                &["run", "--format", "json", "--title", "cclens optimize"] as &[&str],
+                &["run", "--format", "json", "--title", "agentlens optimize"] as &[&str],
                 optimize_mod::RunMode::Headless
             ))
         );

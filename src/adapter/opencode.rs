@@ -965,7 +965,7 @@ mod tests {
     /// A scratch database path unique to the calling test.
     fn scratch_db(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "cclens-test-opencode-{name}-{}-{:?}.db",
+            "agentlens-test-opencode-{name}-{}-{:?}.db",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1132,7 +1132,7 @@ mod tests {
     #[test]
     fn read_project_surfaces_walks_the_opencode_layout() {
         let root = std::env::temp_dir().join(format!(
-            "cclens-test-opencode-project-{}-{:?}",
+            "agentlens-test-opencode-project-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1173,7 +1173,7 @@ mod tests {
         // project symlink. One definition must count once — the project row
         // would shadow the global one and read it as unused.
         let root = std::env::temp_dir().join(format!(
-            "cclens-dedup-{}-{}",
+            "agentlens-dedup-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
