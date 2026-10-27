@@ -1,6 +1,6 @@
 # What this PR adds: multi-harness support, opencode first
 
-`agentlens` analyzes coding-agent usage to show where an agent's configuration can
+`saniwalens` analyzes coding-agent usage to show where an agent's configuration can
 be optimized — cost (context tokens, wall-clock time, friction) against actual
 usage of every configuration surface. Until now it understood only **Claude
 Code**: it read Claude Code transcripts, Claude Code config, and its reports
@@ -31,8 +31,8 @@ the data at all, and the advice it would give points at the wrong files.
 
 - `--harness claude` is the default and behaves exactly as before; `--harness
   opencode` switches every command to opencode data.
-- Each harness analyzes into its **own SQLite store** (`agentlens.db` vs
-  `agentlens-opencode.db`), so two agents' analyses never blend.
+- Each harness analyzes into its **own SQLite store** (`saniwalens.db` vs
+  `saniwalens-opencode.db`), so two agents' analyses never blend.
 - Reading a store with the wrong harness fails with a hint instead of silently
   mixing data ("the store ... holds opencode sessions — rerun with `--harness
   opencode` (or pick another `--db`)"). Frozen reads are guarded the same way,

@@ -165,9 +165,9 @@ impl Harness {
     /// store is never reinterpreted as another harness's rows.
     pub fn db_file_name(&self) -> &'static str {
         match self {
-            Harness::Claude => "agentlens.db",
-            Harness::Opencode => "agentlens-opencode.db",
-            Harness::Kilocode => "agentlens-kilocode.db",
+            Harness::Claude => "saniwalens.db",
+            Harness::Opencode => "saniwalens-opencode.db",
+            Harness::Kilocode => "saniwalens-kilocode.db",
         }
     }
 
@@ -299,9 +299,9 @@ mod tests {
 
     #[test]
     fn claude_keeps_the_historical_db_name() {
-        assert_eq!(Harness::Claude.db_file_name(), "agentlens.db");
-        assert_eq!(Harness::Opencode.db_file_name(), "agentlens-opencode.db");
-        assert_eq!(Harness::Kilocode.db_file_name(), "agentlens-kilocode.db");
+        assert_eq!(Harness::Claude.db_file_name(), "saniwalens.db");
+        assert_eq!(Harness::Opencode.db_file_name(), "saniwalens-opencode.db");
+        assert_eq!(Harness::Kilocode.db_file_name(), "saniwalens-kilocode.db");
     }
 
     #[test]

@@ -9,7 +9,7 @@ implementation and stay in sync via `.claude/rules/spec-sync.md`.
 ## `analyze` — populate the store
 
 ```
-agentlens analyze [--projects <dir>] [--config <dir>] [--db <path>]
+saniwalens analyze [--projects <dir>] [--config <dir>] [--db <path>]
 ```
 
 Reads both Claude Code inputs — session transcripts (default
@@ -17,7 +17,7 @@ Reads both Claude Code inputs — session transcripts (default
 project `.claude/`) — and writes the SQLite store (`storage.md`). That
 `~/.claude` root is `$CLAUDE_CONFIG_DIR` whenever that variable names a
 non-empty path — an empty value carries no location and is treated as unset —
-so agentlens follows a config tree the user has relocated instead of reporting on
+so saniwalens follows a config tree the user has relocated instead of reporting on
 an empty default. Incremental and idempotent: unchanged transcripts are skipped,
 changed ones replaced, the surface catalog rebuilt from current config
 (`storage.md`). The verb is `analyze`, not `build` — it analyzes raw input into
@@ -31,9 +31,9 @@ the store beyond the derived facts (`.claude/rules/session-data-privacy.md`).
 Shared by every command. The input is not scoped to the current directory —
 `analyze` walks *every* project's transcripts under `~/.claude/projects` — so a
 cwd-relative default would contradict the data it holds: it would build a
-separate copy of the same cross-project store per directory agentlens is invoked
+separate copy of the same cross-project store per directory saniwalens is invoked
 from, and leave a database file inside unrelated Git working trees. The default
-is therefore user-level, `${XDG_STATE_HOME:-~/.local/state}/agentlens/agentlens.db`
+is therefore user-level, `${XDG_STATE_HOME:-~/.local/state}/saniwalens/saniwalens.db`
 (`store_path` in `cli.rs`), with the directory created on demand by
 `Store::open` — owner-only, like the store itself (`storage.md`). A non-absolute
 `XDG_STATE_HOME` is invalid per the XDG spec and ignored — honoring one would
@@ -47,12 +47,12 @@ surviving record of those sessions — nothing on disk can rebuild them
 without asking, which is the one thing this file cannot survive; that the store
 migrates in place rather than being discarded on a schema change is the same
 premise applied to upgrades. A project-local store stays available by asking for
-it — `--db ./agentlens.db`.
+it — `--db ./saniwalens.db`.
 
 ## Views — read the store
 
 ```
-agentlens <view> [--scope global|project[:<slug>]] [--by <bucket>] [--frozen]
+saniwalens <view> [--scope global|project[:<slug>]] [--by <bucket>] [--frozen]
               [--format table|markdown|json] [--db <path>]
 ```
 
@@ -97,7 +97,7 @@ ranking.
 
 | View | Answers |
 | --- | --- |
-| `doctor` | The entry point: a one-screen health check **written for someone who has never seen agentlens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units, naming the agent types behind the subagent figure — and, when the named rows cover only part of that figure, saying so first; see *Reporting honesty*), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
+| `doctor` | The entry point: a one-screen health check **written for someone who has never seen saniwalens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units, naming the agent types behind the subagent figure — and, when the named rows cover only part of that figure, saying so first; see *Reporting honesty*), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
 | `inventory` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): startup cost, static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
 | `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table, then splits the subagent half **per agent type** (runs and output tokens, costliest first) — the aggregate is usually the larger number and the split is the part that can be acted on. JSON carries the split's coverage as `agent_split` in every state. In text, a partial split prints its covered and uncovered figures between the total and the table, an unavailable split (no rows at all) is warned on stderr, and rows that cover the total need no note (see *Reporting honesty*). A section with no rows is omitted rather than rendered as bare headers. |
 | `waste` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
@@ -126,7 +126,7 @@ Every command has both a human form and a machine form, strictly separated:
   (`Store::query_json`), `doctor` emits the routed findings structure
   (`core::optimize::Findings`, `projects` filtered by `--scope`), and each view
   emits its rows as named objects. All freshness/refresh chatter goes to
-  **stderr** (see above), so `agentlens <cmd> --format json | jq` needs no
+  **stderr** (see above), so `saniwalens <cmd> --format json | jq` needs no
   filtering. Human-only footnotes (row counts, heuristic caveats) are either
   folded into the JSON (`total`, …) or dropped, never mixed into it.
 
@@ -203,7 +203,7 @@ spike a reader over-trusts; one combined flag says "read this number loosely".
 ## `sql` — query the store directly
 
 ```
-agentlens sql [<query>] [--format table|markdown|json] [--db <path>]
+saniwalens sql [<query>] [--format table|markdown|json] [--db <path>]
 ```
 
 `sql` is the one read that never auto-refreshes — it opens the store strictly
@@ -213,7 +213,7 @@ is at least visible.
 
 The store's own query surface: run an arbitrary read query and print the result.
 The query is the argument, or — when omitted — read from **stdin**, so both
-`agentlens sql "SELECT …"` and `echo "SELECT …" | agentlens sql` work (stdin
+`saniwalens sql "SELECT …"` and `echo "SELECT …" | saniwalens sql` work (stdin
 sidesteps shell quoting for complex queries). This exists because the tool is a
 *session-analysis* tool: anyone wanting a slice the fixed views do not cover —
 notably the `optimize` session chasing a root cause — should query the analyzed
@@ -232,7 +232,7 @@ lists the full schema.
 ## `optimize` — act on the findings with an advisor session
 
 ```
-agentlens optimize [--projects <dir>] [--db <path>] [--scope global|project[:<slug>]]
+saniwalens optimize [--projects <dir>] [--db <path>] [--scope global|project[:<slug>]]
                 [--frozen] [--print] [--verbose]
 ```
 
@@ -273,8 +273,8 @@ locate the failures. The tool split also separates true file friction from a
 browser-automation miss that merely reads as "not found". The briefing is the
 *headline*; for any deeper slice (the full failing-path list, a worktree split,
 arbitrary groupings) the prompt directs the session to **query the store with
-`agentlens sql`** rather than re-parse the raw transcripts in Python — the
-store is exactly the analysis surface agentlens exists to provide. It still
+`saniwalens sql`** rather than re-parse the raw transcripts in Python — the
+store is exactly the analysis surface saniwalens exists to provide. It still
 spends its effort on the evidence the store cannot hold (the real CLAUDE.md,
 rules, hooks). Embedding the headline plus pointing at the queryable store is
 what stops the seeded session from re-deriving what `analyze` already computed.

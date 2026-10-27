@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn read_global_surfaces_walks_the_kilo_layout() {
-        let config_dir = unique_dir("agentlens-test-kilo-config");
+        let config_dir = unique_dir("saniwalens-test-kilo-config");
         std::fs::remove_dir_all(&config_dir).ok();
         std::fs::create_dir_all(config_dir.join("command")).unwrap();
         std::fs::write(
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn read_project_surfaces_walks_the_kilo_layout() {
-        let root = unique_dir("agentlens-test-kilo-project");
+        let root = unique_dir("saniwalens-test-kilo-project");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join(".kilo/command")).unwrap();
         std::fs::write(

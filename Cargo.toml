@@ -1,5 +1,5 @@
 [package]
-name = "agentlens"
+name = "saniwalens"
 # Placeholder. The release workflow rewrites this from the tag of the published
 # GitHub Release before it runs `cargo publish`, so the committed value is never
 # what ships. It stays at 0.0.0 rather than a plausible number precisely so
@@ -7,7 +7,7 @@ name = "agentlens"
 version = "0.0.0"
 edition = "2024"
 description = "A lens onto your coding-agent usage: where time, tokens, and effort go, and which config to fix"
-repository = "https://github.com/armaniacs/agentlens"
+repository = "https://github.com/armaniacs/saniwalens"
 license = "MIT"
 readme = "README.md"
 keywords = ["agent", "claude", "usage", "analytics", "cli"]

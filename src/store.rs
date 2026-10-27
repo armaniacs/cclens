@@ -259,7 +259,7 @@ fn create_private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
 /// inherit the mode for the rollback journal it writes beside the database.
 ///
 /// An existing store is narrowed rather than left alone: a store an older
-/// agentlens created under the umask is the realistic case, and nobody
+/// saniwalens created under the umask is the realistic case, and nobody
 /// deliberately shares this store. Only a regular file is touched, so pointing
 /// `--db` at a directory fails at SQLite instead of silently re-moding it, and
 /// a store owned by someone else is left as it is — re-moding it is not this
@@ -1150,12 +1150,12 @@ impl Store {
 fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
-        // Reconciliation only ever adds; it cannot undo a newer agentlens's
+        // Reconciliation only ever adds; it cannot undo a newer saniwalens's
         // changes, and writing this build's shape over them would corrupt a
         // store that binary still reads correctly.
         anyhow::bail!(
-            "the store was written by a newer agentlens (schema v{version}; this build knows \
-             v{SCHEMA_VERSION}) — upgrade agentlens to read it"
+            "the store was written by a newer saniwalens (schema v{version}; this build knows \
+             v{SCHEMA_VERSION}) — upgrade saniwalens to read it"
         );
     }
 
@@ -1360,8 +1360,8 @@ mod tests {
     /// and the store must come out owner-only.
     #[test]
     fn open_creates_a_missing_directory_and_keeps_both_owner_only() {
-        let dir = std::env::temp_dir().join(format!("agentlens-open-test-{}", std::process::id()));
-        let path = dir.join("agentlens").join("agentlens.db");
+        let dir = std::env::temp_dir().join(format!("saniwalens-open-test-{}", std::process::id()));
+        let path = dir.join("saniwalens").join("saniwalens.db");
         let _ = std::fs::remove_dir_all(&dir);
 
         drop(Store::open(&path).unwrap());
@@ -1378,7 +1378,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The store an older agentlens left under the umask is the case that actually
+    /// The store an older saniwalens left under the umask is the case that actually
     /// exists in the wild, so opening it has to narrow it — otherwise the
     /// protection never reaches anyone who already ran the tool.
     #[cfg(unix)]
@@ -1386,8 +1386,8 @@ mod tests {
     fn open_narrows_a_store_an_earlier_run_left_readable() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("agentlens-mode-test-{}", std::process::id()));
-        let path = dir.join("agentlens.db");
+        let dir = std::env::temp_dir().join(format!("saniwalens-mode-test-{}", std::process::id()));
+        let path = dir.join("saniwalens.db");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         drop(Store::open(&path).unwrap());
@@ -1760,7 +1760,7 @@ mod tests {
         );
     }
 
-    /// A store as an older agentlens left it: `sessions` without the columns later
+    /// A store as an older saniwalens left it: `sessions` without the columns later
     /// releases added, and `surfaces` still keyed without `project`.
     fn legacy_store() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1877,9 +1877,9 @@ mod tests {
     }
 
     #[test]
-    fn a_store_written_by_a_newer_agentlens_is_refused_without_advising_deletion() {
+    fn a_store_written_by_a_newer_saniwalens_is_refused_without_advising_deletion() {
         // Writing to it with this binary's schema would corrupt history the
-        // newer agentlens can still read; deleting it would throw that history away.
+        // newer saniwalens can still read; deleting it would throw that history away.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
             .unwrap();

@@ -1,7 +1,7 @@
 # Multi-harness exploration (opencode / kilocode / DSH)
 
 - Branch: `feature-otherharness` (this file records the exploration work).
-- Goal: reshape agentlens from Claude Code-only into something usable with
+- Goal: reshape saniwalens from Claude Code-only into something usable with
   opencode, kilocode, and DSH.
 - Method (per AGENTS.md): spec-first, TDD, strict privacy — no real data is
   pasted here. Everything below summarizes shapes read read-only from local
@@ -77,9 +77,9 @@
 
 Decisions (2026-10-25):
 1. **opencode is the first target** — SQLite source of record plus real tokens gets value out earliest
-2. **No shared store across harnesses** — with upstream merge in mind, Claude's default behavior and default DB (`agentlens.db`) stay untouched. Each harness gets its own DB file (`--db` defaults switch per harness, e.g. `agentlens-opencode.db` under the same state dir; exact names settled when the spec is drafted). `meta` stays per-DB. No cross-harness aggregation in v1
+2. **No shared store across harnesses** — with upstream merge in mind, Claude's default behavior and default DB (`saniwalens.db`) stay untouched. Each harness gets its own DB file (`--db` defaults switch per harness, e.g. `saniwalens-opencode.db` under the same state dir; exact names settled when the spec is drafted). `meta` stays per-DB. No cross-harness aggregation in v1
 3. **kilocode got its follow-up survey** — reflected in §2.2. The token source of record (`api_req_started`) is confirmed, so the NULL-operation plan is withdrawn in favor of a time-ordered join producing per-request rows
-4. **kilocode v1 wiring landed (2026-10-25)** — one task dir = one agentlens session (`kilocode:<task-uuid>` ingest keys, mtime = the later of the two files', size = their sum), its own version key `meta.kilocode_analyzer_version` (apart from the shared `ANALYZER_VERSION`), the project root from the `estimate_root` heuristic, `agentlens-kilocode.db` under the same state dir, and `inventory` reading as "not implemented yet" instead of "run analyze first". The `optimize` launch stays deferred until the `kilo` prompt surface is measured; the config catalog is a separate spec and change
+4. **kilocode v1 wiring landed (2026-10-25)** — one task dir = one saniwalens session (`kilocode:<task-uuid>` ingest keys, mtime = the later of the two files', size = their sum), its own version key `meta.kilocode_analyzer_version` (apart from the shared `ANALYZER_VERSION`), the project root from the `estimate_root` heuristic, `saniwalens-kilocode.db` under the same state dir, and `inventory` reading as "not implemented yet" instead of "run analyze first". The `optimize` launch stays deferred until the `kilo` prompt surface is measured; the config catalog is a separate spec and change
 
 - Adapter split: `adapter::{claude,opencode,kilocode,dsh}` with the shared domain model (`Record`, `Surface`, `SubagentRun`) unchanged. The existing `adapter::{config,transcript}` bodies move to `adapter::claude::{config,transcript}` with re-exports left on the old paths (prevents boundary bugs). DB separation makes a `sessions.harness` column **unnecessary** — each DB holds a single harness
 - CLI: `--harness claude|opencode|kilocode|dsh` on `analyze`/`doctor`/views/`optimize` (default `claude` = current behavior, unchanged. No `auto` — avoids inventing ambiguous detection order). Per-harness default tables for `--projects`/`--config`/`--db` (opencode DB path, kilocode tasks dir, `~/.dsh/sessions`, plus per-harness DB names). Record `harness` in `meta` and warn when a DB is read under the wrong harness
@@ -107,7 +107,7 @@ editing), then interactively (`kilo --prompt <prompt>`, the article's
 experience — the user approves the briefing read and steers). The v1 launch is
 the interactive one.
 
-The headless run also found three real defects in agentlens itself, all landed:
+The headless run also found three real defects in saniwalens itself, all landed:
 
 - Tool-failure excerpts stored the JSON envelope whole (the measured
   `tool_result` carries an envelope text block plus an `environment_details`
