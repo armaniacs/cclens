@@ -211,7 +211,13 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         // The reader refuses the file's encoding, not its existence — checked
         // before the path patterns for the same reason.
         ErrorCategory::BinaryFile
-    } else if has("no such tool available") || has("not found. available skills") {
+    } else if has("no such tool available")
+        || has("not found. available skills")
+        // kilocode answers a wrong tool name with "Unknown tool "edit". This
+        // tool does not exist." — the tool name is the missing thing, not a
+        // file, so this is checked before the path vocabulary below.
+        || has("unknown tool")
+    {
         ErrorCategory::ToolNotAvailable
     } else if has("inputvalidationerror")
         || has("input validation error")
@@ -245,6 +251,20 @@ pub fn classify_error(text: &str) -> ErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_tool_name_is_not_a_missing_path() {
+        // kilocode answers a wrong tool name with "Unknown tool "edit". This
+        // tool does not exist." — the "does not exist" in that message matched
+        // the path vocabulary and mis-classified the failure; the tool name is
+        // the missing thing, not a file.
+        assert_eq!(
+            classify_error(
+                "Unknown tool \"edit\". This tool does not exist. Please use one of the available tools: execute_command, read_file, write_to_file"
+            ),
+            ErrorCategory::ToolNotAvailable
+        );
+    }
 
     #[test]
     fn binary_file_reads_are_their_own_category() {

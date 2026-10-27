@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub enum Harness {
     Claude,
     Opencode,
+    Kilocode,
 }
 
 impl Harness {
@@ -19,6 +20,7 @@ impl Harness {
         match value {
             "claude" => Some(Harness::Claude),
             "opencode" => Some(Harness::Opencode),
+            "kilocode" => Some(Harness::Kilocode),
             _ => None,
         }
     }
@@ -28,6 +30,7 @@ impl Harness {
         match self {
             Harness::Claude => "claude",
             Harness::Opencode => "opencode",
+            Harness::Kilocode => "kilocode",
         }
     }
 
@@ -37,6 +40,7 @@ impl Harness {
         match self {
             Harness::Claude => "Claude Code",
             Harness::Opencode => "opencode",
+            Harness::Kilocode => "kilocode",
         }
     }
 
@@ -46,23 +50,28 @@ impl Harness {
         match self {
             Harness::Claude => "a",
             Harness::Opencode => "an",
+            Harness::Kilocode => "a",
         }
     }
 
     /// The instruction file reports point at: the file a file-map or rule
-    /// fix lands in.
+    /// fix lands in. kilocode reads the shared `AGENTS.md` convention.
     pub fn instruction_file(&self) -> &'static str {
         match self {
             Harness::Claude => "CLAUDE.md",
             Harness::Opencode => "AGENTS.md",
+            Harness::Kilocode => "AGENTS.md",
         }
     }
 
-    /// How reports name the project config layer that owns a fix.
+    /// How reports name the project config layer that owns a fix. kilocode's
+    /// project-level conventions (`.kilocode/rules` and the like) are not
+    /// observed, so the copy names the one instruction file that exists.
     pub fn project_config_ref(&self) -> &'static str {
         match self {
             Harness::Claude => ".claude / CLAUDE.md",
             Harness::Opencode => ".opencode / AGENTS.md",
+            Harness::Kilocode => "AGENTS.md",
         }
     }
 
@@ -71,6 +80,7 @@ impl Harness {
         match self {
             Harness::Claude => "~/.claude",
             Harness::Opencode => "~/.config/opencode",
+            Harness::Kilocode => "~/.config/kilo",
         }
     }
 
@@ -80,6 +90,7 @@ impl Harness {
         match self {
             Harness::Claude => "session transcripts",
             Harness::Opencode => "sessions",
+            Harness::Kilocode => "sessions",
         }
     }
 
@@ -89,6 +100,7 @@ impl Harness {
         match self {
             Harness::Claude => "~/.claude/projects transcripts",
             Harness::Opencode => "opencode database",
+            Harness::Kilocode => "kilocode task files",
         }
     }
 
@@ -97,6 +109,7 @@ impl Harness {
         match self {
             Harness::Claude => "CLAUDE.md, rules, hooks, skills, and settings",
             Harness::Opencode => "AGENTS.md, commands, agents, and opencode.json",
+            Harness::Kilocode => "AGENTS.md, commands, skills, and kilo.json",
         }
     }
 
@@ -105,6 +118,7 @@ impl Harness {
         match self {
             Harness::Claude => "CLAUDE.md, always-on rules, skill/agent descriptions",
             Harness::Opencode => "AGENTS.md, commands, agent descriptions",
+            Harness::Kilocode => "AGENTS.md, command and skill descriptions",
         }
     }
 
@@ -113,6 +127,7 @@ impl Harness {
         match self {
             Harness::Claude => "transcript(s)",
             Harness::Opencode => "session(s)",
+            Harness::Kilocode => "session(s)",
         }
     }
 
@@ -136,6 +151,12 @@ impl Harness {
              UNUSED marks delete candidates; commands and AGENTS.md are catalog-only because\n\
              using them leaves no trace in sessions."
             }
+            Harness::Kilocode => {
+                "Everything installed in your config — AGENTS.md, .kilorules, commands,\n\
+             agents, skills — is listed with where it is installed (scope) and whether it\n\
+             was ever used. UNUSED marks delete candidates; commands are catalog-only\n\
+             because using them leaves no trace in sessions."
+            }
         }
     }
 
@@ -146,7 +167,36 @@ impl Harness {
         match self {
             Harness::Claude => "cclens.db",
             Harness::Opencode => "cclens-opencode.db",
+            Harness::Kilocode => "cclens-kilocode.db",
         }
+    }
+
+    /// The editor globalStorage task directories kilocode writes, in the
+    /// order the default resolution probes them. The path varies with the
+    /// editor install (Code / Cursor / VSCodium) and the platform, so the
+    /// list — not one hardcoded path — is the contract; `--projects` always
+    /// wins over it.
+    pub fn kilocode_tasks_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+        let Some(home) = home.filter(|dir| dir.is_absolute()) else {
+            return Vec::new();
+        };
+        let editors: [&str; 3] = if cfg!(target_os = "macos") {
+            [
+                "Library/Application Support/Code/User/globalStorage",
+                "Library/Application Support/Cursor/User/globalStorage",
+                "Library/Application Support/VSCodium/User/globalStorage",
+            ]
+        } else {
+            [
+                ".config/Code/User/globalStorage",
+                ".config/Cursor/User/globalStorage",
+                ".config/VSCodium/User/globalStorage",
+            ]
+        };
+        editors
+            .iter()
+            .map(|editor| home.join(editor).join("kilocode.kilo-code").join("tasks"))
+            .collect()
     }
 
     /// The opencode database: `$XDG_DATA_HOME/opencode/opencode.db`, else
@@ -177,6 +227,20 @@ impl Harness {
                 .join("opencode"),
         )
     }
+
+    /// The global kilo config root: `$XDG_CONFIG_HOME/kilo` when that variable
+    /// names an absolute path, else `~/.config/kilo` — the XDG rule, mirroring
+    /// how the store resolution treats `XDG_STATE_HOME`.
+    pub fn kilocode_config_dir(config_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+        if let Some(dir) = config_home.filter(|dir| dir.is_absolute()) {
+            return Some(dir.join("kilo"));
+        }
+        Some(
+            home.filter(|dir| dir.is_absolute())?
+                .join(".config")
+                .join("kilo"),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -184,16 +248,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_both_harnesses_and_rejects_the_rest() {
+    fn parses_all_three_harnesses_and_rejects_the_rest() {
         assert_eq!(Harness::parse("claude"), Some(Harness::Claude));
         assert_eq!(Harness::parse("opencode"), Some(Harness::Opencode));
+        assert_eq!(Harness::parse("kilocode"), Some(Harness::Kilocode));
         assert_eq!(Harness::parse("auto"), None);
         assert_eq!(Harness::parse(""), None);
     }
 
     #[test]
     fn labels_round_trip_through_parse() {
-        for harness in [Harness::Claude, Harness::Opencode] {
+        for harness in [Harness::Claude, Harness::Opencode, Harness::Kilocode] {
             assert_eq!(Harness::parse(harness.label()), Some(harness));
         }
     }
@@ -202,8 +267,10 @@ mod tests {
     fn display_names_name_the_harness() {
         assert_eq!(Harness::Claude.display_name(), "Claude Code");
         assert_eq!(Harness::Opencode.display_name(), "opencode");
+        assert_eq!(Harness::Kilocode.display_name(), "kilocode");
         assert_eq!(Harness::Claude.article(), "a");
         assert_eq!(Harness::Opencode.article(), "an");
+        assert_eq!(Harness::Kilocode.article(), "a");
     }
 
     #[test]
@@ -234,6 +301,30 @@ mod tests {
     fn claude_keeps_the_historical_db_name() {
         assert_eq!(Harness::Claude.db_file_name(), "cclens.db");
         assert_eq!(Harness::Opencode.db_file_name(), "cclens-opencode.db");
+        assert_eq!(Harness::Kilocode.db_file_name(), "cclens-kilocode.db");
+    }
+
+    #[test]
+    fn kilocode_tasks_candidates_cover_the_known_editors() {
+        // The tasks dir varies with the editor install (Code / Cursor /
+        // VSCodium) and the platform, so the list is what the shell probes —
+        // in a fixed order, `--projects` always winning over it.
+        let candidates = Harness::kilocode_tasks_candidates(Some(Path::new("/tmp/example/home")));
+        assert_eq!(candidates.len(), 3);
+        for candidate in &candidates {
+            assert!(
+                candidate
+                    .to_string_lossy()
+                    .ends_with("kilocode.kilo-code/tasks")
+            );
+            assert!(candidate.starts_with("/tmp/example/home"));
+        }
+    }
+
+    #[test]
+    fn kilocode_tasks_candidates_without_a_home_are_empty() {
+        assert!(Harness::kilocode_tasks_candidates(None).is_empty());
+        assert!(Harness::kilocode_tasks_candidates(Some(Path::new("relative/home"))).is_empty());
     }
 
     #[test]

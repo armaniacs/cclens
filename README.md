@@ -117,6 +117,22 @@ Pass `--db ./cclens.db` if you deliberately want a project-local one (and
 on stderr; pass `--frozen` to read the store exactly as it is. Running
 `cclens analyze` yourself is only needed to refresh without reading.
 
+## Other agent harnesses
+
+The same lens works on opencode and Kilo Code transcripts via `--harness`:
+
+```sh
+cclens analyze --harness kilocode      # reads the editor's globalStorage task files
+cclens doctor --harness kilocode
+cclens optimize --harness kilocode     # opens an interactive `kilo --prompt` session
+```
+
+Each harness keeps its own store (`cclens-opencode.db`, `cclens-kilocode.db`)
+and reads its own config — `~/.config/opencode/`, `~/.config/kilo/` plus each
+analyzed project's own files — so findings stay per harness, never mixed. The
+flag is explicit and the default stays `claude`; [`docs/specs/harness.md`](docs/specs/harness.md)
+holds the per-harness contract.
+
 ## Commands
 
 ### Pipeline
@@ -204,8 +220,10 @@ derived store.
   `${XDG_STATE_HOME:-~/.local/state}/cclens/` rather than a cache directory a
   cleaner may empty. Upgrading cclens across a schema change migrates the file
   in place; you never need to delete it.
-- `optimize` launches `claude` (Claude Code) seeded with the findings; the
-  briefing is written to a private temp file, never passed on the command line.
+- `optimize` launches the harness's own interactive session (`claude` by
+  default, `kilo --prompt` under `--harness kilocode`) seeded with the
+  findings; the briefing is written to a private temp file, never passed on
+  the command line.
 - Not yet implemented (see [`docs/specs/`](docs/specs/)): meta-skill (`loop`)
   nesting — a pending design decision on detecting parent/child from the
   transcript.

@@ -5,5 +5,6 @@
 
 pub mod config;
 pub mod harness;
+pub mod kilocode;
 pub mod opencode;
 pub mod transcript;

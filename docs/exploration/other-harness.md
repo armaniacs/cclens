@@ -49,12 +49,13 @@
   - `ui_messages.json` — `{ts, type:say/ask, say:text/...}` display log. Usable for human-turn delimiters (span end conditions). **The token source of record is here**: `say=api_req_started` rows carry JSON text `{apiProtocol, tokensIn, tokensOut, cacheWrites, cacheReads, cost, usageMissing, inferenceProvider}` (49 of 50 sampled rows have `usageMissing=false` with cost). They sort just before their `assistant` replies in `ts` order, so a time-ordered join yields per-request rows. No model name is carried (`inferenceProvider` only), so the representative model stays NULL
   - `task_metadata.json` — measured keys are `files_in_context[]` only (read/edited traces). Future material for never-fires-rule
   - Task⇔session mapping: `sessions/<id>/session.json` holds `taskSessionMap` (taskId → sessionId)
-  - Project root: no `cwd`-style key in messages. `ask=tool` text JSON carries `{tool, path, content: <absolute path>, isOutsideWorkspace}`, so the common prefix of leading absolute paths is the root-estimation candidate (stated as a heuristic)
+  - Project root (corrected by the full 92-task survey): `execute_command` inputs carry `cwd` (640 of 754 rows, absolute 558, exactly one distinct value per task) — the first absolute cwd is the root, the same confidence as Claude Code's first-`cwd`. Tool paths are overwhelmingly relative (945 rel vs 38 abs) and the `ask=tool` payloads' `path` is relative too, so the common-prefix-of-leading-absolute-paths rule is only the fallback (rare). The real edit tools are `edit_file` (`file_path` key, 361) / `apply_diff` (`path`, 101) / `search_and_replace` (`path`, 93); mapping only `apply_diff`/`write_to_file` under-counted `file_edit` events by four to one
   - Approval signal: `ask=tool` is the tool-execution approval point (permission equivalent). Failure-signal candidates: `say=command_output` (carries exit codes) and `api_req_retry_delayed`
 - Config side (measured):
   - Global: `~/.config/kilo/` — `command/*.md` (`devloop.md`, `graphify.md`, `review-diff.md` = slash-command equivalents), `skills/*/` (skill directories), `kilo.json` (providers/models, per-agent prompts), `agent/` (empty in this environment). Plus `settings/mcp_settings.json` (`{mcpServers:{}}`) and `settings/custom_modes.yaml` (empty here)
   - Project-level conventions (`.kilocode/rules/` etc.) not observed in this environment. Needs follow-up survey
-- Paths are strongly environment-dependent (`~/Library/Application Support/Code/...` varies with the VSCode/Cursor installation), so the adapter wants a storage-root override (env var or `--projects`)
+- Paths are strongly environment-dependent (`~/Library/Application Support/Code/...` varies with the VSCode/Cursor installation), so the adapter wants a storage-root override (env var or `--projects`) — resolved in the v1 wiring as `Harness::kilocode_tasks_candidates` (Code → Cursor → VSCodium × platform dirs, first existing wins), with `--projects` overriding
+- `kilo` CLI (measured, for the `optimize` launch question): `/opt/homebrew/bin/kilo` (Homebrew shim → `Cellar/kilo/7.3.41/libexec/kilo`, Bun Mach-O binary), version 7.3.41. It validates its config on every start (`~/.config/kilo/kilo.json` — an unrecognized key fails the whole start), and keeps state under `~/.local/state/kilo` and `~/.local/share/kilo/state`. Its prompt-launch surface (measured from the docs): `kilo run [message..]` is the message surface, with `--format json` (raw JSON events) and `--title` — the same flags as `opencode run` (kilo is an OpenCode fork). A bare `kilo <text>` positional is treated as a file to open (Bun resolves it against the cwd, ENAMETOOLONG), not a prompt. The v1 `optimize` launch is therefore the interactive TUI: `kilo --prompt <prompt>` (the claude-launch experience — the user approves the briefing read and steers). A headless autonomous run would be `kilo run --format json --title ... --auto <prompt>` (measured working, but the advisor dies on its first read without `--auto`)
 
 ### 2.3 DSH (DeepSeek Harness) — home-grown event sourcing. zstd-compressed JSONL
 
@@ -78,6 +79,7 @@ Decisions (2026-10-25):
 1. **opencode is the first target** — SQLite source of record plus real tokens gets value out earliest
 2. **No shared store across harnesses** — with upstream merge in mind, Claude's default behavior and default DB (`cclens.db`) stay untouched. Each harness gets its own DB file (`--db` defaults switch per harness, e.g. `cclens-opencode.db` under the same state dir; exact names settled when the spec is drafted). `meta` stays per-DB. No cross-harness aggregation in v1
 3. **kilocode got its follow-up survey** — reflected in §2.2. The token source of record (`api_req_started`) is confirmed, so the NULL-operation plan is withdrawn in favor of a time-ordered join producing per-request rows
+4. **kilocode v1 wiring landed (2026-10-25)** — one task dir = one cclens session (`kilocode:<task-uuid>` ingest keys, mtime = the later of the two files', size = their sum), its own version key `meta.kilocode_analyzer_version` (apart from the shared `ANALYZER_VERSION`), the project root from the `estimate_root` heuristic, `cclens-kilocode.db` under the same state dir, and `inventory` reading as "not implemented yet" instead of "run analyze first". The `optimize` launch stays deferred until the `kilo` prompt surface is measured; the config catalog is a separate spec and change
 
 - Adapter split: `adapter::{claude,opencode,kilocode,dsh}` with the shared domain model (`Record`, `Surface`, `SubagentRun`) unchanged. The existing `adapter::{config,transcript}` bodies move to `adapter::claude::{config,transcript}` with re-exports left on the old paths (prevents boundary bugs). DB separation makes a `sessions.harness` column **unnecessary** — each DB holds a single harness
 - CLI: `--harness claude|opencode|kilocode|dsh` on `analyze`/`doctor`/views/`optimize` (default `claude` = current behavior, unchanged. No `auto` — avoids inventing ambiguous detection order). Per-harness default tables for `--projects`/`--config`/`--db` (opencode DB path, kilocode tasks dir, `~/.dsh/sessions`, plus per-harness DB names). Record `harness` in `meta` and warn when a DB is read under the wrong harness
@@ -86,7 +88,7 @@ Decisions (2026-10-25):
 
 ## 4. Difficulty order and TDD plan
 
-Status: opencode transcript mapping spec + pure adapter done (`session-format-opencode.md`, `adapter::opencode`, commit `422d4f2`). Remaining:
+Status: opencode is fully landed (mapping spec, pure adapter commit `422d4f2`, CLI wiring, config catalog, copy naming). kilocode transcript mapping spec + pure adapter done (`session-format-kilocode.md`, `adapter::kilocode`), and the kilocode CLI wiring is landed (item 4 + part of item 5). Remaining:
 
 1. opencode CLI wiring (`--harness opencode`, DB-reading shell, per-harness `--db` default, `meta.harness` guard) — first for user-visible value
 2. opencode config catalog (`config-format-opencode.md`, then catalog implementation) — completes `waste`/`inventory`
@@ -96,7 +98,35 @@ Status: opencode transcript mapping spec + pure adapter done (`session-format-op
 
 ## 5. Open survey items
 
+### 6. The headless walkthrough result (measured)
+
+The kilocode optimize launch was exercised end to end twice — first headless
+(`kilo run --format json --title ... --auto <prompt>`, ~7 min, 141 events, the
+advisor investigated autonomously and produced a prioritized plan without
+editing), then interactively (`kilo --prompt <prompt>`, the article's
+experience — the user approves the briefing read and steers). The v1 launch is
+the interactive one.
+
+The headless run also found three real defects in cclens itself, all landed:
+
+- Tool-failure excerpts stored the JSON envelope whole (the measured
+  `tool_result` carries an envelope text block plus an `environment_details`
+  decoration), which mis-classified failures twice — the envelope's "does not
+  exist" matched the path vocabulary and the decoration's file names matched
+  timeout. Each block now unwraps, the decoration drops, and the category
+  reads the message (`KILOCODE_ANALYZER_VERSION` 3).
+- A wrong tool name ("Unknown tool \"edit\"") mis-classified as path-not-found;
+  "unknown tool" joined the tool-not-available vocabulary (`ANALYZER_VERSION`
+  6, opencode 3).
+- Work events and tool errors left `started_at` empty while carrying the
+  epoch — a shared store defect, not kilocode-specific.
+
+Deferred: a mode-restriction category ("is not allowed in code mode" reads
+`Other` honestly today); kilocode token amounts (out_tokens stay zero, the
+floor only); the per-project config split the advisor's plan proposes for the
+target project.
+
 - [ ] opencode: runtime denial signal for `permission`, MCP definition site, `.opencode/command|agent` convention
-- [x] kilocode: token source of record → `ui_messages.json` `say=api_req_started` text JSON (`tokensIn/tokensOut/cacheWrites/cacheReads/cost/usageMissing`). Still open: project-side rules/modes locations, storage-root choice (Cursor side-by-side case)
+- [x] kilocode: token source of record → `ui_messages.json` `say=api_req_started` text JSON (`tokensIn/tokensOut/cacheWrites/cacheReads/cost/usageMissing`). Storage-root choice resolved in the v1 wiring (`kilocode_tasks_candidates`: Code → Cursor → VSCodium, first existing). Still open: project-side rules/modes locations
 - [ ] DSH: hosting event for `usage`, subagent-spawn markers, skill/agent/MCP definition sites
 - [ ] General: default per-harness DB file names (settled when the harness spec is drafted)
