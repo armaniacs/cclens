@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Workspace-local cargo home (sandbox workaround — never committed)
+/.cargo-home
+
 # Nix build symlink
 /result
 

@@ -12,6 +12,8 @@ use crate::adapter::config::{
     claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_mcp_server_surfaces,
     read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
+use crate::adapter::harness::Harness;
+use crate::adapter::opencode as opencode_mod;
 use crate::adapter::transcript::{
     count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
     parse_session, parse_subagent_sidecar, session_cwd, subagent_id_from_file_name,
@@ -42,6 +44,11 @@ use crate::store::{SessionMeta, Store};
              follow-up command."
 )]
 pub struct Cli {
+    /// Which agent harness to analyze. Global so every command resolves its
+    /// store and input roots through it; the default keeps every existing
+    /// invocation byte-identical in behavior. See `docs/specs/harness.md`.
+    #[arg(long, global = true)]
+    harness: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -115,7 +122,7 @@ enum Command {
         db: Option<PathBuf>,
     },
     /// What every session pays in context before any work starts, and how
-    /// much of that comes from your own config files vs Claude Code itself.
+    /// much of that comes from your own config files vs the harness itself.
     Overhead {
         /// Output format: table | markdown.
         #[arg(long)]
@@ -202,9 +209,10 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
-    /// Act on the findings: opens an interactive `claude` session pre-loaded
+    /// Act on the findings: opens an advisor session pre-loaded
     /// with the full analysis, which investigates each problem and proposes
-    /// concrete config edits for your approval.
+    /// concrete config fixes (interactively under Claude Code, headless
+    /// under opencode).
     Optimize {
         /// Transcript root (default: $CLAUDE_CONFIG_DIR/projects, or
         /// ~/.claude/projects).
@@ -221,29 +229,41 @@ enum Command {
         /// Use the existing store as-is; skip the analyze step.
         #[arg(long)]
         frozen: bool,
-        /// Print the composed prompt instead of launching `claude`.
+        /// Print the composed prompt instead of launching the advisor.
         #[arg(long)]
         print: bool,
+        /// Stream the advisor's raw output instead of the quiet render
+        /// (headless opencode runs log raw output to a file by default).
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
 pub fn run() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let harness = parse_harness(cli.harness.as_deref())?;
+    match cli.command {
         Command::Analyze {
             projects,
             format,
             db,
-        } => analyze(projects, parse_format(format.as_deref())?, &resolve_db(db)?),
+        } => analyze(
+            &harness,
+            projects,
+            parse_format(format.as_deref())?,
+            &resolve_db(db, &harness)?,
+        ),
         Command::Usage {
             by,
             format,
             frozen,
             db,
         } => usage(
+            &harness,
             by.as_deref(),
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Inventory {
             scope,
@@ -251,10 +271,11 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => inventory(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Waste {
             scope,
@@ -262,46 +283,59 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => waste(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
-        Command::Overhead { format, frozen, db } => {
-            overhead(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
-        }
-        Command::Prompts { format, frozen, db } => {
-            prompts(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
-        }
+        Command::Overhead { format, frozen, db } => overhead(
+            &harness,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db, &harness)?,
+        ),
+        Command::Prompts { format, frozen, db } => prompts(
+            &harness,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db, &harness)?,
+        ),
         Command::Failures {
             scope,
             format,
             frozen,
             db,
         } => failures(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
-        Command::Stuck { format, frozen, db } => {
-            stuck(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
-        }
+        Command::Stuck { format, frozen, db } => stuck(
+            &harness,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db, &harness)?,
+        ),
         Command::Doctor {
             scope,
             format,
             frozen,
             db,
         } => doctor(
+            &harness,
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Sql { query, format, db } => sql(
+            &harness,
             query.as_deref(),
             parse_format(format.as_deref())?,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
         ),
         Command::Optimize {
             projects,
@@ -309,13 +343,26 @@ pub fn run() -> Result<()> {
             scope,
             frozen,
             print,
+            verbose,
         } => optimize(
+            &harness,
             projects,
-            &resolve_db(db)?,
+            &resolve_db(db, &harness)?,
             &parse_scope(scope.as_deref())?,
             frozen,
             print,
+            verbose,
         ),
+    }
+}
+
+/// Parse `--harness`. Absent means Claude Code — every pre-flag invocation
+/// keeps its behavior, which is what makes the flag upstream-mergeable.
+fn parse_harness(value: Option<&str>) -> Result<Harness> {
+    match value {
+        None => Ok(Harness::Claude),
+        Some(v) => Harness::parse(v)
+            .with_context(|| format!("unknown --harness '{v}' (claude | opencode)")),
     }
 }
 
@@ -328,9 +375,24 @@ fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
 }
 
 /// Analyze, compose the advisor prompt from the findings, and hand it to an
-/// interactive `claude` session — the AI-proposal layer's entry point. The pure
+/// advisor session — the AI-proposal layer's entry point. The pure
 /// composition lives in `core::optimize`; this shell does the I/O: run the
-/// analysis, read the store into `Findings`, then launch `claude`.
+/// analysis, read the store into `Findings`, then launch the harness's agent.
+/// See `docs/specs/harness.md` for the per-harness launch shape.
+/// Launch the harness's advisor for an optimize session: the binary plus any
+/// leading argv. `claude` opens interactively on the prompt; `opencode run`
+/// investigates headlessly — JSON events (`--format json`) so the raw tool
+/// dumps can be logged while only the agent's text streams, and a title so
+/// the sessions it seeds are recognizable in the store it feeds.
+fn launch_command(harness: &Harness) -> (&'static str, &'static [&'static str]) {
+    match harness {
+        Harness::Claude => ("claude", &[]),
+        Harness::Opencode => (
+            "opencode",
+            &["run", "--format", "json", "--title", "cclens optimize"],
+        ),
+    }
+}
 ///
 /// The briefing carries concrete paths and error excerpts that may be sensitive,
 /// so it is written to a private (`0600`) temp file and only a pointer is passed
@@ -338,23 +400,29 @@ fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
 /// removed as soon as the session ends. `--print` instead writes the full prompt
 /// (briefing inline) to stdout for piping / inspection.
 fn optimize(
+    harness: &Harness,
     projects: Option<PathBuf>,
     db: &Path,
     filter: &ScopeFilter,
     frozen: bool,
     print: bool,
+    verbose: bool,
 ) -> Result<()> {
     if !frozen {
-        let stats = run_analyze(projects, db)?;
+        let stats = run_analyze(harness, projects, db)?;
         eprintln!(
             "{}",
             Style::stderr().dim(&format!(
-                "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
-                stats.sessions, stats.skipped
+                "store: refreshed just now ({} {} re-analyzed, {} unchanged)",
+                stats.sessions,
+                harness.input_unit(),
+                stats.skipped
             ))
         );
     }
     let store = Store::open(db).context("open store")?;
+    // `--frozen` skips the analyze that guards, so guard the launch path here.
+    guard_harness(&store, harness, db)?;
     let findings = collect_findings(&store)?;
 
     // The absolute store path so the session's `cclens sql --db …` hits the
@@ -363,46 +431,209 @@ fn optimize(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| db.to_string_lossy().into_owned());
 
+    // The harness copy for every prompt and briefing rendered here — plain
+    // data assembled from the harness, so the core stays harness-agnostic.
+    let copy = optimize_mod::HarnessCopy {
+        agent: harness.display_name(),
+        article: harness.article(),
+        source: harness.source_noun(),
+        raw_source: harness.raw_source(),
+        global_ref: harness.global_config_ref(),
+        project_ref: harness.project_config_ref(),
+        instruction_file: harness.instruction_file(),
+        config_inventory: harness.config_inventory(),
+    };
+
     if print {
         println!(
             "{}",
-            optimize_mod::compose_prompt(&findings, &db_display, filter)
+            optimize_mod::compose_prompt(&findings, &db_display, filter, &copy)
         );
         return Ok(());
     }
 
     // Sensitive briefing → private temp file; only a data-free pointer on argv.
-    let briefing = optimize_mod::render_briefing(&findings, filter);
+    let briefing = optimize_mod::render_briefing(&findings, filter, &copy);
     let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
-    let prompt = optimize_mod::launch_prompt(&briefing_path.to_string_lossy(), &db_display, filter);
+    let mode = match harness {
+        Harness::Claude => optimize_mod::RunMode::Interactive,
+        Harness::Opencode => optimize_mod::RunMode::Headless,
+    };
+    let prompt = optimize_mod::launch_prompt(
+        &briefing_path.to_string_lossy(),
+        &db_display,
+        filter,
+        &copy,
+        mode,
+    );
 
-    // Hand over the terminal: `claude <prompt>` starts an interactive session,
-    // inheriting our stdio so the user takes over. Clean up the briefing file
-    // the moment the session ends, whatever the outcome.
-    let result = std::process::Command::new("claude").arg(&prompt).status();
+    // Hand over the terminal. `claude` opens an interactive TUI on the pointer
+    // prompt (stdio inherited, the user takes over); opencode runs headless, so
+    // its raw stream is logged to a private file and only the agent's text
+    // (narration, then the final plan) streams on stdout — the tool dumps stay
+    // in the log, and `--verbose` keeps the old raw streaming. Clean up the
+    // briefing file the moment the run ends, whatever the outcome.
+    let (binary, leading) = launch_command(harness);
+    let launch_note = || {
+        format!(
+            "launch `{} {}` — is {} installed and on PATH?",
+            binary,
+            leading.join(" ").trim_end(),
+            harness.display_name()
+        )
+    };
+    let (result, run_log) = if *harness == Harness::Opencode && !verbose {
+        let (status, log) = run_headless(binary, leading, &prompt).with_context(launch_note)?;
+        (Ok(status), Some(log))
+    } else {
+        let status = std::process::Command::new(binary)
+            .args(leading)
+            .arg(&prompt)
+            .status();
+        (status, None)
+    };
     let _ = fs::remove_file(&briefing_path);
 
-    let status = result.context("launch `claude` — is Claude Code installed and on PATH?")?;
+    let status = result.with_context(launch_note)?;
     if !status.success() {
-        anyhow::bail!("claude exited with {status}");
+        match run_log {
+            Some(log) => anyhow::bail!(
+                "{binary} exited with {status} — raw output: {}",
+                log.display()
+            ),
+            None => anyhow::bail!("{binary} exited with {status}"),
+        }
     }
     Ok(())
+}
+
+/// Run the headless advisor with its raw output logged: spawn with stdout
+/// piped, write every raw line (and the child's stderr) to a private log, and
+/// surface only what the agent says — text parts on stdout (so a pipe like
+/// `| pbcopy` receives the narration and the plan), one-line progress markers
+/// on stderr. A heartbeat covers quiet stretches (a long tool call, model
+/// thinking) so the run never looks hung. Returns the log path so the caller
+/// can point at the full detail. The raw event shapes are unversioned
+/// upstream, so rendering is lenient: a line with no recognizable text stays
+/// in the log, and a run that renders nothing readable says so instead of
+/// leaving silence.
+fn run_headless(
+    binary: &str,
+    leading: &[&str],
+    prompt: &str,
+) -> Result<(std::process::ExitStatus, PathBuf)> {
+    use std::io::{BufRead, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let log_path = private_temp_path("cclens-run", "log");
+    write_private_file(&log_path, "").context("create run log")?;
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .context("open run log")?;
+    let child_err = fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .context("open run log for the advisor")?;
+
+    eprintln!(
+        "{}",
+        Style::stderr().dim(&format!(
+            "advisor running headlessly — raw progress: {}",
+            log_path.display()
+        ))
+    );
+
+    // A dim beat every 30s while the advisor works: elapsed seconds and how
+    // many events have streamed, so silence reads as waiting, not a hang.
+    let events = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let heartbeat = {
+        let events = Arc::clone(&events);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut next = 30u64;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let elapsed = start.elapsed().as_secs();
+                if elapsed >= next {
+                    next += 30;
+                    eprintln!(
+                        "{}",
+                        Style::stderr().dim(&format!(
+                            "  … advisor working ({}s, {} events)",
+                            elapsed,
+                            events.load(Ordering::Relaxed)
+                        ))
+                    );
+                }
+            }
+        })
+    };
+
+    let mut launch = std::process::Command::new(binary);
+    launch.args(leading).arg(prompt);
+    launch
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(child_err));
+    let mut child = launch.spawn()?;
+    let stdout = child.stdout.take().context("pipe the advisor's stdout")?;
+
+    let mut readable = false;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.context("read the advisor's output")?;
+        events.fetch_add(1, Ordering::Relaxed);
+        writeln!(log, "{line}").context("write the run log")?;
+        match opencode_mod::render_run_line(&line) {
+            opencode_mod::RunEvent::Text(text) => {
+                readable = true;
+                println!("{text}");
+            }
+            opencode_mod::RunEvent::Progress(tool) => {
+                eprintln!("{}", Style::stderr().dim(&format!("  → {tool}")));
+            }
+            opencode_mod::RunEvent::Silent => {}
+        }
+    }
+    let status = child.wait()?;
+    stop.store(true, Ordering::Relaxed);
+    heartbeat.join().ok();
+    if status.success() && !readable {
+        eprintln!(
+            "{}",
+            Style::stderr().dim(&format!(
+                "the advisor produced no readable text — full output: {}",
+                log_path.display()
+            ))
+        );
+    }
+    Ok((status, log_path))
+}
+
+/// A fresh private temp path for `prefix`, unique per process and call.
+fn private_temp_path(prefix: &str, ext: &str) -> PathBuf {
+    // The clock is here to avoid a collision with a leftover file, not to be
+    // unguessable — exclusive creation is what makes guessing the name useless.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos:x}.{ext}", std::process::id()))
 }
 
 /// Write `contents` to a fresh file in the temp dir. Used for the optimization
 /// briefing, which may hold sensitive paths/excerpts and must not sit on argv or
 /// be world-readable.
 fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
-    // The clock is here to avoid a collision with a leftover file, not to be
-    // unguessable — exclusive creation is what makes guessing the name useless.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "cclens-briefing-{}-{nanos:x}.md",
-        std::process::id()
-    ));
+    let path = private_temp_path("cclens-briefing", "md");
     write_private_file(&path, contents)?;
     Ok(path)
 }
@@ -709,7 +940,7 @@ fn config_wedges(store: &Store) -> Result<ScopedWedges> {
 /// comes from the argument or, when absent, from stdin — so both
 /// `cclens sql '…'` and `echo '…' | cclens sql` work. The store is
 /// opened read-only so an ad-hoc query can never mutate the derived data.
-fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
+fn sql(harness: &Harness, query: Option<&str>, format: Format, db: &Path) -> Result<()> {
     let query = match query {
         Some(q) => q.to_string(),
         None => {
@@ -728,6 +959,9 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
 
     let store = Store::open_readonly(db)
         .with_context(|| format!("open store {} (run `analyze` first?)", db.display()))?;
+    // A store built by another harness is a wrong-harness read even here —
+    // `sql` cannot migrate or refresh, but it can still refuse loudly.
+    guard_harness(&store, harness, db)?;
     // `sql` never mutates the store, so it cannot auto-refresh — surface the
     // store's age instead so a stale read is at least visible. An old db whose
     // schema predates `meta` just skips the header.
@@ -756,11 +990,17 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
 /// split by the config layer that owns each fix — the global picture first,
 /// then each project's own findings ("optimize my global setup" and "optimize
 /// this project" are different tasks). `--scope` narrows to one layer.
-fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn doctor(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
     if format == Format::Markdown {
         anyhow::bail!("summary has no markdown form — use the default text or --format json");
     }
-    let store = open_for_read(db, frozen)?;
+    let store = open_for_read(harness, db, frozen)?;
     let f = collect_findings(&store)?;
 
     if format == Format::Json {
@@ -794,8 +1034,9 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
     println!(
         "{}",
         style.heading(&format!(
-            "Claude Code usage health check — {session_count} sessions across \
-             {project_count} projects"
+            "{} usage health check — {session_count} sessions across \
+             {project_count} projects",
+            harness.display_name()
         ))
     );
 
@@ -834,20 +1075,21 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                 cat.label,
                 style.dim(&format!(
                     "— {}",
-                    ErrorCategory::from_label(&cat.label).suggestion()
+                    ErrorCategory::from_label(&cat.label).suggestion(harness.instruction_file())
                 ))
             ));
         }
         if let Some(worst) = p.thrash.first() {
             lines.push(format!(
-                "  …and Claude got stuck re-editing {} ({} edits in {}m).",
+                "  …and the agent got stuck re-editing {} ({} edits in {}m).",
                 worst.file,
                 worst.edits,
                 worst.span_secs.div_euclid(60).max(1)
             ));
         }
         lines.push(format!(
-            "  Fix in this project's own CLAUDE.md / .claude — details: {}",
+            "  Fix in this project's own {} — details: {}",
+            harness.project_config_ref(),
             style.command(&format!("cclens failures --scope project:{}", p.project))
         ));
         items.push(Item {
@@ -867,12 +1109,14 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                         style.bold(&cat.label),
                         style.dim(&format!(
                             "— {}",
-                            ErrorCategory::from_label(&cat.label).suggestion()
+                            ErrorCategory::from_label(&cat.label)
+                                .suggestion(harness.instruction_file())
                         ))
                     ),
                     format!(
-                        "  No single project owns it, so the fix belongs in ~/.claude — \
+                        "  No single project owns it, so the fix belongs in {} — \
                          details: {}",
+                        harness.global_config_ref(),
                         style.command("cclens failures --scope global")
                     ),
                 ],
@@ -888,8 +1132,9 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                 weight: 0,
                 lines: vec![format!(
                     "{} of all Bash commands are just `cd` — a working-directory \
-                     convention in your global CLAUDE.md would cut the churn.",
-                    style.warn(&format!("{cd_pct}%"))
+                     convention in your global {} would cut the churn.",
+                    style.warn(&format!("{cd_pct}%")),
+                    harness.instruction_file()
                 )],
             });
         }
@@ -937,15 +1182,30 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                 "  Every session starts with ~{} tokens of context before any work:",
                 style.bold(&fmt_tokens(f.floor))
             );
-            println!(
-                "  {} comes from your own global config files; the other {} is Claude Code",
-                fmt_tokens(f.config_tokens),
-                fmt_tokens(residual)
-            );
-            println!(
-                "  {}",
-                style.dim("itself (system prompt, built-in tools, MCP schemas) — not trimmable from files.")
-            );
+            if residual > 0 {
+                println!(
+                    "  {} comes from your own global config files; the other {} is {}",
+                    fmt_tokens(f.config_tokens),
+                    fmt_tokens(residual),
+                    harness.display_name()
+                );
+                println!(
+                    "  {}",
+                    style.dim(
+                        "itself (system prompt, built-in tools, MCP schemas) plus each \
+                         project's own config (AGENTS.md, skill descriptions) — `cclens \
+                         overhead` splits it per project."
+                    )
+                );
+            } else {
+                // The global config estimate already covers the observed floor —
+                // attributing a "0" to the harness would read as a claim.
+                println!(
+                    "  ~all of it is accounted for by your own config files (skill \
+                     descriptions, AGENTS.md) — nothing is left over to attribute; \
+                     `cclens overhead` splits it per project."
+                );
+            }
         }
         println!(
             "  Output written so far: {} tokens by skills on the main thread, {} by {} subagent runs.",
@@ -967,7 +1227,8 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
     let mut pruning: Vec<String> = Vec::new();
     if filter.includes_global() && (!f.unused.is_empty() || !f.always_on_heavy.is_empty()) {
         pruning.push(format!(
-            "  ~/.claude: {} → {}",
+            "  {}: {} → {}",
+            harness.global_config_ref(),
             prune_phrase(&f.unused, &f.always_on_heavy),
             style.command("cclens waste --scope global")
         ));
@@ -1174,14 +1435,14 @@ fn shorten_to_tilde(path: &str, home: Option<&str>) -> String {
     }
 }
 
-/// Thrash bursts: a file edited many times in a short window — where Claude got
-/// stuck and kept retrying, as opposed to a hotspot's healthy spread-out edits.
-/// An episode is one session's edits to one path, so parallel work on a
-/// same-named file is never presented as one agent looping (`core::thrash`).
-fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
+/// Thrash bursts: a file edited many times in a short window — where the agent
+/// got stuck and kept retrying, as opposed to a hotspot's healthy spread-out
+/// edits. An episode is one session's edits to one path, so parallel work on
+/// a same-named file is never presented as one agent looping (`core::thrash`).
+fn stuck(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
-    let store = open_for_read(db, frozen)?;
+    let store = open_for_read(harness, db, frozen)?;
     let episodes = detect_thrash(&store.file_edits()?, GAP_SECS, MIN_EDITS);
     if format == Format::Json {
         let episodes: Vec<serde_json::Value> = episodes
@@ -1205,7 +1466,7 @@ fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
     }
     preamble(
         format,
-        "Files Claude kept re-editing in rapid bursts — the signature of getting stuck\n\
+        "Files the agent kept re-editing in rapid bursts — the signature of getting stuck\n\
          and retrying. Worth checking what blocked it there (a rule? missing context?).",
     );
     let rows: Vec<Vec<String>> = episodes
@@ -1229,7 +1490,7 @@ fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
     );
     note(&format!(
         "bursts of >= {MIN_EDITS} edits to one file within {}m by a single session —\n\
-         likely where Claude got stuck. `--format json` carries the session id and\n\
+         likely where the agent got stuck. `--format json` carries the session id and\n\
          full path to investigate with.",
         GAP_SECS / 60
     ));
@@ -1247,7 +1508,13 @@ fn note(text: &str) {
 /// `--scope` routes by ownership (`core::scope`): `global` shows the failures
 /// no project owns, `project` each project's majority-owned failures, and
 /// `project:<slug>` everything that happened in that one project.
-fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn failures(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
     struct FrictionRow {
         project: Option<String>,
         category: String,
@@ -1256,7 +1523,7 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
         spread: Option<usize>,
     }
 
-    let store = open_for_read(db, frozen)?;
+    let store = open_for_read(harness, db, frozen)?;
     let cells = store.error_counts_by_project()?;
 
     let counts: Vec<FrictionRow> = match filter {
@@ -1314,7 +1581,8 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
                     "category": row.category,
                     "count": row.count,
                     "spread_projects": row.spread,
-                    "suggestion": ErrorCategory::from_label(&row.category).suggestion(),
+                    "suggestion": ErrorCategory::from_label(&row.category)
+                        .suggestion(harness.instruction_file()),
                 })
             })
             .collect();
@@ -1327,22 +1595,32 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
 
     preamble(
         format,
-        match filter {
+        &match filter {
             ScopeFilter::All => {
                 "Tool calls that kept failing the same way, grouped by kind of failure.\n\
                  Every row wastes turns and tokens; the suggestion says what usually fixes it."
+                    .to_string()
             }
             ScopeFilter::Global => {
-                "Failures spread across several projects — no single project owns them, so\n\
-                 they read as habits or global-config problems. Fix these in ~/.claude."
+                format!(
+                    "Failures spread across several projects — no single project owns them, so\n\
+                     they read as habits or global-config problems. Fix these in {}.",
+                    harness.global_config_ref()
+                )
             }
             ScopeFilter::Project(None) => {
-                "Failures each project owns (it holds the majority of that kind). Fix each\n\
-                 in that project's own CLAUDE.md / .claude, not globally."
+                format!(
+                    "Failures each project owns (it holds the majority of that kind). Fix each\n\
+                     in that project's own {}, not globally.",
+                    harness.project_config_ref()
+                )
             }
             ScopeFilter::Project(Some(_)) => {
-                "Every recurring failure inside this one project, most frequent first.\n\
-                 Fix them in this project's own CLAUDE.md / .claude."
+                format!(
+                    "Every recurring failure inside this one project, most frequent first.\n\
+                     Fix them in this project's own {}.",
+                    harness.project_config_ref()
+                )
             }
         },
     );
@@ -1361,9 +1639,7 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
             cells.extend([
                 error,
                 row.count.to_string(),
-                ErrorCategory::from_label(&row.category)
-                    .suggestion()
-                    .to_string(),
+                ErrorCategory::from_label(&row.category).suggestion(harness.instruction_file()),
             ]);
             cells
         })
@@ -1390,8 +1666,8 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
 /// Show the mix of how the user steers the session, and what it suggests. Heavy
 /// steering points to room for more autonomy; frequent corrections point to
 /// clearer upfront specs. The classes are lexical heuristics (`core::prompt`).
-fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let counts = store.prompt_behavior_counts()?;
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
     if format == Format::Json {
@@ -1412,15 +1688,28 @@ fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
         return emit_json(&serde_json::json!({ "total": total, "behaviors": behaviors }));
     }
     if total == 0 {
-        println!("no prompts found — run `cclens analyze` first");
+        // An analyzed store with sessions but no prompts means this harness
+        // harvests no prompt signal (opencode v1 does not) — telling the user
+        // to run `analyze` again would send them in a circle.
+        let (sessions, _) = store.session_stats()?;
+        if sessions > 0 {
+            println!(
+                "no prompts harvested for this harness — the store holds {sessions} analyzed session(s)"
+            );
+        } else {
+            println!("no prompts found — run `cclens analyze` first");
+        }
         return Ok(());
     }
 
     preamble(
         format,
-        "How you steer Claude, classified per prompt: instruct (substantive asks),\n\
-         steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
-         steering = room for more autonomy; lots of correcting = unclear upfront specs.",
+        &format!(
+            "How you steer {}, classified per prompt: instruct (substantive asks),\n\
+             steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
+             steering = room for more autonomy; lots of correcting = unclear upfront specs.",
+            harness.display_name()
+        ),
     );
     let pct = |n: i64| (n as f64 * 100.0 / total as f64).round() as i64;
     let get = |name: &str| {
@@ -1485,8 +1774,8 @@ fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
 /// leaves the residual — system prompt, built-in tools, and MCP tool schemas the
 /// catalog cannot weigh. The per-project floors let you infer an MCP server's
 /// real cost by comparing a project that enables it against one that does not.
-fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let floor = store.baseline_floor()?;
     let config = store.always_on_config_tokens()?;
     let residual = floor.map(|floor| (floor - config).max(0));
@@ -1522,8 +1811,11 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
                  carries an observable session start. A store written before session-start\n\
                  tracking keeps its old rows (analyze never re-reads a closed session), so\n\
                  the floor appears as newer sessions are analyzed. Discarding the store\n\
-                 would backfill it from the transcripts still on disk, at the cost of every\n\
-                 session whose transcript Claude Code has already pruned."
+                 would backfill it from the {} still on disk, at the cost of every\n\
+                 session whose {} {} has already pruned.",
+                harness.raw_source(),
+                harness.source_noun(),
+                harness.display_name()
             );
         }
         return Ok(());
@@ -1541,7 +1833,8 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
         style.bold(&format!("{floor} tokens"))
     );
     println!(
-        "  readable config (CLAUDE.md, always-on rules, skill/agent descriptions): {config} tokens"
+        "  readable config ({}): {config} tokens",
+        harness.readable_config()
     );
     println!(
         "  residual (system prompt + built-in tools + MCP schemas):                {residual} tokens"
@@ -1586,8 +1879,8 @@ struct AnalyzeStats {
     denials: usize,
 }
 
-fn analyze(projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
-    let stats = run_analyze(projects, db)?;
+fn analyze(harness: &Harness, projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
+    let stats = run_analyze(harness, projects, db)?;
     let store = Store::open(db).context("open store")?;
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
     if format == Format::Json {
@@ -1617,7 +1910,33 @@ fn analyze(projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+/// Analyze raw input into the store, dispatching on the harness. The guard
+/// runs first: a store built by another harness refuses the write rather than
+/// mixing rows (`docs/specs/harness.md`).
+fn run_analyze(harness: &Harness, projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+    guard_harness(&Store::open(db).context("open store")?, harness, db)?;
+    match harness {
+        Harness::Claude => run_analyze_claude(projects, db),
+        Harness::Opencode => run_analyze_opencode(projects, db),
+    }
+}
+
+/// Refuse to analyze into a store another harness built. A store with no
+/// `harness` key predates the flag and is adopted (the Claude default), never
+/// refused.
+fn guard_harness(store: &Store, harness: &Harness, db: &Path) -> Result<()> {
+    if let Some(existing) = store.meta("harness")?
+        && existing != harness.label()
+    {
+        anyhow::bail!(
+            "the store at {} holds {existing} sessions — rerun with --harness {existing} (or pick another --db)",
+            db.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_analyze_claude(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     let projects = projects.map(Ok).unwrap_or_else(default_projects_dir)?;
     let mut store = Store::open(db).context("open store")?;
 
@@ -1719,6 +2038,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
     store.set_meta("projects_dir", &projects.display().to_string())?;
     store.set_meta("config_dir", &config_dir.display().to_string())?;
+    store.set_meta("harness", Harness::Claude.label())?;
 
     Ok(AnalyzeStats {
         sessions,
@@ -1729,12 +2049,201 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     })
 }
 
+/// Analyze an opencode database into the opencode store. The row-to-record
+/// mapping is `adapter::opencode`; this shell reads the database read-only,
+/// groups rows by session, and ingests each session idempotently. See
+/// `docs/specs/harness.md` for the v1 capability boundaries (no subagent
+/// runs, no prompts, no permission denials, empty surface catalog).
+fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+    let input = match input {
+        Some(path) => path,
+        None => default_opencode_db()?,
+    };
+    if !input.is_file() {
+        anyhow::bail!(
+            "no opencode database at {} — is opencode installed (or pass its path via --projects)?",
+            input.display()
+        );
+    }
+    let mut store = Store::open(db).context("open store")?;
+    // The opencode version key lives apart from the shared analyzer version:
+    // an opencode-only extraction change must never force Claude Code users
+    // through a full re-analyze (`adapter::opencode::OPENCODE_ANALYZER_VERSION`).
+    let reuse_ingested = store
+        .meta(opencode_mod::OPENCODE_ANALYZER_META_KEY)?
+        .as_deref()
+        == Some(opencode_mod::OPENCODE_ANALYZER_VERSION);
+
+    let snapshot = opencode_mod::read_database(&input)?;
+    let mut messages_by_session: std::collections::HashMap<
+        &str,
+        Vec<&opencode_mod::SnapshotMessage>,
+    > = std::collections::HashMap::new();
+    for message in &snapshot.messages {
+        messages_by_session
+            .entry(message.session_id.as_str())
+            .or_default()
+            .push(message);
+    }
+    let mut parts_by_message: std::collections::HashMap<&str, Vec<&opencode_mod::SnapshotPart>> =
+        std::collections::HashMap::new();
+    for part in &snapshot.parts {
+        parts_by_message
+            .entry(part.message_id.as_str())
+            .or_default()
+            .push(part);
+    }
+
+    let mut sessions = 0;
+    let mut skipped = 0;
+    let mut spans_total = 0;
+    for session in &snapshot.sessions {
+        let session_messages = messages_by_session
+            .get(session.id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        // Per-session fingerprint: the whole-file stat would re-ingest every
+        // session on each run (opencode appends constantly).
+        let fingerprint_key = format!("opencode:{}", session.id);
+        let message_count = session_messages.len() as i64;
+        if reuse_ingested
+            && store.is_ingested(&fingerprint_key, session.time_updated_ms, message_count)?
+        {
+            skipped += 1;
+            continue;
+        }
+        let message_rows: Vec<opencode_mod::MessageRow> = session_messages
+            .iter()
+            .map(|m| opencode_mod::MessageRow {
+                id: m.id.as_str(),
+                session_id: m.session_id.as_str(),
+                time_created_ms: m.time_created_ms,
+                parent_id: m.data.get("parentID").and_then(|v| v.as_str()),
+                data: &m.data,
+            })
+            .collect();
+        let mut part_rows: Vec<opencode_mod::PartRow> = session_messages
+            .iter()
+            .flat_map(|m| {
+                parts_by_message
+                    .get(m.id.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .map(|p| opencode_mod::PartRow {
+                id: p.id.as_str(),
+                message_id: p.message_id.as_str(),
+                session_id: p.session_id.as_str(),
+                time_created_ms: p.time_created_ms,
+                data: &p.data,
+            })
+            .collect();
+        part_rows.sort_by_key(|p| (p.time_created_ms, p.id));
+        let records = opencode_mod::parse_session(&message_rows, &part_rows);
+        let spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
+        let usage = extract_usage_events(&records);
+        let meta = SessionMeta {
+            id: session.id.clone(),
+            project: session.directory.clone(),
+            slug: session.slug.clone(),
+            root: session.directory.clone(),
+            source_path: fingerprint_key.clone(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            start: session_start(&records),
+        };
+        store.ingest_session(&meta, &spans, &usage)?;
+        // `raw_errors` owns the strings; `error_rows` borrows them.
+        let raw_errors = opencode_mod::extract_tool_errors(&part_rows);
+        let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
+            .iter()
+            .map(|e| {
+                (
+                    e.epoch_ms,
+                    e.category.label(),
+                    e.excerpt.as_str(),
+                    e.tool.as_str(),
+                    e.target.as_str(),
+                )
+            })
+            .collect();
+        store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
+        // `work` owns the strings; the rows borrow them.
+        let work = opencode_mod::extract_work_events(&part_rows);
+        let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
+            .iter()
+            .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
+            .collect();
+        store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
+        store.record_ingested_file(&fingerprint_key, session.time_updated_ms, message_count)?;
+        sessions += 1;
+        spans_total += spans.len();
+    }
+
+    // Catalog the installed config — global scope plus every known project
+    // root that still exists on disk — so usage joins against what is
+    // installed. Skills join from the six documented sites (deduped by
+    // canonical path, since sites may be symlinks to one shared directory);
+    // MCP and permissions stay out of v1 (see
+    // `docs/specs/config-format-opencode.md`), so their live usage still
+    // shows as orphaned rows in `inventory`.
+    let config_dir = opencode_home()?;
+    let home = home_dir().map(Path::new);
+    let mut seen = std::collections::HashSet::new();
+    let mut surfaces = opencode_mod::read_global_surfaces(&config_dir, home, &mut seen);
+    for (root, project) in store.session_roots()? {
+        if Path::new(&root).is_dir() {
+            surfaces.extend(opencode_mod::read_project_surfaces(
+                Path::new(&root),
+                &project,
+                home,
+                &mut seen,
+            ));
+        }
+    }
+    let surface_count = surfaces.len();
+    store.replace_surfaces(&surfaces)?;
+
+    store.set_meta(
+        opencode_mod::OPENCODE_ANALYZER_META_KEY,
+        opencode_mod::OPENCODE_ANALYZER_VERSION,
+    )?;
+    store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
+    store.set_meta("projects_dir", &input.display().to_string())?;
+    store.set_meta("config_dir", &config_dir.display().to_string())?;
+    store.set_meta("harness", Harness::Opencode.label())?;
+
+    Ok(AnalyzeStats {
+        sessions,
+        skipped,
+        spans_total,
+        surface_count,
+        denials: 0,
+    })
+}
+
+/// The opencode config root for this run: the environment read that
+/// `adapter::harness::opencode_config_dir` deliberately does not do.
+fn opencode_home() -> Result<PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    Harness::opencode_config_dir(config_home.as_deref(), home_dir().map(Path::new))
+        .context("set XDG_CONFIG_HOME or HOME")
+}
+
+/// The opencode database for this run: the environment read that
+/// `adapter::harness::opencode_db_path` deliberately does not do.
+fn default_opencode_db() -> Result<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    Harness::opencode_db_path(data_home.as_deref(), home_dir().map(Path::new))
+        .context("set XDG_DATA_HOME or HOME")
+}
+
 /// Open the store for a read command. Unless `--frozen`, the analysis is
 /// refreshed first — incremental, so an up-to-date store costs one stat per
 /// transcript — which makes stale reads structurally impossible (`optimize` has
 /// always worked this way; the views now compose the same stage). A one-line
 /// freshness header goes to **stderr** so piped stdout stays clean.
-fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
+fn open_for_read(harness: &Harness, db: &Path, frozen: bool) -> Result<Store> {
     if !frozen {
         // Re-analyze against the roots the store was built from (recorded in
         // meta); a fresh db falls back to the defaults.
@@ -1745,18 +2254,23 @@ fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
                 .map(PathBuf::from),
             false => None,
         };
-        let stats = run_analyze(projects, db)?;
+        let stats = run_analyze(harness, projects, db)?;
         eprintln!(
             "{}",
             Style::stderr().dim(&format!(
-                "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
-                stats.sessions, stats.skipped
+                "store: refreshed just now ({} {} re-analyzed, {} unchanged)",
+                stats.sessions,
+                harness.input_unit(),
+                stats.skipped
             ))
         );
         return Store::open(db).context("open store");
     }
 
     let store = Store::open(db).context("open store")?;
+    // No refresh ran, so no guard ran either — refuse a wrong-harness read
+    // here rather than reporting another harness's rows as this one's.
+    guard_harness(&store, harness, db)?;
     eprint_freshness(&freshness_line(store.meta("analyzed_at")?.as_deref()));
     Ok(store)
 }
@@ -1923,8 +2437,14 @@ fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
     runs
 }
 
-fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn usage(
+    harness: &Harness,
+    by: Option<&str>,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
 
     if let Some(by) = by {
         let bucket = Bucket::parse(by)
@@ -2131,8 +2651,14 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 /// Join the catalogued surfaces against usage: each installed surface with its
 /// static cost and (for usage-measurable kinds) invocation count, unused ones
 /// flagged. Usage with no matching surface is shown as orphaned.
-fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn inventory(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let catalog: Vec<_> = store
         .effective_catalog()?
         .into_iter()
@@ -2182,15 +2708,7 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
         return Ok(());
     }
 
-    preamble(
-        format,
-        "Everything installed in your config — skills, rules, agents, MCP servers,\n\
-         CLAUDE.md — with where it is installed (scope) and whether it was ever used.\n\
-         \"start tok\" is what every session pays for having it installed; \"static tok\"\n\
-         is the whole definition, which for a skill or agent is paid only on invocation.\n\
-         UNUSED marks delete candidates; rules and CLAUDE.md are catalog-only because\n\
-         using them leaves no trace in transcripts.",
-    );
+    preamble(format, harness.inventory_preamble());
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
@@ -2289,8 +2807,14 @@ fn scope_cell(scope: &str, project: &str) -> String {
 /// at session start — real always-on tokens first, then MCP schemas, then
 /// declutter-only (skills/agents, whose body is on-demand). This is the "where
 /// and how to optimize" view, honest about which removals save context.
-fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(db, frozen)?;
+fn waste(
+    harness: &Harness,
+    filter: &ScopeFilter,
+    format: Format,
+    frozen: bool,
+    db: &Path,
+) -> Result<()> {
+    let store = open_for_read(harness, db, frozen)?;
     let catalog: Vec<_> = store
         .effective_catalog()?
         .into_iter()
@@ -2576,9 +3100,12 @@ fn claude_home() -> Result<PathBuf> {
 /// exactly the one thing this file cannot survive.
 ///
 /// Pure over its inputs (the environment is read by the caller) so the
-/// resolution is testable.
+/// resolution is testable. Each harness resolves to its own file name, so a
+/// store built by one harness is never reinterpreted as another's rows
+/// (`docs/specs/harness.md`).
 fn store_path(
     db: Option<PathBuf>,
+    harness: &Harness,
     state_home: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf> {
@@ -2597,13 +3124,18 @@ fn store_path(
             .join(".local")
             .join("state"),
     };
-    Ok(base.join("cclens").join("cclens.db"))
+    Ok(base.join("cclens").join(harness.db_file_name()))
 }
 
 /// `store_path` against the live environment.
-fn resolve_db(db: Option<PathBuf>) -> Result<PathBuf> {
+fn resolve_db(db: Option<PathBuf>, harness: &Harness) -> Result<PathBuf> {
     let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
-    store_path(db, state_home.as_deref(), home_dir().map(Path::new))
+    store_path(
+        db,
+        harness,
+        state_home.as_deref(),
+        home_dir().map(Path::new),
+    )
 }
 
 /// Column alignment for the table renderer.
@@ -3047,12 +3579,40 @@ mod tests {
     #[test]
     fn store_path_defaults_under_the_user_state_dir() {
         assert_eq!(
-            store_path(None, Some(Path::new("/tmp/example/state")), None).unwrap(),
+            store_path(
+                None,
+                &Harness::Claude,
+                Some(Path::new("/tmp/example/state")),
+                None
+            )
+            .unwrap(),
             PathBuf::from("/tmp/example/state/cclens/cclens.db")
         );
         assert_eq!(
-            store_path(None, None, Some(Path::new("/tmp/example/home"))).unwrap(),
+            store_path(
+                None,
+                &Harness::Claude,
+                None,
+                Some(Path::new("/tmp/example/home"))
+            )
+            .unwrap(),
             PathBuf::from("/tmp/example/home/.local/state/cclens/cclens.db")
+        );
+    }
+
+    #[test]
+    fn store_path_gives_each_harness_its_own_file() {
+        // One store per harness: an opencode run never lands in the Claude
+        // file, so an old store is never reinterpreted as another harness.
+        assert_eq!(
+            store_path(
+                None,
+                &Harness::Opencode,
+                Some(Path::new("/tmp/example/state")),
+                None
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/example/state/cclens/cclens-opencode.db")
         );
     }
 
@@ -3063,6 +3623,7 @@ mod tests {
         assert_eq!(
             store_path(
                 None,
+                &Harness::Claude,
                 Some(Path::new("relative/state")),
                 Some(Path::new("/tmp/example/home"))
             )
@@ -3073,14 +3634,22 @@ mod tests {
 
     #[test]
     fn store_path_without_a_home_is_an_error() {
-        assert!(store_path(None, None, None).is_err());
+        assert!(store_path(None, &Harness::Claude, None, None).is_err());
     }
 
     #[test]
     fn store_path_refuses_a_relative_home() {
         // The fallback root is held to the same bar as XDG_STATE_HOME: a
         // relative one would put the store back under the current directory.
-        assert!(store_path(None, None, Some(Path::new("relative/home"))).is_err());
+        assert!(
+            store_path(
+                None,
+                &Harness::Claude,
+                None,
+                Some(Path::new("relative/home"))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3089,11 +3658,60 @@ mod tests {
         assert_eq!(
             store_path(
                 Some(PathBuf::from("./cclens.db")),
+                &Harness::Opencode,
                 Some(Path::new("/tmp/example/state")),
                 Some(Path::new("/tmp/example/home"))
             )
             .unwrap(),
             PathBuf::from("./cclens.db")
         );
+    }
+
+    #[test]
+    fn parse_harness_defaults_to_claude_and_rejects_the_rest() {
+        assert_eq!(parse_harness(None).unwrap(), Harness::Claude);
+        assert_eq!(parse_harness(Some("opencode")).unwrap(), Harness::Opencode);
+        assert!(parse_harness(Some("auto")).is_err());
+    }
+
+    #[test]
+    fn launch_command_runs_each_harness_own_agent() {
+        // `claude` opens interactively on the prompt; `opencode run` runs the
+        // advisor headless on JSON events (raw tool dumps loggable) with a
+        // recognizable session title (see `run_instructions`).
+        assert_eq!(launch_command(&Harness::Claude), ("claude", &[] as &[&str]));
+        assert_eq!(
+            launch_command(&Harness::Opencode),
+            (
+                "opencode",
+                &["run", "--format", "json", "--title", "cclens optimize"] as &[&str]
+            )
+        );
+    }
+
+    #[test]
+    fn guard_harness_adopts_a_store_without_a_key() {
+        // A store predating the flag carries no `harness` key and is adopted
+        // by the Claude default, never refused.
+        let mut store = Store::in_memory().unwrap();
+        assert!(guard_harness(&store, &Harness::Claude, Path::new("/tmp/example/x.db")).is_ok());
+        store.set_meta("harness", Harness::Claude.label()).unwrap();
+        assert!(guard_harness(&store, &Harness::Claude, Path::new("/tmp/example/x.db")).is_ok());
+        assert!(guard_harness(&store, &Harness::Opencode, Path::new("/tmp/example/x.db")).is_err());
+    }
+
+    #[test]
+    fn frozen_reads_refuse_a_wrong_harness_store() {
+        // `--frozen` skips the analyze that guards, so the read path guards
+        // itself — otherwise a Claude read would report opencode rows.
+        let path = TempPath::new("guard.db");
+        {
+            let mut store = Store::open(&path.0).unwrap();
+            store
+                .set_meta("harness", Harness::Opencode.label())
+                .unwrap();
+        }
+        assert!(open_for_read(&Harness::Opencode, &path.0, true).is_ok());
+        assert!(open_for_read(&Harness::Claude, &path.0, true).is_err());
     }
 }

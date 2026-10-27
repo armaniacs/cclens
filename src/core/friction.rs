@@ -25,6 +25,11 @@ pub enum ErrorCategory {
     ToolNotAvailable,
     /// A tool was called with invalid arguments.
     InputValidation,
+    /// A fetched URL answered with an HTTP error (404, 500, ...).
+    WebError,
+    /// A file the reader refuses as binary — usually an encoding mismatch,
+    /// not a missing file.
+    BinaryFile,
     /// An MCP server returned an error (auth, validation, upstream).
     McpError,
     /// A user-stopped or cascade-cancelled call — not a code failure.
@@ -49,6 +54,8 @@ impl ErrorCategory {
             ErrorCategory::Timeout => "timeout",
             ErrorCategory::ToolNotAvailable => "tool-not-available",
             ErrorCategory::InputValidation => "input-validation",
+            ErrorCategory::WebError => "web-error",
+            ErrorCategory::BinaryFile => "binary-file",
             ErrorCategory::McpError => "mcp-error",
             ErrorCategory::Cancelled => "cancelled",
             ErrorCategory::Transient => "transient",
@@ -69,6 +76,8 @@ impl ErrorCategory {
             "timeout" => ErrorCategory::Timeout,
             "tool-not-available" => ErrorCategory::ToolNotAvailable,
             "input-validation" => ErrorCategory::InputValidation,
+            "web-error" => ErrorCategory::WebError,
+            "binary-file" => ErrorCategory::BinaryFile,
             "mcp-error" => ErrorCategory::McpError,
             "cancelled" => ErrorCategory::Cancelled,
             "transient" => ErrorCategory::Transient,
@@ -92,38 +101,61 @@ impl ErrorCategory {
         )
     }
 
-    /// What recurring instances of this category suggest fixing.
-    pub fn suggestion(self) -> &'static str {
+    /// What recurring instances of this category suggest fixing. The
+    /// instruction file varies by harness (`CLAUDE.md` vs `AGENTS.md`), so it
+    /// arrives as a parameter rather than living in the shared vocabulary.
+    pub fn suggestion(self, instruction_file: &str) -> String {
         match self {
             ErrorCategory::EditPrecondition => {
-                "re-read before editing; a stale or fuzzy match keeps failing"
+                "re-read before editing; a stale or fuzzy match keeps failing".to_string()
             }
             ErrorCategory::BlockedByHook => {
                 "a habit keeps hitting a rule/hook — the rule blocks but doesn't prevent it"
+                    .to_string()
             }
-            ErrorCategory::CommandNotFound => "a missing tool; install it or note its absence",
+            ErrorCategory::CommandNotFound => {
+                "a missing tool; install it or note its absence".to_string()
+            }
             ErrorCategory::PathNotFound => {
-                "paths are being guessed wrong — a file map in CLAUDE.md would help"
+                format!(
+                    "paths are being guessed wrong — a file map in {instruction_file} would help"
+                )
             }
             ErrorCategory::CompileError => {
-                "expected during iteration; spikes may signal a hard spot"
+                "expected during iteration; spikes may signal a hard spot".to_string()
             }
-            ErrorCategory::TestFailure => "flaky or hard tests; worth stabilising the worst",
-            ErrorCategory::Timeout => "slow commands; raise timeout or split the work",
+            ErrorCategory::TestFailure => {
+                "flaky or hard tests; worth stabilising the worst".to_string()
+            }
+            ErrorCategory::Timeout => "slow commands; raise timeout or split the work".to_string(),
             ErrorCategory::ToolNotAvailable => {
-                "a tool was called by a name that doesn't exist — wrong/deferred tool"
+                "a tool was called by a name that doesn't exist — wrong/deferred tool".to_string()
             }
-            ErrorCategory::InputValidation => "tool called with invalid arguments",
-            ErrorCategory::McpError => "an MCP server erroring (auth/validation/upstream)",
+            ErrorCategory::InputValidation => "tool called with invalid arguments".to_string(),
+            ErrorCategory::WebError => {
+                "a fetched URL returned an HTTP error — a dead or moved link; update or drop it"
+                    .to_string()
+            }
+            ErrorCategory::BinaryFile => {
+                "a file the reader refuses as binary — usually an encoding mismatch; convert it \
+                 or stop pointing at it"
+                    .to_string()
+            }
+            ErrorCategory::McpError => {
+                "an MCP server erroring (auth/validation/upstream)".to_string()
+            }
             ErrorCategory::Cancelled => {
                 "not a code failure: a user stop or parallel-cascade cancel; frequent stops \
                  may mean the work went off-track"
+                    .to_string()
             }
             ErrorCategory::Transient => {
-                "transient infra (e.g. model unavailable) — not yours to fix"
+                "transient infra (e.g. model unavailable) — not yours to fix".to_string()
             }
-            ErrorCategory::CommandFailed => "a command exited non-zero; cause unclassified",
-            ErrorCategory::Other => "uncategorised — inspect the raw errors",
+            ErrorCategory::CommandFailed => {
+                "a command exited non-zero; cause unclassified".to_string()
+            }
+            ErrorCategory::Other => "uncategorised — inspect the raw errors".to_string(),
         }
     }
 }
@@ -149,11 +181,15 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         || has("has not been read")
         || has("has been modified")
         || has("file has not been read yet")
+        || has("could not find oldstring")
     {
         ErrorCategory::EditPrecondition
     } else if has("cancelled: parallel tool call")
         || has("request interrupted by user")
         || has("the user doesn't want to proceed")
+        || has("tool execution aborted")
+        || has("user rejected permission")
+        || has("task cancelled")
     {
         // User stop or a sibling failing in a parallel batch — not a code fault.
         ErrorCategory::Cancelled
@@ -162,19 +198,35 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         || has("use perl instead")
         || has("denied by")
         || has("blocked:")
+        || has("prevents you from using")
     {
         ErrorCategory::BlockedByHook
     } else if has("temporarily unavailable") || has("overloaded") {
         ErrorCategory::Transient
-    } else if has("no such tool available") {
+    } else if has("non 2xx status code") {
+        // A fetched URL answered with an HTTP error — checked before the file
+        // patterns since the URL may contain any of their phrases.
+        ErrorCategory::WebError
+    } else if has("cannot read binary file") {
+        // The reader refuses the file's encoding, not its existence — checked
+        // before the path patterns for the same reason.
+        ErrorCategory::BinaryFile
+    } else if has("no such tool available") || has("not found. available skills") {
         ErrorCategory::ToolNotAvailable
-    } else if has("inputvalidationerror") || has("input validation error") {
+    } else if has("inputvalidationerror")
+        || has("input validation error")
+        || has("called with invalid arguments")
+    {
         ErrorCategory::InputValidation
     } else if has("mcp error") {
         ErrorCategory::McpError
     } else if has("command not found") || has("is not recognized") {
         ErrorCategory::CommandNotFound
-    } else if has("no such file") || has("does not exist") || has("cannot find the path") {
+    } else if has("no such file")
+        || has("does not exist")
+        || has("cannot find the path")
+        || has("file not found")
+    {
         ErrorCategory::PathNotFound
     } else if has("error[e") || has("mismatched types") || has("cannot borrow") {
         ErrorCategory::CompileError
@@ -193,6 +245,24 @@ pub fn classify_error(text: &str) -> ErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_file_reads_are_their_own_category() {
+        assert_eq!(
+            classify_error("Cannot read binary file: /tmp/example/notes/2026-02-15.md"),
+            ErrorCategory::BinaryFile
+        );
+    }
+
+    #[test]
+    fn http_status_errors_are_their_own_category() {
+        assert_eq!(
+            classify_error(
+                "StatusCode: non 2xx status code (404 GET https://example.com/main/README.md)"
+            ),
+            ErrorCategory::WebError
+        );
+    }
 
     #[test]
     fn edit_precondition_is_detected_first() {
@@ -245,6 +315,55 @@ mod tests {
         assert_eq!(
             classify_error("cat: /tmp/x: No such file or directory"),
             ErrorCategory::PathNotFound
+        );
+    }
+
+    #[test]
+    fn opencode_phrasings_reach_their_categories() {
+        // Observed opencode tool-error wordings; each is specific enough to
+        // carry no other meaning in either harness's error texts.
+        assert_eq!(
+            classify_error("File not found: /tmp/example/foo.md"),
+            ErrorCategory::PathNotFound
+        );
+        assert_eq!(
+            classify_error("Could not find oldString in the file. It must match exactly,"),
+            ErrorCategory::EditPrecondition
+        );
+        assert_eq!(
+            classify_error("Tool execution aborted"),
+            ErrorCategory::Cancelled
+        );
+        assert_eq!(
+            classify_error("The user rejected permission to use this specific tool call."),
+            ErrorCategory::Cancelled
+        );
+        assert_eq!(classify_error("Task cancelled"), ErrorCategory::Cancelled);
+        assert_eq!(
+            classify_error("The user has specified a rule which prevents you from using bash."),
+            ErrorCategory::BlockedByHook
+        );
+        assert_eq!(
+            classify_error("The edit tool was called with invalid arguments"),
+            ErrorCategory::InputValidation
+        );
+        assert_eq!(
+            classify_error("Skill \"nikki-make\" not found. Available skills: ..."),
+            ErrorCategory::ToolNotAvailable
+        );
+    }
+
+    #[test]
+    fn the_path_suggestion_names_the_harness_instruction_file() {
+        assert!(
+            ErrorCategory::PathNotFound
+                .suggestion("CLAUDE.md")
+                .contains("a file map in CLAUDE.md would help")
+        );
+        assert!(
+            ErrorCategory::PathNotFound
+                .suggestion("AGENTS.md")
+                .contains("a file map in AGENTS.md would help")
         );
     }
 

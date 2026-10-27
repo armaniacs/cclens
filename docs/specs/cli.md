@@ -229,26 +229,32 @@ category='edit-precondition' GROUP BY target` answers "which files keep failing
 to edit", which the error text alone cannot. `SELECT sql FROM sqlite_master`
 lists the full schema.
 
-## `optimize` — act on the findings with an interactive `claude` session
+## `optimize` — act on the findings with an advisor session
 
 ```
 cclens optimize [--projects <dir>] [--db <path>] [--scope global|project[:<slug>]]
-                [--frozen] [--print]
+                [--frozen] [--print] [--verbose]
 ```
 
 The AI-proposal consumer (`architecture.md`): rather than emit static
 "recommendations" the tool cannot safely act on, `optimize` analyzes (unless
 `--frozen`, the same flag the views use), composes the findings with a prescribed advisor prompt, and
-launches `claude` seeded with it — so the user optimizes *interactively*, with an
-agent that can read their config and apply edits on agreement. The prompt makes
+launches the harness's agent seeded with it — `claude` for an interactive
+session that applies edits on agreement, `opencode run --format json` for a
+headless run that streams only the agent's text while the raw tool output
+logs to a private file (`--verbose` restores the raw stream) and prints the
+plan without editing. The prompt makes
 the session **investigate autonomously to a conclusion**: it pins down each root
 cause and proposes a concrete fix, rather than handing the analysis back with a
 "which area do you want to start with?". It prioritises work friction over config
 size, verifies before recommending removal (an "unused" skill may be invoked by
-subagents) by inspecting rather than asking, and pauses for exactly one thing —
+subagents) by inspecting rather than asking, and — in interactive runs — pauses for exactly one thing —
 approval of the concrete fix-plan before any file is edited. This "drive to a
 plan, gate only on applying it" shape is the design; if it changes, update
-`INSTRUCTIONS` in `core::optimize` and this paragraph together.
+`instructions` in `core::optimize` and this paragraph together.
+`instructions` renders from the harness copy (`HarnessCopy`), not a constant,
+so the advisor identity, config locations, and raw-input pointers name the
+harness whose rows the briefing renders.
 
 Crucially the briefing is the **complete** analysis, not a headline — every
 project's friction breakdown, the full Bash/hotspot/thrash detail, and the actual
@@ -287,5 +293,5 @@ to stdout for piping / inspection, where the user has opted into seeing it.
 
 The split mirrors the rest of the tool: prompt composition is a pure transform
 (`core::optimize` — `render_briefing` for the Markdown report with empty sections
-omitted and long lists capped, `INSTRUCTIONS` for the role, `launch_prompt` for
+omitted and long lists capped, `instructions` for the role, `launch_prompt` for
 the argv pointer), and only the temp-file write and process launch are I/O.
