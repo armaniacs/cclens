@@ -1,6 +1,6 @@
-# cclens
+# saniwalens
 
-A CLI that analyzes Claude Code usage to show **where your Claude Code
+A CLI that analyzes coding-agent usage to show **where your agent
 configuration can be optimized, and how**. It measures the **cost** (context
 tokens, wall-clock time, friction) and **actual usage** of every configuration
 surface — skills, rules, hooks, MCP servers and their tool schemas, agents,
@@ -8,7 +8,11 @@ surface — skills, rules, hooks, MCP servers and their tool schemas, agents,
 wedges: high cost with low use (prune), always-on cost used only rarely
 (defer/split), redundancy (merge), recurring friction (configure).
 
-Skills are just one surface among many; the tool is configuration-wide.
+Skills are just one surface among many; the tool is configuration-wide. It
+understands more than one agent harness: Claude Code is the default, and
+`--harness opencode | kilocode` switches every command to that harness's
+transcripts and config. Harness-specific knowledge stays isolated per harness;
+shared core behavior must never regress for the other harnesses.
 
 AI-assisted optimization *proposals* are a planned future layer on top of this
 analysis core — the core's job is to measure and visualize, not to advise.
@@ -36,7 +40,7 @@ Two stages, decoupled by an intermediate SQLite store:
 transcripts + config ──analyze──▶ SQLite (sessions · surfaces · events) ──▶ consumers
 ```
 
-`analyze` reads two kinds of Claude Code input — **session transcripts** (what
+`analyze` reads two kinds of agent-harness input — **session transcripts** (what
 was actually used and at what cost) and **live config** (what is installed and
 its static cost) — and writes a normalized store. The first consumer is CLI
 reporting (tables / Markdown); a later consumer feeds the same store to AI for
@@ -50,10 +54,10 @@ measured cost). What is configured but absent from events is unused; what is
 costly but rarely used is a prune candidate.
 
 Internally the code is layered — an **adapter** that owns all knowledge of the
-Claude Code input formats (transcript JSONL *and* config files), a **pure core**
-(records → events → aggregates, and the surface/usage joins), a **store**, and
-**reporting**. Those input formats are upstream and will change; isolating them
-in the adapter keeps the rest stable across Claude Code releases. See
-`docs/specs/architecture.md` and `.claude/rules/format-isolation.md`.
+harness input formats (transcript JSONL / databases *and* config files), a
+**pure core** (records → events → aggregates, and the surface/usage joins), a
+**store**, and **reporting**. Those input formats are upstream and will change;
+isolating them in the adapter keeps the rest stable across harness releases.
+See `docs/specs/architecture.md` and `.claude/rules/format-isolation.md`.
 
 Project-local guardrails live in `.claude/rules/`.

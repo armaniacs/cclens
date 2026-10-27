@@ -1,6 +1,6 @@
 # Architecture Specification
 
-saniwalens answers one question about a Claude Code setup: **where can the
+saniwalens answers one question about a coding-agent setup: **where can the
 configuration be optimized, and how?** It does that by measuring, from real
 usage, the **cost** and **actual use** of every configuration surface — skills,
 rules, hooks, MCP servers and their tool schemas, agents, `CLAUDE.md` /
