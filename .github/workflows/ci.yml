@@ -23,7 +23,6 @@ jobs:
       # the auth token; without it the step is skipped and the run builds from
       # source instead.
       - uses: cachix/cachix-action@v17
-        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -40,7 +39,6 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - uses: cachix/cachix-action@v17
-        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
