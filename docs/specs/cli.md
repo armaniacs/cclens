@@ -49,6 +49,33 @@ migrates in place rather than being discarded on a schema change is the same
 premise applied to upgrades. A project-local store stays available by asking for
 it — `--db ./saniwalens.db`.
 
+### `config.toml` — defaults and named profiles
+
+The tool's own config file lives at
+`${XDG_CONFIG_HOME:-~/.config}/saniwalens/config.toml` (`config_file_path` in
+`cli.rs`; a relative `XDG_CONFIG_HOME` is invalid and ignored, like its
+`XDG_STATE_HOME` sibling above). The file is optional — without it every
+invocation behaves exactly as before.
+
+```toml
+default_harness = "kilocode"   # claude | opencode | kilocode
+
+[profiles.work]
+harness = "claude"
+db = "work.db"                 # relative to the config file's directory
+```
+
+It holds two kinds of defaults plus named profiles `--profile` selects.
+Resolution order, strongest first: explicit flags, the selected profile, the
+file's top-level defaults, then the builtins (`claude`, the per-harness store
+path). A relative `db` joins the directory holding `config.toml` — never the
+current working directory — while an explicit `--db` is taken as is, even
+when relative; `~` is not expanded. Unknown keys are ignored so a newer file
+never breaks an older binary. A missing file is silence, not an error; anything
+else wrong with the file (unparsable TOML, unknown harness, missing profile)
+fails the invocation with the file named, and an unknown `--profile` lists the
+available ones.
+
 ## Views — read the store
 
 ```

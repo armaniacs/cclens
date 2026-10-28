@@ -113,6 +113,23 @@ analyzed project's own files — so findings stay per harness, never mixed. The
 flag is explicit and the default stays `claude`; [`docs/specs/harness.md`](docs/specs/harness.md)
 holds the per-harness contract.
 
+## Config file
+
+Defaults live in `~/.config/saniwalens/config.toml` (optional — without it
+everything behaves as before):
+
+```toml
+default_harness = "kilocode"
+
+[profiles.work]
+harness = "claude"
+db = "work.db"   # relative to the config file's directory
+```
+
+`saniwalens --profile work doctor` runs under that profile; explicit flags
+always win over the file. See [`docs/specs/cli.md`](docs/specs/cli.md) for
+the resolution order.
+
 ## Commands
 
 ### Pipeline

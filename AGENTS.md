@@ -31,6 +31,11 @@ This project is **spec-driven and test-driven**.
   personal data and secrets. Test fixtures are synthetic; harvested transcripts,
   captured config, and generated databases are never committed. See
   `.claude/rules/session-data-privacy.md`.
+- **PBI first for user-facing work.** When the user asks to proceed their usual
+  way ("PBIを作って"), write a `pbi/YYYY-MM-DD-NN-<type>-<slug>.md` before
+  implementing, following the pbi-create-bdd skill (vertical slice, BDD
+  scenarios, t-wada test strategy, implementer notes). This takes precedence
+  over the brainstorming skill's design-doc flow when the user says so.
 
 ## Architecture
 
