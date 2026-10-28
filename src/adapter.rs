@@ -4,6 +4,7 @@
 //! `docs/specs/architecture.md` and `.claude/rules/format-isolation.md`.
 
 pub mod config;
+pub mod config_file;
 pub mod harness;
 pub mod kilocode;
 pub mod opencode;
