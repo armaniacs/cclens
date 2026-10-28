@@ -40,7 +40,12 @@ jobs:
   # --keep-revisions meaningful — a tag in the name would give each pin exactly
   # one revision and retain them all, which is the storage growth this cache
   # cannot afford.
+  # Skipped unless the CACHIX_ENABLED repo variable is 'true' (set it together
+  # with the CACHIX_AUTH_TOKEN secret when a Cachix cache is ready). Without
+  # the token this job fails while proving nothing the `build` matrix has not
+  # already proved — and nothing downstream needs it.
   nix:
+    if: ${{ vars.CACHIX_ENABLED == 'true' }}
     uses: lambdalisue/nix-github-release/.github/workflows/build.yml@v0.1.0
     with:
       ref: ${{ github.event.release.tag_name }}
