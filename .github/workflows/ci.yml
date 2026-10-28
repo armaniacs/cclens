@@ -20,8 +20,10 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       # Pull prebuilt toolchain/deps and push what this run builds. Pushing needs
-      # the auth token; forks/PRs without the secret fall back to pull-only.
+      # the auth token; without it the step is skipped and the run builds from
+      # source instead.
       - uses: cachix/cachix-action@v17
+        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -38,6 +40,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - uses: cachix/cachix-action@v17
+        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -52,7 +55,11 @@ jobs:
   # Built from the archive GitHub serves for the commit rather than from the
   # checkout: only the archive has VERSION filled in, so only its build is the
   # one `nix run github:armaniacs/saniwalens` looks up in the cache.
+  # Skipped without the Cachix auth token: the reusable build pushes to the
+  # cache, which needs the token, and there is nothing to pull from an empty
+  # cache. The `targets` matrix below still proves every release target.
   build:
+    if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
     uses: lambdalisue/nix-github-release/.github/workflows/build.yml@v0.1.0
     with:
       cachix-cache: saniwalens
