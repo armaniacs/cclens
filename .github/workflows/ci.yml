@@ -19,14 +19,17 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      # Pull prebuilt toolchain/deps and push what this run builds. Without an
-      # auth token there is nothing to push and no private cache to pull, so
-      # the step becomes pull-only via the public nixpkgs cache.
+      # Pull prebuilt toolchain/deps and push what this run builds. Runs only
+      # when the CACHIX_ENABLED repo variable is 'true' (set it together with
+      # the CACHIX_AUTH_TOKEN secret when a Cachix cache is ready); without it
+      # the run builds from source via the public nixpkgs cache instead.
+      # (The gate lives in `vars`, not `secrets`: a secrets-based `if`
+      # prevents this workflow from evaluating at all.)
       - uses: cachix/cachix-action@v17
+        if: ${{ vars.CACHIX_ENABLED == 'true' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-          skipPush: ${{ secrets.CACHIX_AUTH_TOKEN == '' }}
       # Same pinned tools as local dev (flake devShell) — see flake.nix / justfile.
       - run: nix develop -c just check
 
@@ -40,10 +43,10 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - uses: cachix/cachix-action@v17
+        if: ${{ vars.CACHIX_ENABLED == 'true' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-          skipPush: ${{ secrets.CACHIX_AUTH_TOKEN == '' }}
       - run: nix develop -c just test
 
   # Built on each system the flake advertises, because the cache only helps the
