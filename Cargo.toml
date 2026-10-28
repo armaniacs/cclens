@@ -10,7 +10,7 @@ description = "A lens onto your coding-agent usage: where time, tokens, and effo
 repository = "https://github.com/armaniacs/saniwalens"
 license = "MIT"
 readme = "README.md"
-keywords = ["agent", "claude", "usage", "analytics", "cli"]
+keywords = ["agent", "coding-agent", "usage", "analytics", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 # The crate is the Rust program. Everything that only serves someone working in
 # the repository — the dev shell, the task runner, the toolchain pin, the CI

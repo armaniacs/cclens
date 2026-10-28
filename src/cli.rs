@@ -38,8 +38,10 @@ use crate::store::{SessionMeta, Store};
 #[command(
     name = "saniwalens",
     // Cargo.toml holds a placeholder that the release workflow and the flake
-    // both stamp from the tag before building.
-    version,
+    // both stamp from the tag before building; build.rs additionally stamps
+    // the git tag itself, so `--version` names the release even for a plain
+    // source build.
+    version = env!("SANIWALENS_VERSION"),
     about = "See where your coding-agent time and tokens go, and which config to fix.\n\
              Start with `saniwalens doctor`; every report explains itself and names the\n\
              follow-up command."
@@ -3566,10 +3568,14 @@ mod tests {
             .try_get_matches_from(["saniwalens", "--version"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        // The binary reports the build-stamped version (git tag when built
+        // from a checkout, the tag-stamped placeholder otherwise), never the
+        // raw `0.0.0` placeholder a source build used to print.
         assert_eq!(
             err.to_string(),
-            format!("saniwalens {}\n", env!("CARGO_PKG_VERSION"))
+            format!("saniwalens {}\n", env!("SANIWALENS_VERSION"))
         );
+        assert_ne!(env!("SANIWALENS_VERSION"), "0.0.0");
     }
 
     fn agent(name: &str, runs: i64, out_tokens: i64) -> optimize_mod::AgentCost {
