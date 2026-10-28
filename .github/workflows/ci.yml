@@ -19,13 +19,14 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      # Pull prebuilt toolchain/deps and push what this run builds. Pushing needs
-      # the auth token; without it the step is skipped and the run builds from
-      # source instead.
+      # Pull prebuilt toolchain/deps and push what this run builds. Without an
+      # auth token there is nothing to push and no private cache to pull, so
+      # the step becomes pull-only via the public nixpkgs cache.
       - uses: cachix/cachix-action@v17
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: ${{ secrets.CACHIX_AUTH_TOKEN == '' }}
       # Same pinned tools as local dev (flake devShell) — see flake.nix / justfile.
       - run: nix develop -c just check
 
@@ -42,6 +43,7 @@ jobs:
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: ${{ secrets.CACHIX_AUTH_TOKEN == '' }}
       - run: nix develop -c just test
 
   # Built on each system the flake advertises, because the cache only helps the
@@ -53,11 +55,13 @@ jobs:
   # Built from the archive GitHub serves for the commit rather than from the
   # checkout: only the archive has VERSION filled in, so only its build is the
   # one `nix run github:armaniacs/saniwalens` looks up in the cache.
-  # NOTE: the reusable nix build cannot run without CACHIX_AUTH_TOKEN and
-  # `if` cannot gate a reusable-workflow job here, so this job is currently
-  # expected to fail on runs without the token. The `targets` matrix below
-  # still proves every release target.
+  # Skipped unless the CACHIX_ENABLED repo variable is 'true' (set it together
+  # with the CACHIX_AUTH_TOKEN secret when a Cachix cache is ready): the
+  # reusable build pushes to the cache, which needs the token, and there is
+  # nothing to pull from an empty cache. The `targets` matrix below still
+  # proves every release target.
   build:
+    if: ${{ vars.CACHIX_ENABLED == 'true' }}
     uses: lambdalisue/nix-github-release/.github/workflows/build.yml@v0.1.0
     with:
       cachix-cache: saniwalens
