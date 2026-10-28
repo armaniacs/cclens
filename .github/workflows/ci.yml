@@ -19,9 +19,14 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      # Pull prebuilt toolchain/deps and push what this run builds. Pushing needs
-      # the auth token; forks/PRs without the secret fall back to pull-only.
+      # Pull prebuilt toolchain/deps and push what this run builds. Runs only
+      # when the CACHIX_ENABLED repo variable is 'true' (set it together with
+      # the CACHIX_AUTH_TOKEN secret when a Cachix cache is ready); without it
+      # the run builds from source via the public nixpkgs cache instead.
+      # (The gate lives in `vars`, not `secrets`: a secrets-based `if`
+      # prevents this workflow from evaluating at all.)
       - uses: cachix/cachix-action@v17
+        if: ${{ vars.CACHIX_ENABLED == 'true' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -38,6 +43,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - uses: cachix/cachix-action@v17
+        if: ${{ vars.CACHIX_ENABLED == 'true' }}
         with:
           name: saniwalens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -52,7 +58,13 @@ jobs:
   # Built from the archive GitHub serves for the commit rather than from the
   # checkout: only the archive has VERSION filled in, so only its build is the
   # one `nix run github:armaniacs/saniwalens` looks up in the cache.
+  # Skipped unless the CACHIX_ENABLED repo variable is 'true' (set it together
+  # with the CACHIX_AUTH_TOKEN secret when a Cachix cache is ready): the
+  # reusable build pushes to the cache, which needs the token, and there is
+  # nothing to pull from an empty cache. The `targets` matrix below still
+  # proves every release target.
   build:
+    if: ${{ vars.CACHIX_ENABLED == 'true' }}
     uses: lambdalisue/nix-github-release/.github/workflows/build.yml@v0.1.0
     with:
       cachix-cache: saniwalens
