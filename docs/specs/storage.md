@@ -368,7 +368,11 @@ ignores the fingerprint skip, re-ingests every transcript once (replace, per
 above, so this is safe to repeat), and stamps the new value. Bump it whenever
 extraction or classification changes what an *unchanged* transcript yields. It is
 deliberately not the crate version — a release that changes no analysis should not
-cost every user a full re-analyze.
+cost every user a full re-analyze. The Claude Code pair lives with its mapping in
+`adapter::transcript` (`CLAUDE_ANALYZER_META_KEY` / `CLAUDE_ANALYZER_VERSION`);
+each other harness carries its own beside its own mapping (`harness.md`), and
+`Store::is_analyzer_current(key, version)` compares whatever it is handed — the
+store owns no harness's key.
 
 Invalidation only recovers what the transcript actually holds. Where a signal was
 never recorded at all, the contract remains that a reader **reports the gap or

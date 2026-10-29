@@ -106,6 +106,15 @@ upstream field or moving a config file changes the adapter's mapping, nothing
 downstream. This boundary is enforced by `.claude/rules/format-isolation.md`; a
 format change whose diff escapes the adapter is a boundary bug.
 
+The per-harness routine that walks this pipeline sits behind one seam:
+`Harness::analyze` (`adapter::harness`) dispatches to each harness's own module
+— `adapter::claude`, `adapter::opencode`, `adapter::kilocode` — which owns that
+harness's input route, fingerprinting, and extraction wiring, and hands rows to
+`Store::ingest` (the store's API, never SQL). The analyzer-version key each
+harness stamps lives beside its mapping, and the store compares whatever pair it
+is handed. A new harness therefore adds a variant and a module; the shell does
+not change (`harness.md`).
+
 ### Why a pure core
 
 The tool's value is its analysis logic — event boundaries, the compaction-safe

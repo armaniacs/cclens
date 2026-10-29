@@ -77,15 +77,9 @@ pub fn config_file_path(config_home: Option<&Path>, home: Option<&str>) -> Optio
 }
 
 /// Counters from one analyze run, for the command's summary line and the
-/// freshness header on auto-refreshing reads.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AnalyzeStats {
-    pub sessions: usize,
-    pub skipped: usize,
-    pub spans_total: usize,
-    pub surface_count: usize,
-    pub denials: usize,
-}
+/// freshness header on auto-refreshing reads. Owned by the analyze seam
+/// (`adapter::harness`), re-exported here for the shell's imports.
+pub use crate::adapter::harness::AnalyzeStats;
 
 /// One invocation's resolved world: which harness, which store file, and the
 /// opened, harness-guarded store. Every command builds exactly this and

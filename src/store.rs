@@ -16,16 +16,6 @@ use crate::core::surface::Surface;
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
 
-/// The `meta` key holding the analysis semantics a store's rows were built with.
-const ANALYZER_META_KEY: &str = "analyzer_version";
-
-/// The analysis semantics this build produces. **Bump it whenever extraction or
-/// classification changes what an unchanged transcript yields** — that is the
-/// only way rows behind the incremental-ingest skip get rebuilt. It is not the
-/// crate version: a release that changes no analysis should not force everyone
-/// through a full re-analyze.
-const ANALYZER_VERSION: &str = "6";
-
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
@@ -1261,14 +1251,19 @@ impl Store {
     /// everything once (`docs/specs/storage.md`). "Everything" means every
     /// transcript still on disk — rows whose source file is gone can never be
     /// re-derived, so they stay as last extracted.
-    pub fn is_analyzer_current(&self) -> Result<bool> {
-        Ok(self.meta(ANALYZER_META_KEY)?.as_deref() == Some(ANALYZER_VERSION))
+    ///
+    /// Which `key`/`version` pair a harness uses is the harness's own business
+    /// (`adapter::transcript` for Claude Code, `adapter::opencode`,
+    /// `adapter::kilocode`); the store only compares what it was handed, so it
+    /// stays harness-agnostic.
+    pub fn is_analyzer_current(&self, key: &str, version: &str) -> Result<bool> {
+        Ok(self.meta(key)?.as_deref() == Some(version))
     }
 
     /// Stamp the store with the analysis semantics its rows were produced by.
     /// Call once a full analyze run has completed.
-    pub fn record_analyzer_version(&mut self) -> Result<()> {
-        self.set_meta(ANALYZER_META_KEY, ANALYZER_VERSION)
+    pub fn record_analyzer_version(&mut self, key: &str, version: &str) -> Result<()> {
+        self.set_meta(key, version)
     }
 
     /// Whether a source file's `(mtime, size)` matches its recorded ingest
@@ -1607,6 +1602,12 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
 mod tests {
     use super::*;
     use crate::core::surface::{LoadMode, Scope};
+
+    /// The store is agnostic to which analysis-semantics pair a harness
+    /// stamps, so the tests use their own — nothing here depends on a real
+    /// harness's key or version.
+    const TEST_ANALYZER_KEY: &str = "test_analyzer_version";
+    const TEST_ANALYZER_VERSION: &str = "1";
 
     /// Permissions are the reason this test and the next one work on a real
     /// temp directory instead of `Store::in_memory`: the default store path
@@ -2373,12 +2374,16 @@ mod tests {
             .execute_batch("DROP TABLE subagent_runs")
             .unwrap();
         // Stamped by a build that predates subagent extraction.
-        store.set_meta(ANALYZER_META_KEY, "1").unwrap();
+        store.set_meta(TEST_ANALYZER_KEY, "0").unwrap();
 
         let store = Store::from_connection(store.conn).unwrap();
 
         assert!(table_exists(&store.conn, "subagent_runs").unwrap());
-        assert!(!store.is_analyzer_current().unwrap());
+        assert!(
+            !store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2389,10 +2394,16 @@ mod tests {
         store
             .record_ingested_file("/tmp/example/s1.jsonl", 1, 2)
             .unwrap();
-        store.record_analyzer_version().unwrap();
+        store
+            .record_analyzer_version(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+            .unwrap();
         let store = Store::from_connection(store.conn).unwrap();
 
-        assert!(store.is_analyzer_current().unwrap());
+        assert!(
+            store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
         assert!(store.is_ingested("/tmp/example/s1.jsonl", 1, 2).unwrap());
     }
 
@@ -2644,11 +2655,25 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         // A store written by an older analyzer (or none at all) is stale, so
         // `analyze` re-ingests even the transcripts whose fingerprint matches.
-        assert!(!store.is_analyzer_current().unwrap());
-        store.set_meta(ANALYZER_META_KEY, "0").unwrap();
-        assert!(!store.is_analyzer_current().unwrap());
-        store.record_analyzer_version().unwrap();
-        assert!(store.is_analyzer_current().unwrap());
+        assert!(
+            !store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
+        store.set_meta(TEST_ANALYZER_KEY, "0").unwrap();
+        assert!(
+            !store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
+        store
+            .record_analyzer_version(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+            .unwrap();
+        assert!(
+            store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
     }
 
     #[test]

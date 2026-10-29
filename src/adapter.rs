@@ -3,6 +3,7 @@
 //! the rest of the crate never sees a Claude Code field name. See
 //! `docs/specs/architecture.md` and `.claude/rules/format-isolation.md`.
 
+pub mod claude;
 pub mod config;
 pub mod config_file;
 pub mod harness;

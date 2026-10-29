@@ -191,9 +191,31 @@ opencode output never claims to be Claude Code's:
 Static `--help` texts still describe the Claude Code defaults; per-harness
 help generation is out of scope.
 
+## The analyze seam — `Harness::analyze`
+
+`analyze` is dispatched exactly once, on the harness:
+
+- `Harness::analyze` (`adapter::harness`) is the only dispatch. Each arm calls
+  the matching adapter module's `analyze` (`adapter::claude`,
+  `adapter::opencode`, `adapter::kilocode`), which owns input discovery,
+  fingerprint skipping, extraction wiring, and the store hand-off for that
+  harness. `cli.rs` guards the store against a cross-harness write and then
+  calls the seam — it names no harness and carries no dispatch arm.
+- The input-route defaults resolve inside that module: the projects directory
+  (Claude Code), the opencode database file, the kilocode tasks directory.
+  `--projects` still overrides whatever the harness resolves (the top of this
+  spec), and the resolved root is recorded in `meta.projects_dir` unchanged.
+- Each harness's analyzer-version key sits beside its mapping —
+  `adapter::transcript::CLAUDE_ANALYZER_META_KEY` / `CLAUDE_ANALYZER_VERSION`,
+  `OPENCODE_ANALYZER_*`, `KILOCODE_ANALYZER_*`. The store's invalidation check
+  takes the `(key, version)` it is given, so no harness's key lives in
+  `store.rs` and a new harness adds its own without touching the store.
+
 ## Forward compatibility
 
 A new harness adds: a `Harness` variant, its default input root and store
-name here, its format spec, its adapter module, and its `run_analyze_*`
-ingestion. Nothing in the Claude Code path moves — that immobility is the
-contract this spec protects.
+name here, its format spec, and an adapter module carrying its analyze routine
+behind `Harness::analyze` — input route, fingerprinting, and its
+analyzer-version key included, so `cli.rs` gains no dispatch arm. Nothing in
+the Claude Code path moves — that immobility is the contract this spec
+protects.

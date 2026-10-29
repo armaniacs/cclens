@@ -6,6 +6,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
+
+use crate::adapter::harness::home_dir;
 use crate::core::surface::{LoadMode, Scope, Surface};
 
 /// The Claude Code config root: `$CLAUDE_CONFIG_DIR` when it names a non-empty
@@ -526,6 +529,22 @@ fn read_markdown_files(dir: &Path) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// The Claude Code config root for this run: the environment read that
+/// `adapter::config::claude_config_dir` deliberately does not do, plus the
+/// advice to show when neither variable names one.
+pub(crate) fn claude_home() -> Result<PathBuf> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    // What can go wrong differs by platform, so the advice does too: only
+    // Windows requires the value to name a real directory, and telling a unix
+    // user otherwise sends them looking for a problem they do not have.
+    claude_config_dir(config_dir.as_deref(), home_dir().map(Path::new)).with_context(|| {
+        if cfg!(windows) {
+            "set CLAUDE_CONFIG_DIR, or HOME/USERPROFILE to an existing directory"
+        } else {
+            "set CLAUDE_CONFIG_DIR or HOME"
+        }
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

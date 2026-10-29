@@ -2,7 +2,10 @@
 //! files live. This module owns the per-harness *locations* (upstream
 //! conventions), never the formats themselves. See `docs/specs/harness.md`.
 
+use std::fs;
 use std::path::{Path, PathBuf};
+
+use anyhow::Result;
 
 /// The agent harness one store holds. One store never mixes harnesses, so
 /// this labels a whole run — never a row.
@@ -13,7 +16,31 @@ pub enum Harness {
     Kilocode,
 }
 
+/// Counters from one analyze run, for the command's summary line and the
+/// freshness header on auto-refreshing reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnalyzeStats {
+    pub sessions: usize,
+    pub skipped: usize,
+    pub spans_total: usize,
+    pub surface_count: usize,
+    pub denials: usize,
+}
+
 impl Harness {
+    /// Analyze this harness's input into `db` — the one seam the `analyze`
+    /// command and the views' auto-refresh call. The per-harness routines
+    /// live beside their formats (`adapter::claude`, `adapter::opencode`,
+    /// `adapter::kilocode`), so a new harness is a variant plus its adapter
+    /// module and `cli.rs` does not change (`docs/specs/harness.md`).
+    pub fn analyze(&self, input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+        match self {
+            Harness::Claude => crate::adapter::claude::analyze(input, db),
+            Harness::Opencode => crate::adapter::opencode::analyze(input, db),
+            Harness::Kilocode => crate::adapter::kilocode::analyze(input, db),
+        }
+    }
+
     /// Parse `--harness`. `None` for anything else, so the caller can fail
     /// with the valid list.
     pub fn parse(value: &str) -> Option<Self> {
@@ -243,6 +270,41 @@ impl Harness {
     }
 }
 
+/// The user's home directory, resolved once per run.
+///
+/// `HOME` is preferred, so unix behaves exactly as before; Windows does not set
+/// it, hence `USERPROFILE`. The wrinkle is that a Windows shell like Git Bash
+/// *does* export `HOME` — as a POSIX path (`/c/Users/…`) that a native binary
+/// cannot resolve. Taking it at face value would send every lookup to a
+/// directory that does not exist and report "no transcripts" instead of an
+/// error, so on Windows a candidate has to name a real directory to win. The
+/// check stays off on unix, where a home that does not exist is worth surfacing
+/// as itself rather than silently falling through to another variable.
+pub(crate) fn home_dir() -> Option<&'static str> {
+    static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        ["HOME", "USERPROFILE"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+            .find(|value| !cfg!(windows) || Path::new(value).is_dir())
+    })
+    .as_deref()
+}
+
+/// A file's `(mtime epoch secs, size)` — the cheap change detector for
+/// incremental ingest. `None` when the file cannot be stat'ed (it is then
+/// ingested unconditionally and not recorded).
+pub(crate) fn file_fingerprint(path: &Path) -> Option<(i64, i64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some((mtime, meta.len() as i64))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
