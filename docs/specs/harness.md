@@ -210,6 +210,13 @@ help generation is out of scope.
   `OPENCODE_ANALYZER_*`, `KILOCODE_ANALYZER_*`. The store's invalidation check
   takes the `(key, version)` it is given, so no harness's key lives in
   `store.rs` and a new harness adds its own without touching the store.
+- The surface catalog rides the same seam: `catalog_surfaces(harness, roots)`
+  (`adapter::harness`) is the single traversal — it resolves that harness's
+  config root, builds each `Scope`, owns the symlink-dedup `seen` set, and
+  gates roots on disk. Each harness contributes only its **site rows**
+  (`global_sites` / `project_sites`: a path plus a loader), so a new config
+  site or surface kind is data, not a traversal edit
+  (`config-format.md`).
 
 ## Forward compatibility
 

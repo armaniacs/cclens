@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::adapter::config::{
-    claude_home, read_agent_surfaces, read_claude_md_surfaces, read_mcp_server_surfaces,
-    read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
+use crate::adapter::config::claude_home;
+use crate::adapter::harness::{
+    AnalyzeStats, Harness, Site, catalog_surfaces, file_fingerprint, load_agents, load_claude_md,
+    load_mcp, load_rules, load_skills,
 };
-use crate::adapter::harness::{AnalyzeStats, Harness, file_fingerprint, home_dir};
 use crate::adapter::transcript::{
     CLAUDE_ANALYZER_META_KEY, CLAUDE_ANALYZER_VERSION, count_permission_denials,
     extract_prompt_pointers, extract_tool_errors, extract_work_events, parse_session,
@@ -25,7 +25,6 @@ use crate::adapter::transcript::{
 };
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
 use crate::core::subagent::{SubagentRun, link_runs};
-use crate::core::surface::{Scope, Surface};
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
 use crate::store::{IngestBatch, OpenMode, SessionMeta, Store};
 
@@ -93,23 +92,39 @@ fn main_transcripts(projects: &Path) -> Result<Vec<PathBuf>> {
     Ok(transcripts)
 }
 
-/// Read all installed config (global scope) into one surface list.
-fn read_global_surfaces() -> Result<Vec<Surface>> {
-    let config_dir = claude_home()?;
-    let scope = Scope::Global;
-    let mut surfaces = read_skill_surfaces(&config_dir.join("skills"), &scope);
-    surfaces.extend(read_rule_surfaces(&config_dir.join("rules"), &scope));
-    surfaces.extend(read_agent_surfaces(&config_dir.join("agents"), &scope));
-    surfaces.extend(read_mcp_server_surfaces(
-        &config_dir.join("mcp.json"),
-        &scope,
-    ));
-    surfaces.extend(read_claude_md_surfaces(
-        &[(&config_dir.join("CLAUDE.md"), "global")],
-        &scope,
-        home_dir().map(Path::new),
-    ));
-    Ok(surfaces)
+/// This harness's global config sites, as data: the shared traversal
+/// (`adapter::harness::catalog_surfaces`) loads them under `Scope::Global`.
+/// Adding a kind is a loader and a row here — the traversal never changes.
+pub(crate) fn global_sites(config_dir: &Path) -> Vec<Site> {
+    vec![
+        Site::new(config_dir.join("skills"), load_skills),
+        Site::new(config_dir.join("rules"), load_rules),
+        Site::new(config_dir.join("agents"), load_agents),
+        Site::new(config_dir.join("mcp.json"), load_mcp),
+        Site::with_payload(
+            config_dir.to_path_buf(),
+            load_claude_md,
+            &[("CLAUDE.md", "global")],
+        ),
+    ]
+}
+
+/// This harness's per-project config sites: `<root>/.claude` mirrored, plus
+/// the in-repo `.mcp.json` and the `CLAUDE.md` / `AGENTS.md` pair (CLAUDE.md
+/// first: a repo shipping `AGENTS.md` as a symlink to it reports the first
+/// loader that resolves).
+pub(crate) fn project_sites(root: &Path) -> Vec<Site> {
+    vec![
+        Site::new(root.join(".claude").join("skills"), load_skills),
+        Site::new(root.join(".claude").join("rules"), load_rules),
+        Site::new(root.join(".claude").join("agents"), load_agents),
+        Site::new(root.join(".mcp.json"), load_mcp),
+        Site::with_payload(
+            root.to_path_buf(),
+            load_claude_md,
+            &[("CLAUDE.md", "CLAUDE.md"), ("AGENTS.md", "AGENTS.md")],
+        ),
+    ]
 }
 
 /// Fold a worktree checkout's path onto its parent repository, mirroring
@@ -231,16 +246,9 @@ pub fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     // Catalog the installed config — global scope plus every known project root
     // that still exists on disk — so usage joins against what is installed.
     let config_dir = claude_home()?;
-    let mut surfaces = read_global_surfaces()?;
-    for (root, project) in store.session_roots()? {
-        if Path::new(&root).is_dir() {
-            surfaces.extend(read_project_surfaces(
-                Path::new(&root),
-                &project,
-                home_dir().map(Path::new),
-            ));
-        }
-    }
+    // The traversal (scope building, dedup, root gating) lives in
+    // `catalog_surfaces`; this module supplies only the site rows.
+    let surfaces = catalog_surfaces(Harness::Claude, &store.session_roots()?)?;
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 

@@ -17,9 +17,14 @@ both and records the scope on each surface — `Scope::Project` carries the
 owning project's normalized slug, since many projects coexist in one catalog
 (`storage.md`). Which project roots get scanned is driven by the *sessions*:
 `analyze` collects the distinct real session roots (`session-format.md`, the
-records' `cwd`, worktree folded onto the parent checkout) and scans each root
-that still exists on disk (`read_project_surfaces` in `config.rs`); a root that
-was deleted since its sessions ran simply contributes no project surfaces.
+records' `cwd`, worktree folded onto the parent checkout) and hands them to the
+one traversal, `catalog_surfaces(harness, roots)` (`adapter::harness`), which
+builds each scope, owns the symlink-dedup set, and skips a root that was deleted
+since its sessions ran. What a harness scans is its **site rows** — a path plus
+a loader (`Site`, listed per harness as `global_sites` / `project_sites`) — so a
+new surface kind is a row and a loader, never an edit to that traversal;
+`read_project_surfaces` in `config.rs` remains the direct single-root entry
+point the tests drive.
 `~/.claude` throughout this document means `$CLAUDE_CONFIG_DIR` when that
 variable names a non-empty path, because Claude Code relocates the whole tree
 under it (`claude_config_dir` in `config.rs`); an empty value is treated as unset.

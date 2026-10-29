@@ -15,7 +15,10 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::adapter::harness::{AnalyzeStats, Harness, file_fingerprint, home_dir};
+use crate::adapter::harness::{
+    AnalyzeStats, Harness, Site, catalog_surfaces, file_fingerprint, home_dir, load_agents,
+    load_claude_md, load_commands, load_kilo_instructions, load_skills_deduped,
+};
 use crate::adapter::transcript::{ToolError, WorkEvent};
 use crate::core::friction::classify_error;
 use crate::core::path::basename;
@@ -523,105 +526,82 @@ pub fn extract_work_events(conversation: &str) -> Vec<WorkEvent> {
     events
 }
 
-/// Read the global kilo config into surfaces: `command/` and `agent/` under
-/// the config dir, the skills sites (kilo-native first, then the shared homes
-/// kilo also loads), the global `AGENTS.md`, and the files in `kilo.json`'s
-/// `instructions[]` — kilo's own addition, the way `kilo.json` loads
-/// always-on instruction files (`docs/specs/config-format-kilocode.md`).
-/// MCP and permissions stay out of v1: the `mcp` key is real but kilocode
-/// emitted zero `mcp__` tool calls, and the permission table has no denial
-/// marker to join, so either catalog would read "unused" — a wedge the
-/// catalog manufactures. `seen` carries the canonical definition paths
-/// already catalogued, so the project pass skips the same files reached
-/// through a project symlink.
+/// The kilocode global config sites, as data (`adapter::harness::Site`).
+pub(crate) fn global_sites(config_dir: &Path, home: Option<&Path>) -> Vec<Site> {
+    let mut sites = vec![
+        Site::new(config_dir.join("command"), load_commands),
+        Site::new(config_dir.join("agent"), load_agents),
+        Site::new(config_dir.join("skills"), load_skills_deduped),
+    ];
+    if let Some(home) = home {
+        sites.push(Site::new(
+            home.join(".claude").join("skills"),
+            load_skills_deduped,
+        ));
+        sites.push(Site::new(
+            home.join(".agents").join("skills"),
+            load_skills_deduped,
+        ));
+    }
+    sites.push(Site::with_payload(
+        config_dir.to_path_buf(),
+        load_claude_md,
+        &[("AGENTS.md", "AGENTS.md")],
+    ));
+    sites.push(Site::new(
+        config_dir.join("kilo.json"),
+        load_kilo_instructions,
+    ));
+    sites
+}
+
+/// Read all installed config (global scope) into one surface list — the
+/// direct entry point the catalog tests drive; `analyze` goes through
+/// `adapter::harness::catalog_surfaces`. `seen` dedups skill definitions
+/// across sites.
 pub fn read_global_surfaces(
     config_dir: &Path,
     home: Option<&Path>,
     seen: &mut HashSet<PathBuf>,
 ) -> Vec<Surface> {
-    let scope = Scope::Global;
-    let mut surfaces =
-        crate::adapter::config::read_command_surfaces(&config_dir.join("command"), &scope);
-    surfaces.extend(crate::adapter::config::read_agent_surfaces(
-        &config_dir.join("agent"),
-        &scope,
-    ));
-    crate::adapter::config::add_skill_site(&config_dir.join("skills"), &scope, seen, &mut surfaces);
-    if let Some(home) = home {
-        crate::adapter::config::add_skill_site(
-            &home.join(".claude").join("skills"),
-            &scope,
-            seen,
-            &mut surfaces,
-        );
-        crate::adapter::config::add_skill_site(
-            &home.join(".agents").join("skills"),
-            &scope,
-            seen,
-            &mut surfaces,
-        );
-    }
-    let agents_md = config_dir.join("AGENTS.md");
-    surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
-        &[(&agents_md, "AGENTS.md")],
-        &scope,
-        home,
-    ));
-    surfaces.extend(read_kilo_instructions(
-        &config_dir.join("kilo.json"),
-        config_dir,
-        &scope,
-        home,
-    ));
-    surfaces
+    crate::adapter::harness::load_sites(&global_sites(config_dir, home), &Scope::Global, home, seen)
 }
 
-/// Read one project's kilo config into surfaces: `.kilo/command/`,
-/// `.kilo/agent/`, the three skills sites under the root, `AGENTS.md` with its
-/// `@import`s, the project `.kilorules` (the rules file kilo loads always-on),
-/// and the files in the project `kilo.json`'s `instructions[]`.
-/// `home` resolves a `~/` import; `seen` skips skill definitions already
-/// catalogued from the global sites.
+/// The kilocode per-project config sites, as data: the `.kilo` pair, the
+/// three skills sites, `AGENTS.md` with the `.kilorules` file, and the
+/// project `kilo.json`'s `instructions[]`.
+pub(crate) fn project_sites(root: &Path) -> Vec<Site> {
+    let kilo = root.join(".kilo");
+    vec![
+        Site::new(kilo.join("command"), load_commands),
+        Site::new(kilo.join("agent"), load_agents),
+        Site::new(kilo.join("skills"), load_skills_deduped),
+        Site::new(root.join(".claude").join("skills"), load_skills_deduped),
+        Site::new(root.join(".agents").join("skills"), load_skills_deduped),
+        Site::with_payload(
+            root.to_path_buf(),
+            load_claude_md,
+            &[("AGENTS.md", "AGENTS.md"), (".kilorules", ".kilorules")],
+        ),
+        Site::new(root.join("kilo.json"), load_kilo_instructions),
+    ]
+}
+
+/// Read one project's kilo config into surfaces — the direct entry point the
+/// catalog tests drive (see `read_global_surfaces`). `seen` skips skill
+/// definitions already catalogued from the global sites.
 pub fn read_project_surfaces(
     root: &Path,
     project: &str,
     home: Option<&Path>,
     seen: &mut HashSet<PathBuf>,
 ) -> Vec<Surface> {
-    let scope = Scope::Project(project.to_string());
-    let kilo = root.join(".kilo");
-    let mut surfaces = crate::adapter::config::read_command_surfaces(&kilo.join("command"), &scope);
-    surfaces.extend(crate::adapter::config::read_agent_surfaces(
-        &kilo.join("agent"),
-        &scope,
-    ));
-    crate::adapter::config::add_skill_site(&kilo.join("skills"), &scope, seen, &mut surfaces);
-    crate::adapter::config::add_skill_site(
-        &root.join(".claude").join("skills"),
-        &scope,
-        seen,
-        &mut surfaces,
-    );
-    crate::adapter::config::add_skill_site(
-        &root.join(".agents").join("skills"),
-        &scope,
-        seen,
-        &mut surfaces,
-    );
-    let agents_md = root.join("AGENTS.md");
-    let kilorules = root.join(".kilorules");
-    surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
-        &[(&agents_md, "AGENTS.md"), (&kilorules, ".kilorules")],
-        &scope,
+    crate::adapter::harness::load_sites(
+        &project_sites(root),
+        &Scope::Project(project.to_string()),
         home,
-    ));
-    surfaces.extend(read_kilo_instructions(
-        &root.join("kilo.json"),
-        root,
-        &scope,
-        home,
-    ));
-    surfaces
+        seen,
+    )
 }
 
 /// The files in `kilo.json`'s `instructions[]`, as always-on instruction
@@ -632,7 +612,7 @@ pub fn read_project_surfaces(
 /// `base_dir` (the config file's directory at the global scope, the project
 /// root at the project scope); absolute paths pass through. A missing config,
 /// a missing key, or a non-array yields nothing.
-fn read_kilo_instructions(
+pub(crate) fn read_kilo_instructions(
     config_path: &Path,
     base_dir: &Path,
     scope: &Scope,
@@ -809,19 +789,7 @@ pub fn analyze(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     // `docs/specs/config-format-kilocode.md`), so their live usage still
     // shows as orphaned rows in `inventory`.
     let config_dir = kilo_home()?;
-    let home = home_dir().map(Path::new);
-    let mut seen = std::collections::HashSet::new();
-    let mut surfaces = read_global_surfaces(&config_dir, home, &mut seen);
-    for (root, project) in store.session_roots()? {
-        if Path::new(&root).is_dir() {
-            surfaces.extend(read_project_surfaces(
-                Path::new(&root),
-                &project,
-                home,
-                &mut seen,
-            ));
-        }
-    }
+    let surfaces = catalog_surfaces(Harness::Kilocode, &store.session_roots()?)?;
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 
@@ -842,7 +810,7 @@ pub fn analyze(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
 
 /// The kilo config root for this run: the environment read that
 /// `adapter::harness::kilocode_config_dir` deliberately does not do.
-fn kilo_home() -> Result<PathBuf> {
+pub(crate) fn kilo_home() -> Result<PathBuf> {
     let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     Harness::kilocode_config_dir(config_home.as_deref(), home_dir().map(Path::new))
         .context("set XDG_CONFIG_HOME or HOME")

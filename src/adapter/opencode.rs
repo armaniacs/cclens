@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::adapter::harness::{AnalyzeStats, Harness, home_dir};
+use crate::adapter::harness::{
+    AnalyzeStats, Harness, Site, SiteCtx, catalog_surfaces, home_dir, load_claude_md,
+    load_skills_deduped,
+};
 use crate::adapter::transcript::{ToolError, WorkEvent};
 use crate::core::friction::classify_error;
 use crate::core::path::basename;
@@ -450,42 +453,71 @@ fn read_markdown_surfaces(
         .collect()
 }
 
-/// Read the global opencode config into surfaces: `command/` and `agent/`
-/// under the config dir, plus the three global skills sites the docs name
-/// (opencode-native first, then the compatible homes opencode also loads).
-/// (No global `AGENTS.md` — whether opencode loads one is unverified; see
-/// `docs/specs/config-format-opencode.md`.) `seen` carries the canonical
-/// definition paths already catalogued, so the project pass skips the same
-/// files reached through a project symlink.
+/// The opencode global config sites, as data (`adapter::harness::Site`):
+/// opencode-native first, then the compatible homes opencode also loads. No
+/// global `AGENTS.md` — whether opencode loads one is unverified
+/// (`docs/specs/config-format-opencode.md`).
+pub(crate) fn global_sites(config_dir: &Path, home: Option<&Path>) -> Vec<Site> {
+    let mut sites = vec![
+        Site::new(config_dir.join("command"), load_commands),
+        Site::new(config_dir.join("agent"), load_agents),
+        Site::new(config_dir.join("skills"), load_skills_deduped),
+    ];
+    if let Some(home) = home {
+        sites.push(Site::new(
+            home.join(".claude").join("skills"),
+            load_skills_deduped,
+        ));
+        sites.push(Site::new(
+            home.join(".agents").join("skills"),
+            load_skills_deduped,
+        ));
+    }
+    sites
+}
+
+/// Loaders for opencode's own `command/` and `agent/` readers — the format is
+/// opencode's, so the row names these, not the shared config readers.
+fn load_commands(site: &Site, scope: &Scope, _ctx: &mut SiteCtx) -> Vec<Surface> {
+    read_command_surfaces(&site.path, scope)
+}
+
+fn load_agents(site: &Site, scope: &Scope, _ctx: &mut SiteCtx) -> Vec<Surface> {
+    read_agent_surfaces(&site.path, scope)
+}
+
+/// Read all installed config (global scope) into one surface list — the
+/// direct entry point the catalog tests drive; `analyze` goes through
+/// `adapter::harness::catalog_surfaces`, which loads the same rows under the
+/// scope it builds. `seen` dedups skill definitions across sites.
 pub fn read_global_surfaces(
     config_dir: &Path,
     home: Option<&Path>,
     seen: &mut HashSet<PathBuf>,
 ) -> Vec<Surface> {
-    let scope = Scope::Global;
-    let mut surfaces = read_command_surfaces(&config_dir.join("command"), &scope);
-    surfaces.extend(read_agent_surfaces(&config_dir.join("agent"), &scope));
-    crate::adapter::config::add_skill_site(&config_dir.join("skills"), &scope, seen, &mut surfaces);
-    if let Some(home) = home {
-        crate::adapter::config::add_skill_site(
-            &home.join(".claude").join("skills"),
-            &scope,
-            seen,
-            &mut surfaces,
-        );
-        crate::adapter::config::add_skill_site(
-            &home.join(".agents").join("skills"),
-            &scope,
-            seen,
-            &mut surfaces,
-        );
-    }
-    surfaces
+    crate::adapter::harness::load_sites(&global_sites(config_dir, home), &Scope::Global, home, seen)
 }
 
-/// Read one project's opencode config into surfaces: `.opencode/command/`,
-/// `.opencode/agent/`, the three skills sites under the root, and `AGENTS.md`
-/// with its `@import`s. `home` resolves a `~/` import; `seen` skips skill
+/// The opencode per-project config sites, as data: the `.opencode` pair, the
+/// three skills sites under the root, and the repo `AGENTS.md`.
+pub(crate) fn project_sites(root: &Path) -> Vec<Site> {
+    let opencode = root.join(".opencode");
+    vec![
+        Site::new(opencode.join("command"), load_commands),
+        Site::new(opencode.join("agent"), load_agents),
+        Site::new(opencode.join("skills"), load_skills_deduped),
+        Site::new(root.join(".claude").join("skills"), load_skills_deduped),
+        Site::new(root.join(".agents").join("skills"), load_skills_deduped),
+        Site::with_payload(
+            root.to_path_buf(),
+            load_claude_md,
+            &[("AGENTS.md", "AGENTS.md")],
+        ),
+    ]
+}
+
+/// Read one project's opencode config into surfaces — the direct entry point
+/// the catalog tests drive (see `read_global_surfaces`). `seen` skips skill
 /// definitions already catalogued from the global sites.
 pub fn read_project_surfaces(
     root: &Path,
@@ -493,30 +525,12 @@ pub fn read_project_surfaces(
     home: Option<&Path>,
     seen: &mut HashSet<PathBuf>,
 ) -> Vec<Surface> {
-    let scope = Scope::Project(project.to_string());
-    let opencode = root.join(".opencode");
-    let mut surfaces = read_command_surfaces(&opencode.join("command"), &scope);
-    surfaces.extend(read_agent_surfaces(&opencode.join("agent"), &scope));
-    crate::adapter::config::add_skill_site(&opencode.join("skills"), &scope, seen, &mut surfaces);
-    crate::adapter::config::add_skill_site(
-        &root.join(".claude").join("skills"),
-        &scope,
-        seen,
-        &mut surfaces,
-    );
-    crate::adapter::config::add_skill_site(
-        &root.join(".agents").join("skills"),
-        &scope,
-        seen,
-        &mut surfaces,
-    );
-    let agents_md = root.join("AGENTS.md");
-    surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
-        &[(&agents_md, "AGENTS.md")],
-        &scope,
+    crate::adapter::harness::load_sites(
+        &project_sites(root),
+        &Scope::Project(project.to_string()),
         home,
-    ));
-    surfaces
+        seen,
+    )
 }
 
 /// Add one skills site's `skills/*/SKILL.md` surfaces, deduped by canonical
@@ -642,7 +656,7 @@ fn default_opencode_db() -> Result<PathBuf> {
 
 /// The opencode config root for this run: the environment read that
 /// `adapter::harness::opencode_config_dir` deliberately does not do.
-fn opencode_home() -> Result<PathBuf> {
+pub(crate) fn opencode_home() -> Result<PathBuf> {
     let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     Harness::opencode_config_dir(config_home.as_deref(), home_dir().map(Path::new))
         .context("set XDG_CONFIG_HOME or HOME")
@@ -785,19 +799,7 @@ pub fn analyze(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     // `docs/specs/config-format-opencode.md`), so their live usage still
     // shows as orphaned rows in `inventory`.
     let config_dir = opencode_home()?;
-    let home = home_dir().map(Path::new);
-    let mut seen = std::collections::HashSet::new();
-    let mut surfaces = read_global_surfaces(&config_dir, home, &mut seen);
-    for (root, project) in store.session_roots()? {
-        if Path::new(&root).is_dir() {
-            surfaces.extend(read_project_surfaces(
-                Path::new(&root),
-                &project,
-                home,
-                &mut seen,
-            ));
-        }
-    }
+    let surfaces = catalog_surfaces(Harness::Opencode, &store.session_roots()?)?;
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 
