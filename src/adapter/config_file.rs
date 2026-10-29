@@ -198,6 +198,15 @@ db = "work.db"
     }
 
     #[test]
+    fn tilde_db_is_not_expanded() {
+        // `~` is data, not a home reference: it joins the config directory
+        // like any other relative path instead of expanding.
+        let file: FileConfig = toml::from_str(r#"db = "~/.x.db""#).unwrap();
+        let resolved = resolve(None, None, None, Some(&file), Some(&example_dir())).unwrap();
+        assert_eq!(resolved.db, Some(example_dir().join("~/.x.db")));
+    }
+
+    #[test]
     fn explicit_relative_db_stays_cwd_relative() {
         // An explicit `--db` is taken as is, even when relative — only the
         // file's own entries rebase onto the config directory.
