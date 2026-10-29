@@ -438,14 +438,14 @@ fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
 /// the sessions it seeds are recognizable in the store it feeds.
 fn launch_command(
     harness: &Harness,
-) -> Option<(&'static str, &'static [&'static str], optimize_mod::RunMode)> {
+) -> (&'static str, &'static [&'static str], optimize_mod::RunMode) {
     match harness {
-        Harness::Claude => Some(("claude", &[], optimize_mod::RunMode::Interactive)),
-        Harness::Opencode => Some((
+        Harness::Claude => ("claude", &[], optimize_mod::RunMode::Interactive),
+        Harness::Opencode => (
             "opencode",
             &["run", "--format", "json", "--title", "saniwalens optimize"],
             optimize_mod::RunMode::Headless,
-        )),
+        ),
         // The `kilo` binary is the measured agent CLI (Homebrew), and kilo is
         // an OpenCode fork whose TUI takes a prompt: `kilo [project] --prompt
         // <prompt>` opens the interactive session on the pointer prompt — the
@@ -454,8 +454,200 @@ fn launch_command(
         // opencode does not, so a headless run would need `--auto` instead).
         // A bare `kilo <text>` positional is treated as a file to open
         // (measured), not a prompt — `--prompt` is the TUI's message surface.
-        Harness::Kilocode => Some(("kilo", &["--prompt"], optimize_mod::RunMode::Interactive)),
+        Harness::Kilocode => ("kilo", &["--prompt"], optimize_mod::RunMode::Interactive),
     }
+}
+
+/// How the briefing reaches the advisor — the three deliveries `optimize`
+/// picks between (`docs/specs/cli.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryMode {
+    Interactive,
+    Headless,
+    Print,
+}
+
+/// `--print` wins over the harness's launch shape.
+fn delivery_mode(print: bool, launch: optimize_mod::RunMode) -> DeliveryMode {
+    if print {
+        DeliveryMode::Print
+    } else {
+        match launch {
+            optimize_mod::RunMode::Interactive => DeliveryMode::Interactive,
+            optimize_mod::RunMode::Headless => DeliveryMode::Headless,
+        }
+    }
+}
+
+/// What gets delivered: the full prompt itself (`--print`), or the rendered
+/// briefing behind a private pointer file whose argv prompt `pointer` builds
+/// once the file's path exists.
+enum DeliveryPayload<'a> {
+    Full(String),
+    Launch {
+        briefing: String,
+        pointer: Box<dyn FnOnce(&Path) -> String + 'a>,
+    },
+}
+
+/// One delivery, assembled: mode, launch shape, payload. Built by `optimize`,
+/// run by `deliver` (`pbi/2026-10-29-06-feat-optimize-delivery-seam.md`).
+pub struct DeliveryPlan<'a> {
+    mode: DeliveryMode,
+    binary: &'static str,
+    leading: &'static [&'static str],
+    harness_name: &'static str,
+    verbose: bool,
+    payload: DeliveryPayload<'a>,
+}
+
+impl<'a> DeliveryPlan<'a> {
+    /// `--print`: the prompt itself, destined for stdout — no process, no
+    /// temp file (`docs/specs/cli.md`: the exception that opts the user into
+    /// seeing the full prompt).
+    pub fn print(prompt: String) -> Self {
+        Self {
+            mode: DeliveryMode::Print,
+            binary: "",
+            leading: &[],
+            harness_name: "",
+            verbose: false,
+            payload: DeliveryPayload::Full(prompt),
+        }
+    }
+
+    /// A launch: the briefing travels behind a private pointer file, and
+    /// `pointer` assembles the argv prompt for that file's path.
+    pub fn launch(
+        binary: &'static str,
+        leading: &'static [&'static str],
+        mode: DeliveryMode,
+        briefing: String,
+        harness_name: &'static str,
+        verbose: bool,
+        pointer: impl FnOnce(&Path) -> String + 'a,
+    ) -> Self {
+        Self {
+            mode,
+            binary,
+            leading,
+            harness_name,
+            verbose,
+            payload: DeliveryPayload::Launch {
+                briefing,
+                pointer: Box::new(pointer),
+            },
+        }
+    }
+}
+
+/// The process side of a launch — the adapter `deliver` runs through, so a
+/// test substitutes a double and asserts the argv instead of spawning.
+pub trait AdvisorLaunch {
+    /// Spawn with stdio inherited: the interactive TUI, and `--verbose`'s raw
+    /// streaming for a headless harness.
+    fn direct(
+        &mut self,
+        binary: &str,
+        leading: &[&str],
+        prompt: &str,
+    ) -> Result<std::process::ExitStatus>;
+
+    /// Spawn headless: the raw stream goes to a private log, the agent's text
+    /// to stdout. Returns the exit status and the log path.
+    fn headless(
+        &mut self,
+        binary: &str,
+        leading: &[&str],
+        prompt: &str,
+    ) -> Result<(std::process::ExitStatus, PathBuf)>;
+}
+
+/// The real process side: an inherited-stdio spawn, or `run_headless`'s
+/// logged pipe.
+struct ProcessAdvisor;
+
+impl AdvisorLaunch for ProcessAdvisor {
+    fn direct(
+        &mut self,
+        binary: &str,
+        leading: &[&str],
+        prompt: &str,
+    ) -> Result<std::process::ExitStatus> {
+        Ok(std::process::Command::new(binary)
+            .args(leading)
+            .arg(prompt)
+            .status()?)
+    }
+
+    fn headless(
+        &mut self,
+        binary: &str,
+        leading: &[&str],
+        prompt: &str,
+    ) -> Result<(std::process::ExitStatus, PathBuf)> {
+        run_headless(binary, leading, prompt)
+    }
+}
+
+/// Deliver `plan` — the one seam between the briefing and the advisor.
+/// Launch modes write the briefing to a private (`0600`) pointer file, hand
+/// the spawn to the `advisor` adapter, and remove the file the moment the run
+/// ends whatever the outcome; `Print` writes the prompt to stdout. The
+/// briefing itself never rides argv — a process argument is world-visible
+/// (`ps`) — and only a data-free pointer does.
+pub fn deliver(plan: DeliveryPlan<'_>, advisor: &mut impl AdvisorLaunch) -> Result<()> {
+    let DeliveryPlan {
+        mode,
+        binary,
+        leading,
+        harness_name,
+        verbose,
+        payload,
+    } = plan;
+    let (prompt, path) = match payload {
+        DeliveryPayload::Full(prompt) => {
+            println!("{prompt}");
+            return Ok(());
+        }
+        DeliveryPayload::Launch { briefing, pointer } => {
+            let path = write_private_tempfile(&briefing).context("write briefing temp file")?;
+            (pointer(&path), path)
+        }
+    };
+
+    let launch_note = || {
+        format!(
+            "launch `{} {}` — is {} installed and on PATH?",
+            binary,
+            leading.join(" ").trim_end(),
+            harness_name
+        )
+    };
+    // Headless harnesses run piped unless --verbose: the raw stream is logged
+    // to a private file and only the agent's text streams on stdout; verbose
+    // keeps the raw streaming by handing the terminal over.
+    let (result, run_log) = if mode == DeliveryMode::Headless && !verbose {
+        match advisor.headless(binary, leading, &prompt) {
+            Ok((status, log)) => (Ok(status), Some(log)),
+            Err(err) => (Err(err), None),
+        }
+    } else {
+        (advisor.direct(binary, leading, &prompt), None)
+    };
+    let _ = fs::remove_file(&path);
+
+    let status = result.with_context(launch_note)?;
+    if !status.success() {
+        match run_log {
+            Some(log) => anyhow::bail!(
+                "{binary} exited with {status} — raw output: {}",
+                log.display()
+            ),
+            None => anyhow::bail!("{binary} exited with {status}"),
+        }
+    }
+    Ok(())
 }
 ///
 /// The briefing carries concrete paths and error excerpts that may be sensitive,
@@ -491,85 +683,42 @@ fn optimize(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| sess.db_path.to_string_lossy().into_owned());
 
-    // The harness copy for every prompt and briefing rendered here — plain
-    // data assembled from the harness, so the core stays harness-agnostic.
-    let copy = optimize_mod::HarnessCopy {
-        agent: sess.harness.display_name(),
-        article: sess.harness.article(),
-        source: sess.harness.source_noun(),
-        raw_source: sess.harness.raw_source(),
-        global_ref: sess.harness.global_config_ref(),
-        project_ref: sess.harness.project_config_ref(),
-        instruction_file: sess.harness.instruction_file(),
-        config_inventory: sess.harness.config_inventory(),
-    };
+    // The harness copy for every prompt and briefing rendered here — the
+    // harness assembles its own (adapter side), so the core stays agnostic.
+    let copy = sess.harness.copy();
+    let (binary, leading, run_mode) = launch_command(&sess.harness);
 
-    if print {
-        println!(
-            "{}",
-            optimize_mod::compose_prompt(&findings, &db_display, filter, &copy)
-        );
-        return Ok(());
-    }
-
-    // The measured launch surfaces are Claude Code and opencode. kilo's
-    // prompt-launch surface is unmeasured — a positional argument is treated
-    // as a file to open (measured), not a prompt — so the launch is refused
-    // and `--print` is the path that hands the briefing over.
-    let Some((binary, leading, mode)) = launch_command(&sess.harness) else {
-        anyhow::bail!(
-            "the {} launch is not supported yet — use --print to get the briefing for pasting into kilo",
-            sess.harness.display_name()
-        );
-    };
-
-    // Sensitive briefing → private temp file; only a data-free pointer on argv.
-    let briefing = optimize_mod::render_briefing(&findings, filter, &copy);
-    let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
-    let prompt = optimize_mod::launch_prompt(
-        &briefing_path.to_string_lossy(),
-        &db_display,
-        filter,
-        &copy,
-        mode,
-    );
-
-    // Hand over the terminal. Headless harnesses run piped: the raw stream is
-    // logged to a private file and only the agent's text (narration, then the
-    // final plan) streams on stdout — the tool dumps stay in the log, and
-    // `--verbose` keeps the old raw streaming. `claude` opens an interactive
-    // TUI on the pointer prompt (stdio inherited, the user takes over). Clean
-    // up the briefing file the moment the run ends, whatever the outcome.
-    let launch_note = || {
-        format!(
-            "launch `{} {}` — is {} installed and on PATH?",
+    // One seam from here: the payload (the full prompt, or the rendered
+    // briefing behind a private pointer file) and the mode are decided, then
+    // `deliver` runs them against the process adapter. `claude` opens an
+    // interactive TUI, `opencode run` goes headless, kilo's TUI takes
+    // `--prompt` (`docs/specs/harness.md`).
+    let plan = match delivery_mode(print, run_mode) {
+        DeliveryMode::Print => DeliveryPlan::print(optimize_mod::compose_prompt(
+            &findings,
+            &db_display,
+            filter,
+            &copy,
+        )),
+        mode => DeliveryPlan::launch(
             binary,
-            leading.join(" ").trim_end(),
-            sess.harness.display_name()
-        )
+            leading,
+            mode,
+            optimize_mod::render_briefing(&findings, filter, &copy),
+            sess.harness.display_name(),
+            verbose,
+            |path| {
+                optimize_mod::launch_prompt(
+                    &path.to_string_lossy(),
+                    &db_display,
+                    filter,
+                    &copy,
+                    run_mode,
+                )
+            },
+        ),
     };
-    let (result, run_log) = if mode == optimize_mod::RunMode::Headless && !verbose {
-        let (status, log) = run_headless(binary, leading, &prompt).with_context(launch_note)?;
-        (Ok(status), Some(log))
-    } else {
-        let status = std::process::Command::new(binary)
-            .args(leading)
-            .arg(&prompt)
-            .status();
-        (status, None)
-    };
-    let _ = fs::remove_file(&briefing_path);
-
-    let status = result.with_context(launch_note)?;
-    if !status.success() {
-        match run_log {
-            Some(log) => anyhow::bail!(
-                "{binary} exited with {status} — raw output: {}",
-                log.display()
-            ),
-            None => anyhow::bail!("{binary} exited with {status}"),
-        }
-    }
+    deliver(plan, &mut ProcessAdvisor)?;
     Ok(())
 }
 
@@ -2627,23 +2776,173 @@ mod tests {
         // launch is the opencode shape under kilo's binary.
         assert_eq!(
             launch_command(&Harness::Claude),
-            Some(("claude", &[] as &[&str], optimize_mod::RunMode::Interactive))
+            ("claude", &[] as &[&str], optimize_mod::RunMode::Interactive)
         );
         assert_eq!(
             launch_command(&Harness::Opencode),
-            Some((
+            (
                 "opencode",
                 &["run", "--format", "json", "--title", "saniwalens optimize"] as &[&str],
                 optimize_mod::RunMode::Headless
-            ))
+            )
         );
         assert_eq!(
             launch_command(&Harness::Kilocode),
-            Some((
+            (
                 "kilo",
                 &["--prompt"] as &[&str],
                 optimize_mod::RunMode::Interactive
-            ))
+            )
+        );
+    }
+
+    // ---- PBI 06: the delivery seam ----
+
+    /// A delivery double: records what would have been launched instead of
+    /// spawning anything, so the briefing's argv can be asserted against a
+    /// mock (BDD: "従来と同一の引数で claude が起動する").
+    #[cfg(unix)]
+    struct RecordingAdvisor {
+        direct: Vec<(String, Vec<String>, String)>,
+        headless: Vec<(String, Vec<String>, String)>,
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(unix)]
+    impl RecordingAdvisor {
+        fn new() -> Self {
+            Self {
+                direct: Vec::new(),
+                headless: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl AdvisorLaunch for RecordingAdvisor {
+        fn direct(
+            &mut self,
+            binary: &str,
+            leading: &[&str],
+            prompt: &str,
+        ) -> Result<std::process::ExitStatus> {
+            self.direct.push((
+                binary.to_string(),
+                leading.iter().map(|s| s.to_string()).collect(),
+                prompt.to_string(),
+            ));
+            Ok(success_status())
+        }
+
+        fn headless(
+            &mut self,
+            binary: &str,
+            leading: &[&str],
+            prompt: &str,
+        ) -> Result<(std::process::ExitStatus, PathBuf)> {
+            self.headless.push((
+                binary.to_string(),
+                leading.iter().map(|s| s.to_string()).collect(),
+                prompt.to_string(),
+            ));
+            Ok((success_status(), PathBuf::from("/tmp/never-opened.log")))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_print_delivery_writes_to_stdout_and_launches_nothing() {
+        let plan = DeliveryPlan::print("FULL PROMPT".to_string());
+        let mut advisor = RecordingAdvisor::new();
+
+        deliver(plan, &mut advisor).unwrap();
+
+        assert!(advisor.direct.is_empty(), "print never spawns");
+        assert!(advisor.headless.is_empty(), "print never spawns");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_interactive_delivery_hands_the_double_the_measured_launch() {
+        use std::cell::RefCell;
+        let seen_path: RefCell<Option<PathBuf>> = RefCell::new(None);
+        let plan = DeliveryPlan::launch(
+            "claude",
+            &[],
+            DeliveryMode::Interactive,
+            "the rendered briefing".to_string(),
+            "Claude Code",
+            false,
+            |path| {
+                *seen_path.borrow_mut() = Some(path.to_path_buf());
+                "POINTER PROMPT".to_string()
+            },
+        );
+        let mut advisor = RecordingAdvisor::new();
+
+        deliver(plan, &mut advisor).unwrap();
+
+        assert_eq!(advisor.direct.len(), 1);
+        assert_eq!(advisor.direct[0].0, "claude");
+        assert!(advisor.direct[0].1.is_empty());
+        assert_eq!(advisor.direct[0].2, "POINTER PROMPT");
+        // The private pointer file is removed the moment the run ends.
+        let path = seen_path.borrow().clone().expect("pointer got the path");
+        assert!(!path.exists(), "briefing file outlived its run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_routes_through_the_logged_adapter_unless_verbose() {
+        let headless_plan = DeliveryPlan::launch(
+            "opencode",
+            &["run", "--format", "json"],
+            DeliveryMode::Headless,
+            "briefing".to_string(),
+            "opencode",
+            false,
+            |_| "pointer".to_string(),
+        );
+        let mut advisor = RecordingAdvisor::new();
+        deliver(headless_plan, &mut advisor).unwrap();
+        assert_eq!(advisor.headless.len(), 1, "quiet headless logs its stream");
+        assert!(advisor.direct.is_empty());
+
+        // `--verbose` inherits stdio for the raw streaming instead
+        // (`docs/specs/harness.md`).
+        let verbose_plan = DeliveryPlan::launch(
+            "opencode",
+            &["run", "--format", "json"],
+            DeliveryMode::Headless,
+            "briefing".to_string(),
+            "opencode",
+            true,
+            |_| "pointer".to_string(),
+        );
+        let mut advisor = RecordingAdvisor::new();
+        deliver(verbose_plan, &mut advisor).unwrap();
+        assert_eq!(advisor.direct.len(), 1);
+        assert!(advisor.headless.is_empty());
+    }
+
+    #[test]
+    fn the_delivery_mode_is_the_flag_over_the_launch_shape() {
+        assert_eq!(
+            delivery_mode(true, optimize_mod::RunMode::Interactive),
+            DeliveryMode::Print
+        );
+        assert_eq!(
+            delivery_mode(false, optimize_mod::RunMode::Interactive),
+            DeliveryMode::Interactive
+        );
+        assert_eq!(
+            delivery_mode(false, optimize_mod::RunMode::Headless),
+            DeliveryMode::Headless
         );
     }
 }

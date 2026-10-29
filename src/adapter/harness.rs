@@ -221,6 +221,22 @@ impl Harness {
         }
     }
 
+    /// The plain harness data every prompt and briefing renders from —
+    /// assembled here so the shell never spells `HarnessCopy` field by field
+    /// and the core stays harness-agnostic (`core::optimize::HarnessCopy`).
+    pub fn copy(&self) -> crate::core::optimize::HarnessCopy {
+        crate::core::optimize::HarnessCopy {
+            agent: self.display_name(),
+            article: self.article(),
+            source: self.source_noun(),
+            raw_source: self.raw_source(),
+            global_ref: self.global_config_ref(),
+            project_ref: self.project_config_ref(),
+            instruction_file: self.instruction_file(),
+            config_inventory: self.config_inventory(),
+        }
+    }
+
     /// Parse `--harness`. `None` for anything else, so the caller can fail
     /// with the valid list.
     pub fn parse(value: &str) -> Option<Self> {

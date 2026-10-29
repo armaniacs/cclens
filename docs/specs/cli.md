@@ -332,3 +332,14 @@ The findings themselves split the same way: the shell fetches the store's rows
 `EXAMPLES_PER_CATEGORY`, `THRASH_LINES_PER_PROJECT`, …), the scope routing, and
 the ordering — so the briefing's wiring is unit-tested over small inputs and
 only the queries and the print are I/O.
+
+The send is one seam: `deliver` runs a `DeliveryPlan` whose mode
+(`DeliveryMode::Print | Interactive | Headless`, chosen by `--print` over the
+harness's launch shape) picks the payload — `Print` writes the prompt to
+stdout, launch modes write the briefing to the private pointer file, hand the
+spawn to the `AdvisorLaunch` adapter, and remove the file the moment the run
+ends. Production wires `ProcessAdvisor` (inherited stdio, or `run_headless`'s
+logged pipe unless `--verbose`); the delivery tests wire a recording double
+and assert the argv instead of spawning. `Harness::copy` assembles the harness
+data those prompts render from, so the shell never spells `HarnessCopy` field
+by field.
