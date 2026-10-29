@@ -38,10 +38,20 @@ Scenario: open経路の保証が明示される
 ```
 
 ## 受け入れ基準
-- [ ] open経路が1つに統一されるか、保証の違いが型で表現される
-- [ ] ingestがバッチIFになり、呼び出し順への依存が消える
-- [ ] 列エンコーディングが1箇所の表で定義される
-- [ ] 既存の全storeテストがグリーン＋順序回帰テストが追加される
+- [x] open経路が1つに統一されるか、保証の違いが型で表現される
+  （`Store::open(path, OpenMode::{ReadWrite, ReadOnly})` に統一。
+  作成・owner-only・マイグレーションの保証はモードの型で明示。
+  `readonly_open_neither_creates_nor_migrates` が非作成・非移行を固定）
+- [x] ingestがバッチIFになり、呼び出し順への依存が消える
+  （`IngestBatch` + `Store::ingest` を唯一の公開 IF に。旧5関数は private の
+  tx ヘルパへ格下げ、呼び出し側3分析器はバッチ構築1回に移行）
+- [x] 列エンコーディングが1箇所の表で定義される
+  （`EVENT_ENCODING` が単一定義。view はそこから生成、reader は
+  `encoding_column` 参照、writer の tool_error/prompt 列も表由来。
+  種別追加は表に行を足すだけ＝`adding_a_kind_to_the_encoding_table_leaves_the_view_untouched`）
+- [x] 既存の全storeテストがグリーン＋順序回帰テストが追加される
+  （`cargo test` 381 passed。`a_batch_replaces_every_prior_row_for_the_file_wholesale` /
+  `one_batch_settles_the_spawn_costs_of_the_runs_it_carries` を追加）
 
 ## テスト戦略
 - E2E: 実バイナリで analyze→各view の出力が従来同一（手動＋記録）
@@ -73,7 +83,12 @@ grep -n "surface_id\|source\|model" src/store.rs | head -20
   変える場合は別PBIに切り出す
 
 ## Definition of Done
-- [ ] 回帰テスト（順序・エンコード）が先に書かれパスする
-- [ ] 全BDDシナリオが自動テストとして実装されパスする
+- [x] 回帰テスト（順序・エンコード）が先に書かれパスする
+  （RED: 新IF参照のコンパイルエラーを確認 → GREEN: 381 passed）
+- [x] 全BDDシナリオが自動テストとして実装されパスする
+  （順序シナリオ=バッチ置換の同一性、エンコード=view導出＋種別追加非依存、
+  open保証=readonly の非作成・非移行）
 - [ ] コードレビュー完了
-- [ ] ドキュメント更新済み（`docs/specs/storage.md` の契約節）
+- [x] ドキュメント更新済み（`docs/specs/storage.md` の契約節）
+  （One transcript, one batch 節・Column encoding is defined once 節・
+  OpenMode の readonly 節を追記）
