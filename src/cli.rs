@@ -36,7 +36,7 @@ use crate::session::{
     AnalyzeStats, Session, SessionEnv, Style, eprint_freshness, freshness_line, guard_harness,
     resolve_cli,
 };
-use crate::store::{SessionMeta, Store};
+use crate::store::{IngestBatch, OpenMode, SessionMeta, Store};
 
 #[derive(Parser)]
 #[command(
@@ -1970,7 +1970,11 @@ fn analyze(sess: &Session, projects: Option<PathBuf>, format: Format) -> Result<
 /// runs first: a store built by another harness refuses the write rather than
 /// mixing rows (`docs/specs/harness.md`).
 fn run_analyze(harness: &Harness, projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
-    guard_harness(&Store::open(db).context("open store")?, harness, db)?;
+    guard_harness(
+        &Store::open(db, OpenMode::ReadWrite).context("open store")?,
+        harness,
+        db,
+    )?;
     match harness {
         Harness::Claude => run_analyze_claude(projects, db),
         Harness::Opencode => run_analyze_opencode(projects, db),
@@ -1980,7 +1984,7 @@ fn run_analyze(harness: &Harness, projects: Option<PathBuf>, db: &Path) -> Resul
 
 fn run_analyze_claude(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     let projects = projects.map(Ok).unwrap_or_else(default_projects_dir)?;
-    let mut store = Store::open(db).context("open store")?;
+    let mut store = Store::open(db, OpenMode::ReadWrite).context("open store")?;
 
     // Rows produced by older analysis semantics are rebuilt once: the
     // fingerprint skip below would otherwise pin them forever, because the
@@ -2022,13 +2026,10 @@ fn run_analyze_claude(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeSta
             runs.len() as i64,
             session_start(&records),
         );
-        store.ingest_session(&meta, &spans, &usage)?;
-        store.ingest_subagent_runs(&meta.id, &meta.source_path, &runs)?;
         let prompts: Vec<(usize, i64, &str)> = extract_prompt_pointers(&text)
             .into_iter()
             .map(|(line, ts, behavior)| (line, ts, behavior.label()))
             .collect();
-        store.ingest_prompts(&meta.id, &meta.source_path, &prompts)?;
         // `raw_errors` owns the strings; `error_rows` borrows them.
         let raw_errors = extract_tool_errors(&text);
         let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
@@ -2043,14 +2044,21 @@ fn run_analyze_claude(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeSta
                 )
             })
             .collect();
-        store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
         // `work` owns the strings; the rows borrow them.
         let work = extract_work_events(&text);
         let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
             .iter()
             .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
             .collect();
-        store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
+        // One transcript, one batch: the store applies its parts in its own
+        // order, so nothing here depends on the order these were extracted in.
+        store.ingest(
+            IngestBatch::new(&meta, &spans, &usage)
+                .subagent_runs(&runs)
+                .prompts(&prompts)
+                .tool_errors(&error_rows)
+                .work_events(&work_rows),
+        )?;
         if let Some((mtime, _)) = fingerprint {
             // Record the size actually consumed, so a tail appended after the
             // read shows a mismatch next run instead of being skipped forever.
@@ -2107,7 +2115,7 @@ fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
             input.display()
         );
     }
-    let mut store = Store::open(db).context("open store")?;
+    let mut store = Store::open(db, OpenMode::ReadWrite).context("open store")?;
     // The opencode version key lives apart from the shared analyzer version:
     // an opencode-only extraction change must never force Claude Code users
     // through a full re-analyze (`adapter::opencode::OPENCODE_ANALYZER_VERSION`).
@@ -2194,7 +2202,6 @@ fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
             sub_agent_count: 0,
             start: session_start(&records),
         };
-        store.ingest_session(&meta, &spans, &usage)?;
         // `raw_errors` owns the strings; `error_rows` borrows them.
         let raw_errors = opencode_mod::extract_tool_errors(&part_rows);
         let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
@@ -2209,14 +2216,17 @@ fn run_analyze_opencode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
                 )
             })
             .collect();
-        store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
         // `work` owns the strings; the rows borrow them.
         let work = opencode_mod::extract_work_events(&part_rows);
         let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
             .iter()
             .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
             .collect();
-        store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
+        store.ingest(
+            IngestBatch::new(&meta, &spans, &usage)
+                .tool_errors(&error_rows)
+                .work_events(&work_rows),
+        )?;
         store.record_ingested_file(&fingerprint_key, session.time_updated_ms, message_count)?;
         sessions += 1;
         spans_total += spans.len();
@@ -2304,7 +2314,7 @@ fn run_analyze_kilocode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
             input.display()
         );
     }
-    let mut store = Store::open(db).context("open store")?;
+    let mut store = Store::open(db, OpenMode::ReadWrite).context("open store")?;
     // The kilocode version key lives apart from the shared analyzer version:
     // a kilocode-only extraction change must never force other harnesses
     // through a full re-analyze (`adapter::kilocode::KILOCODE_ANALYZER_VERSION`).
@@ -2364,7 +2374,6 @@ fn run_analyze_kilocode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
             sub_agent_count: 0,
             start: session_start(&records),
         };
-        store.ingest_session(&meta, &spans, &usage)?;
         // `raw_errors` owns the strings; `error_rows` borrows them.
         let raw_errors = kilocode_mod::extract_tool_errors(&conversation);
         let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
@@ -2379,7 +2388,6 @@ fn run_analyze_kilocode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
                 )
             })
             .collect();
-        store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
         // `work` owns the strings; the rows borrow them.
         let work = kilocode_mod::extract_work_events(&conversation);
         let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
@@ -2393,7 +2401,11 @@ fn run_analyze_kilocode(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStat
                 )
             })
             .collect();
-        store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
+        store.ingest(
+            IngestBatch::new(&meta, &spans, &usage)
+                .tool_errors(&error_rows)
+                .work_events(&work_rows),
+        )?;
         // Record the size actually consumed, so a file that grows after the
         // read shows a mismatch next run instead of being skipped forever.
         store.record_ingested_file(&fingerprint_key, mtime, size)?;
