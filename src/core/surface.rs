@@ -102,6 +102,11 @@ pub struct Surface {
 
 /// Whether a surface kind can ever acquire usage events. Absence of events is
 /// only evidence of disuse for usage-measurable kinds; for catalog-only kinds
+/// Static-token threshold above which an always-on or rarely-used surface
+/// counts as "heavy" — a tuning knob, not a hard rule. Shared by the briefing's
+/// wedge routing (`core::findings`) and the `waste` view (`cli.rs`).
+pub const HEAVY_TOKENS: u64 = 800;
+
 /// (rules, hooks, CLAUDE.md) it means nothing (`docs/specs/surfaces.md`).
 pub fn is_usage_measurable(kind: &str) -> bool {
     matches!(

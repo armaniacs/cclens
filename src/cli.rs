@@ -11,13 +11,14 @@ use clap::{Parser, Subcommand};
 use crate::adapter::harness::{Harness, home_dir};
 use crate::adapter::opencode as opencode_mod;
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
+use crate::core::findings;
 use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
 use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::subagent::SplitCoverage;
 use crate::core::surface::{
-    LoadMode, StartupSavings, Wedge, classify_wedge, is_usage_measurable, on_demand_tokens,
-    startup_savings,
+    HEAVY_TOKENS, LoadMode, StartupSavings, Wedge, classify_wedge, is_usage_measurable,
+    on_demand_tokens, startup_savings,
 };
 use crate::core::thrash::detect_thrash;
 use crate::session::{
@@ -730,275 +731,56 @@ fn write_private_file(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// Gather the COMPLETE analysis the optimization briefing carries — every view's
-/// detail as owned data for `core::optimize`, so the seeded session works from
-/// the briefing and need not re-run the tool. Lists are capped where a long tail
-/// adds nothing for ranking.
+/// Gather the COMPLETE analysis the optimization briefing carries: fetch the
+/// store's rows and hand them to the pure assembly in `core::findings`. The
+/// shell's half is the queries and the store-row → plain-row mapping; every
+/// join, cap, and sort lives in the core where it is testable
+/// (`pbi/2026-10-29-04-feat-findings-assembly-core.md`).
 fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
-    // The briefing's "unknown floor" sentinel is 0 — no session start observed
-    // means the always-on section is omitted rather than guessed at.
-    let floor = store.baseline_floor()?.unwrap_or(0);
+    Ok(findings::collect_findings(&findings_input(store)?))
+}
 
-    // A few concrete examples per (project, category) — the actual failing
-    // paths/files behind each count, so the fix is obvious from the briefing.
-    const EXAMPLES_PER_CATEGORY: u32 = 3;
-    let mut examples: std::collections::HashMap<(String, String), Vec<String>> =
-        std::collections::HashMap::new();
-    for (project, category, excerpt) in store.error_examples(EXAMPLES_PER_CATEGORY)? {
-        examples
-            .entry((project, category))
-            .or_default()
-            .push(excerpt);
-    }
-
-    // The split of each (project, category) across the tools that produced it —
-    // so the briefing carries the attribution the agent otherwise re-derives.
-    let mut by_tool: std::collections::HashMap<(String, String), Vec<(String, i64)>> =
-        std::collections::HashMap::new();
-    for (project, category, tool, n) in store.error_tool_breakdown()? {
-        by_tool
-            .entry((project, category))
-            .or_default()
-            .push((tool, n));
-    }
-
-    // Route actionable friction to the layer that owns each fix (core::scope):
-    // majority-owned categories to their project, the spread rest to global.
-    let cells: Vec<(String, String, i64)> = store
-        .error_counts_by_project()?
-        .into_iter()
-        .filter(|(_, label, _)| ErrorCategory::from_label(label).is_actionable())
-        .collect();
-    let split = split_friction(&cells);
-
-    // A global category aggregates its tool split across projects and pools a
-    // few examples; a project-owned one uses its own (project, category) detail.
-    const EXAMPLES_PER_GLOBAL_CATEGORY: usize = 3;
-    let friction_global: Vec<optimize_mod::FrictionCat> = split
-        .global
-        .iter()
-        .map(|g| {
-            let mut tools: std::collections::HashMap<String, i64> =
-                std::collections::HashMap::new();
-            let mut pooled = Vec::new();
-            for (project, label, _) in &cells {
-                if label != &g.category {
-                    continue;
-                }
-                let key = (project.clone(), label.clone());
-                for (tool, n) in by_tool.get(&key).into_iter().flatten() {
-                    *tools.entry(tool.clone()).or_default() += n;
-                }
-                pooled.extend(examples.get(&key).into_iter().flatten().cloned());
-            }
-            let mut by_tool: Vec<(String, i64)> = tools.into_iter().collect();
-            by_tool.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            pooled.truncate(EXAMPLES_PER_GLOBAL_CATEGORY);
-            optimize_mod::FrictionCat {
-                label: g.category.clone(),
-                count: g.total,
-                projects: g.projects,
-                by_tool,
-                examples: pooled,
-            }
-        })
-        .collect();
-
-    // Workflow: Bash mix + cd share, most-edited files (global signals).
-    let bash = store.work_counts("bash_cmd")?;
-    let bash_total: i64 = bash.iter().map(|(_, n)| n).sum();
-    let cd_pct = (bash_total > 0).then(|| {
-        let cd = bash.iter().find(|(c, _)| c == "cd").map_or(0, |(_, n)| *n);
-        (cd as f64 * 100.0 / bash_total as f64).round() as i64
-    });
-    let top_commands: Vec<(String, i64)> = bash.into_iter().take(15).collect();
-    let hotspots: Vec<(String, i64)> = store
-        .work_counts("file_edit")?
-        .into_iter()
-        .take(15)
-        .collect();
-
-    // Thrash per project — a burst belongs to the project it happened in. Each
-    // episode already knows its project, so detection runs once over everything.
-    let mut thrash_by_project: std::collections::HashMap<String, Vec<optimize_mod::ThrashLine>> =
-        std::collections::HashMap::new();
-    for episode in detect_thrash(&store.file_edits()?, 5 * 60, 4) {
-        let lines = thrash_by_project
-            .entry(episode.project.clone())
-            .or_default();
-        if lines.len() < 5 {
-            lines.push(optimize_mod::ThrashLine {
-                span_secs: episode.span_secs(),
-                file: episode.file().to_string(),
-                edits: episode.edits,
-            });
-        }
-    }
-
-    // Config wedges, split by the surface's own scope.
-    let scoped = config_wedges(store)?;
-
-    // Assemble per-project findings: any project owning friction, thrash, or
-    // project-scoped wedges gets a section, busiest first.
-    let roots: std::collections::HashMap<String, String> = store
-        .session_roots()?
-        .into_iter()
-        .map(|(root, project)| (project, root))
-        .collect();
-    let mut owned_friction: std::collections::HashMap<String, Vec<(String, i64)>> =
-        split.per_project.into_iter().collect();
-    let mut project_names: Vec<String> = owned_friction
-        .keys()
-        .chain(thrash_by_project.keys())
-        .chain(scoped.projects.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let mut projects: Vec<optimize_mod::ProjectFindings> = project_names
-        .drain(..)
-        .map(|project| {
-            let friction = owned_friction
-                .remove(&project)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(label, count)| {
-                    let key = (project.clone(), label.clone());
-                    optimize_mod::FrictionCat {
-                        by_tool: by_tool.get(&key).cloned().unwrap_or_default(),
-                        examples: examples.get(&key).cloned().unwrap_or_default(),
-                        label,
-                        count,
-                        projects: 1,
-                    }
-                })
-                .collect();
-            let wedges = scoped.projects.get(&project);
-            optimize_mod::ProjectFindings {
-                friction,
-                thrash: thrash_by_project.remove(&project).unwrap_or_default(),
-                unused: wedges.map(|w| w.unused.clone()).unwrap_or_default(),
-                always_on_heavy: wedges
-                    .map(|w| w.always_on_heavy.clone())
-                    .unwrap_or_default(),
-                root: roots.get(&project).cloned().unwrap_or_default(),
-                project,
-            }
-        })
-        .collect();
-    // Busiest first: owned friction, then config wedges, then thrash — so a
-    // friction-free but config-heavy project still outranks thrash-only noise.
-    projects.sort_by(|a, b| {
-        let weight = |p: &optimize_mod::ProjectFindings| {
-            (
-                p.total_friction(),
-                p.unused.len() + p.always_on_heavy.len(),
-                p.thrash.len(),
-            )
-        };
-        weight(b)
-            .cmp(&weight(a))
-            .then_with(|| a.project.cmp(&b.project))
-    });
-
-    let pcounts = store.prompt_behavior_counts()?;
-    let ptotal: i64 = pcounts.iter().map(|(_, n)| n).sum();
-    let share = |name: &str| {
-        let n = pcounts
-            .iter()
-            .find(|(b, _)| b == name)
-            .map_or(0, |(_, n)| *n);
-        (n as f64 * 100.0 / ptotal as f64).round() as i64
-    };
-    let (steer_pct, correct_pct) = if ptotal > 0 {
-        (Some(share("steer")), Some(share("correct")))
-    } else {
-        (None, None)
-    };
-
-    let (sub_tokens, sub_agents) = store.subagent_totals()?;
-    let agents: Vec<optimize_mod::AgentCost> = store
-        .subagent_by_agent()?
-        .into_iter()
-        .map(|row| optimize_mod::AgentCost {
-            agent: row.agent,
-            runs: row.runs,
-            out_tokens: row.out_tokens,
-        })
-        .collect();
-    Ok(optimize_mod::Findings {
-        main_out: store.skill_usage()?.iter().map(|r| r.out_tokens).sum(),
-        sub_tokens,
-        sub_agents,
-        agent_split: SplitCoverage::new(
-            sub_tokens,
-            sub_agents,
-            agents.iter().map(|a| (a.runs, a.out_tokens)),
-        ),
-        agents,
-        floor,
-        config_tokens: if floor > 0 {
-            store.always_on_config_tokens()?
-        } else {
-            0
-        },
-        friction_global,
-        cd_pct,
-        top_commands,
-        hotspots,
-        unused: scoped.global.unused,
-        always_on_heavy: scoped.global.always_on_heavy,
-        steer_pct,
-        correct_pct,
-        projects,
+/// Every row `core::findings` assembles from, fetched in one place.
+fn findings_input(store: &Store) -> Result<findings::FindingsInput> {
+    Ok(findings::FindingsInput {
+        // No session start observed means the always-on section is omitted
+        // rather than guessed at — the sentinel stays the core's business.
+        floor: store.baseline_floor()?,
+        error_examples: store.error_examples(findings::EXAMPLES_PER_CATEGORY)?,
+        error_breakdown: store.error_tool_breakdown()?,
+        friction_cells: store.error_counts_by_project()?,
+        bash_commands: store.work_counts("bash_cmd")?,
+        file_edit_counts: store.work_counts("file_edit")?,
+        file_edits: store.file_edits()?,
+        catalog: store
+            .effective_catalog()?
+            .into_iter()
+            .map(|e| findings::CatalogRow {
+                kind: e.kind,
+                id: e.id,
+                scope: e.scope,
+                project: e.project,
+                startup_tokens: e.startup_tokens,
+                static_tokens: e.static_tokens,
+                load_mode: e.load_mode,
+                uses: e.uses,
+            })
+            .collect(),
+        session_roots: store.session_roots()?,
+        prompt_behaviors: store.prompt_behavior_counts()?,
+        subagent_totals: store.subagent_totals()?,
+        agents: store
+            .subagent_by_agent()?
+            .into_iter()
+            .map(|row| optimize_mod::AgentCost {
+                agent: row.agent,
+                runs: row.runs,
+                out_tokens: row.out_tokens,
+            })
+            .collect(),
+        skill_out_tokens: store.skill_usage()?.iter().map(|r| r.out_tokens).collect(),
+        always_on_config_tokens: store.always_on_config_tokens()?,
     })
-}
-
-/// Wedge-flagged surfaces (unused-but-measurable, always-on heavy) grouped by
-/// the config layer that owns them — the routing key for summary and briefing.
-#[derive(Default)]
-struct WedgeRefs {
-    unused: Vec<optimize_mod::SurfaceRef>,
-    always_on_heavy: Vec<optimize_mod::SurfaceRef>,
-}
-
-struct ScopedWedges {
-    global: WedgeRefs,
-    projects: std::collections::HashMap<String, WedgeRefs>,
-}
-
-fn config_wedges(store: &Store) -> Result<ScopedWedges> {
-    // Carry the cost split, not one figure: a skill's file weight is its
-    // invocation cost, and rendering it as the trim saving promised startup
-    // context that deleting it never frees (`docs/specs/surfaces.md`).
-    let surface_ref =
-        |e: &crate::store::CatalogEntry, load_mode: LoadMode| optimize_mod::SurfaceRef {
-            kind: e.kind.clone(),
-            id: e.id.clone(),
-            startup_tokens: e.startup_tokens,
-            on_demand_tokens: on_demand_tokens(load_mode, e.static_tokens.map(|t| t as u64))
-                .map(|t| t as i64),
-        };
-    let mut scoped = ScopedWedges {
-        global: WedgeRefs::default(),
-        projects: std::collections::HashMap::new(),
-    };
-    for entry in store.effective_catalog()? {
-        let refs = if entry.scope == "global" {
-            &mut scoped.global
-        } else {
-            scoped.projects.entry(entry.project.clone()).or_default()
-        };
-        let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
-        let static_tokens = entry.static_tokens.map(|t| t as u64);
-        if is_usage_measurable(&entry.kind) && entry.uses == 0 {
-            refs.unused.push(surface_ref(&entry, load_mode));
-        }
-        if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
-            refs.always_on_heavy.push(surface_ref(&entry, load_mode));
-        }
-    }
-    Ok(scoped)
 }
 
 /// Run a read-only SQL query against the store and print the result. The query
@@ -1918,10 +1700,6 @@ fn overhead(sess: &Session, format: Format) -> Result<()> {
     );
     Ok(())
 }
-
-/// Static-token threshold above which an always-on or rarely-used surface counts
-/// as "heavy" — a tuning knob, not a hard rule.
-const HEAVY_TOKENS: u64 = 800;
 
 fn analyze(sess: &Session, projects: Option<PathBuf>, format: Format) -> Result<()> {
     let stats = run_analyze(&sess.harness, projects, &sess.db_path)?;

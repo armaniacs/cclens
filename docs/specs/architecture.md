@@ -96,7 +96,7 @@ flowchart TD
 | Layer | Owns | Must NOT know |
 | --- | --- | --- |
 | **adapter** | The raw shapes of *both* inputs: transcript JSONL (record types, field names, `subagents/` layout) and config files (skill/rule frontmatter, `settings.json`, MCP schemas, `CLAUDE.md`). Maps them into the internal domain model. | The SQLite schema; how costs are computed. |
-| **core** | Event extraction, static-cost weighing inputs, the catalog×usage join, and aggregation — all **pure functions** over the domain model. No I/O, no clock, no DB. | Claude Code field names or config path conventions; SQL. |
+| **core** | Event extraction, static-cost weighing inputs, the catalog×usage join, the briefing's findings assembly (`core::findings`), and aggregation — all **pure functions** over the domain model. No I/O, no clock, no DB. | Claude Code field names or config path conventions; SQL. |
 | **store** | Persisting and querying `sessions` / `surfaces` / `events` in SQLite. | Raw input shapes. |
 | **report** | Turning query results into tables / Markdown and ranking wedges. | Raw input shapes; SQL beyond the store's API. |
 

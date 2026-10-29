@@ -326,3 +326,9 @@ The split mirrors the rest of the tool: prompt composition is a pure transform
 (`core::optimize` — `render_briefing` for the Markdown report with empty sections
 omitted and long lists capped, `instructions` for the role, `launch_prompt` for
 the argv pointer), and only the temp-file write and process launch are I/O.
+The findings themselves split the same way: the shell fetches the store's rows
+(`findings_input` in `cli.rs`) and hands them to the pure assembly in
+`core::findings` — the joins, the named caps (`TOP_COMMANDS_LIMIT`,
+`EXAMPLES_PER_CATEGORY`, `THRASH_LINES_PER_PROJECT`, …), the scope routing, and
+the ordering — so the briefing's wiring is unit-tested over small inputs and
+only the queries and the print are I/O.
