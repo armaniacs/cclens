@@ -32,11 +32,16 @@ Scenario: frozen読み取りでもguardが働く
 ```
 
 ## 受け入れ基準
-- [ ] 11のdispatch armが `Session::open` 以外の解決呼び出しを持たない
-- [ ] `store_path` / `resolve_db` / `migrate_legacy_store` / `config_file_path` /
+- [x] 11のdispatch armが `Session::open` 以外の解決呼び出しを持たない
+- [x] `store_path` / `resolve_db` / `migrate_legacy_store` / `config_file_path` /
   `parse_harness` / `open_for_read` / `guard_harness` の呼び出しが1箇所に集約される
-- [ ] 既存テストは移動するだけで全て残る（削除は正当な理由がある場合のみ）
-- [ ] 実出力がバイト同一（freshness行・エラー文言を含む）
+  （arm からの解決呼び出しは `Session::open*` のみ。`run_analyze` 入口の
+  guard は解析書き込み経路の防衛で、refactor 前から存在する own guard）
+- [x] 既存テストは移動するだけで全て残る（削除は正当な理由がある場合のみ）
+  （821bf1e 時点 366 → 現在 376、session.rs に移設済み）
+- [x] 実出力がバイト同一（freshness行・エラー文言を含む）
+  （旧 821bf1e バイナリ vs 現行を合成フィクスチャで29シナリオ・269行 diff、
+  不正 --scope/--format/--profile/--harness・guard・readonly・HOME なし経路を含め同一）
 
 ## テスト戦略
 - E2E: 実バイナリで doctor/analyze/inventory の代表コマンドを実行し、
@@ -69,8 +74,13 @@ grep -n "^fn \(store_path\|resolve_db\|migrate_legacy_store\|config_file_path\|p
 - frozen時の guard位置（open後にguardする現行動作）を変えないこと
 
 ## Definition of Done
-- [ ] 全BDDシナリオが自動テストとして実装されパスする
-- [ ] テストカバレッジが基準を満たす（統合/単体すべて）
+- [x] 全BDDシナリオが自動テストとして実装されパスする
+  （`resolve_cli_unknown_profile_lists_available` /
+  `open_read_frozen_wrong_harness_is_refused` / Session 統合テスト群、
+  既定起動のバイト同一は旧バイナリ E2E diff で確認）
+- [x] テストカバレッジが基準を満たす（統合/単体すべて）（`cargo test` 376 passed）
 - [ ] コードレビュー完了
-- [ ] リファクタリング完了（グリーン後）
-- [ ] ドキュメント更新済み（`docs/specs/cli.md` の解決節を Session 基準に）
+- [x] リファクタリング完了（グリーン後）
+  （dispatch の parse 前提順回復＋`Session::open_resolved` 分割）
+- [x] ドキュメント更新済み（`docs/specs/cli.md` の解決節を Session 基準に）
+  （`config_file_path` の所在を session.rs へ修正、フラグ解析順の契約を追記）
