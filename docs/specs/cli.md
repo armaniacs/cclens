@@ -34,7 +34,8 @@ cwd-relative default would contradict the data it holds: it would build a
 separate copy of the same cross-project store per directory saniwalens is invoked
 from, and leave a database file inside unrelated Git working trees. The default
 is therefore user-level, `${XDG_STATE_HOME:-~/.local/state}/saniwalens/saniwalens.db`
-(`store_path` in `cli.rs`), with the directory created on demand by
+(`Session::open` in `session.rs`, which owns resolution, the legacy-store move,
+and the guarded open as one seam), with the directory created on demand by
 `Store::open` — owner-only, like the store itself (`storage.md`). A non-absolute
 `XDG_STATE_HOME` is invalid per the XDG spec and ignored — honoring one would
 reintroduce exactly the cwd-relative store this default exists to avoid.

@@ -12,7 +12,6 @@ use crate::adapter::config::{
     claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_mcp_server_surfaces,
     read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
-use crate::adapter::config_file;
 use crate::adapter::harness::Harness;
 use crate::adapter::kilocode as kilocode_mod;
 use crate::adapter::opencode as opencode_mod;
@@ -33,6 +32,10 @@ use crate::core::surface::{
 };
 use crate::core::thrash::detect_thrash;
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
+use crate::session::{
+    AnalyzeStats, Session, SessionEnv, Style, eprint_freshness, freshness_line, guard_harness,
+    resolve_cli,
+};
 use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
@@ -250,120 +253,160 @@ enum Command {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    // The tool's own config file is optional; without it everything below is
-    // exactly the old behavior. Flags beat the file everywhere.
+    // One call resolves flags, the config file, and the builtins into the
+    // harness plus an optional configured store; see `session.rs`.
+    let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
     let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    let config_path = config_file_path(config_home.as_deref(), home_dir());
-    let file = config_path
-        .as_deref()
-        .map(config_file::load)
-        .transpose()?
-        .flatten();
-    let config_dir = config_path.as_deref().and_then(|p| p.parent());
-    let resolved = config_file::resolve(
-        cli.harness.as_deref(),
-        cli.profile.as_deref(),
-        None,
-        file.as_ref(),
-        config_dir,
-    )?;
-    let harness = parse_harness(resolved.harness.as_deref())?;
-    let config_db = resolved.db;
+    let env = SessionEnv {
+        state_home: state_home.as_deref(),
+        home: home_dir(),
+        config_home: config_home.as_deref(),
+    };
+    let resolved = resolve_cli(cli.harness.as_deref(), cli.profile.as_deref(), &env)?;
+    let harness = resolved.harness;
+    let config_db = resolved.config_db;
     match cli.command {
         Command::Analyze {
             projects,
             format,
             db,
-        } => analyze(
-            &harness,
-            projects,
-            parse_format(format.as_deref())?,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
+        } => {
+            let sess = Session::open(&harness, db, config_db.as_deref(), &env)?;
+            analyze(&sess, projects, parse_format(format.as_deref())?)
+        }
         Command::Usage {
             by,
             format,
             frozen,
             db,
-        } => usage(
-            &harness,
-            by.as_deref(),
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
+        } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            usage(&sess, by.as_deref(), parse_format(format.as_deref())?)
+        }
         Command::Inventory {
             scope,
             format,
             frozen,
             db,
-        } => inventory(
-            &harness,
-            &parse_scope(scope.as_deref())?,
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
+        } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            inventory(
+                &sess,
+                &parse_scope(scope.as_deref())?,
+                parse_format(format.as_deref())?,
+            )
+        }
         Command::Waste {
             scope,
             format,
             frozen,
             db,
-        } => waste(
-            &harness,
-            &parse_scope(scope.as_deref())?,
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
-        Command::Overhead { format, frozen, db } => overhead(
-            &harness,
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
-        Command::Prompts { format, frozen, db } => prompts(
-            &harness,
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
+        } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            waste(
+                &sess,
+                &parse_scope(scope.as_deref())?,
+                parse_format(format.as_deref())?,
+            )
+        }
+        Command::Overhead { format, frozen, db } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            overhead(&sess, parse_format(format.as_deref())?)
+        }
+        Command::Prompts { format, frozen, db } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            prompts(&sess, parse_format(format.as_deref())?)
+        }
         Command::Failures {
             scope,
             format,
             frozen,
             db,
-        } => failures(
-            &harness,
-            &parse_scope(scope.as_deref())?,
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
-        Command::Stuck { format, frozen, db } => stuck(
-            &harness,
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
+        } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            failures(
+                &sess,
+                &parse_scope(scope.as_deref())?,
+                parse_format(format.as_deref())?,
+            )
+        }
+        Command::Stuck { format, frozen, db } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            stuck(&sess, parse_format(format.as_deref())?)
+        }
         Command::Doctor {
             scope,
             format,
             frozen,
             db,
-        } => doctor(
-            &harness,
-            &parse_scope(scope.as_deref())?,
-            parse_format(format.as_deref())?,
-            frozen,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
-        Command::Sql { query, format, db } => sql(
-            &harness,
-            query.as_deref(),
-            parse_format(format.as_deref())?,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-        ),
+        } => {
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            doctor(
+                &sess,
+                &parse_scope(scope.as_deref())?,
+                parse_format(format.as_deref())?,
+            )
+        }
+        Command::Sql { query, format, db } => {
+            let sess = Session::open_readonly(&harness, db, config_db.as_deref(), &env)?;
+            sql(&sess, query.as_deref(), parse_format(format.as_deref())?)
+        }
         Command::Optimize {
             projects,
             db,
@@ -371,25 +414,17 @@ pub fn run() -> Result<()> {
             frozen,
             print,
             verbose,
-        } => optimize(
-            &harness,
-            projects,
-            &resolve_db(db, &harness, config_db.as_deref())?,
-            &parse_scope(scope.as_deref())?,
-            frozen,
-            print,
-            verbose,
-        ),
-    }
-}
-
-/// Parse `--harness`. Absent means Claude Code — every pre-flag invocation
-/// keeps its behavior, which is what makes the flag upstream-mergeable.
-fn parse_harness(value: Option<&str>) -> Result<Harness> {
-    match value {
-        None => Ok(Harness::Claude),
-        Some(v) => Harness::parse(v)
-            .with_context(|| format!("unknown --harness '{v}' (claude | opencode | kilocode)")),
+        } => {
+            let sess = Session::open(&harness, db, config_db.as_deref(), &env)?;
+            optimize(
+                &sess,
+                projects,
+                &parse_scope(scope.as_deref())?,
+                frozen,
+                print,
+                verbose,
+            )
+        }
     }
 }
 
@@ -439,48 +474,44 @@ fn launch_command(
 /// removed as soon as the session ends. `--print` instead writes the full prompt
 /// (briefing inline) to stdout for piping / inspection.
 fn optimize(
-    harness: &Harness,
+    sess: &Session,
     projects: Option<PathBuf>,
-    db: &Path,
     filter: &ScopeFilter,
     frozen: bool,
     print: bool,
     verbose: bool,
 ) -> Result<()> {
     if !frozen {
-        let stats = run_analyze(harness, projects, db)?;
+        let stats = run_analyze(&sess.harness, projects, &sess.db_path)?;
         eprintln!(
             "{}",
             Style::stderr().dim(&format!(
                 "store: refreshed just now ({} {} re-analyzed, {} unchanged)",
                 stats.sessions,
-                harness.input_unit(),
+                sess.harness.input_unit(),
                 stats.skipped
             ))
         );
     }
-    let store = Store::open(db).context("open store")?;
-    // `--frozen` skips the analyze that guards, so guard the launch path here.
-    guard_harness(&store, harness, db)?;
-    let findings = collect_findings(&store)?;
+    let findings = collect_findings(&sess.store)?;
 
     // The absolute store path so the session's `saniwalens sql --db …` hits the
     // store this run built, wherever it is launched from.
-    let db_display = std::fs::canonicalize(db)
+    let db_display = std::fs::canonicalize(&sess.db_path)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| db.to_string_lossy().into_owned());
+        .unwrap_or_else(|_| sess.db_path.to_string_lossy().into_owned());
 
     // The harness copy for every prompt and briefing rendered here — plain
     // data assembled from the harness, so the core stays harness-agnostic.
     let copy = optimize_mod::HarnessCopy {
-        agent: harness.display_name(),
-        article: harness.article(),
-        source: harness.source_noun(),
-        raw_source: harness.raw_source(),
-        global_ref: harness.global_config_ref(),
-        project_ref: harness.project_config_ref(),
-        instruction_file: harness.instruction_file(),
-        config_inventory: harness.config_inventory(),
+        agent: sess.harness.display_name(),
+        article: sess.harness.article(),
+        source: sess.harness.source_noun(),
+        raw_source: sess.harness.raw_source(),
+        global_ref: sess.harness.global_config_ref(),
+        project_ref: sess.harness.project_config_ref(),
+        instruction_file: sess.harness.instruction_file(),
+        config_inventory: sess.harness.config_inventory(),
     };
 
     if print {
@@ -495,10 +526,10 @@ fn optimize(
     // prompt-launch surface is unmeasured — a positional argument is treated
     // as a file to open (measured), not a prompt — so the launch is refused
     // and `--print` is the path that hands the briefing over.
-    let Some((binary, leading, mode)) = launch_command(harness) else {
+    let Some((binary, leading, mode)) = launch_command(&sess.harness) else {
         anyhow::bail!(
             "the {} launch is not supported yet — use --print to get the briefing for pasting into kilo",
-            harness.display_name()
+            sess.harness.display_name()
         );
     };
 
@@ -524,7 +555,7 @@ fn optimize(
             "launch `{} {}` — is {} installed and on PATH?",
             binary,
             leading.join(" ").trim_end(),
-            harness.display_name()
+            sess.harness.display_name()
         )
     };
     let (result, run_log) = if mode == optimize_mod::RunMode::Headless && !verbose {
@@ -985,7 +1016,7 @@ fn config_wedges(store: &Store) -> Result<ScopedWedges> {
 /// comes from the argument or, when absent, from stdin — so both
 /// `saniwalens sql '…'` and `echo '…' | saniwalens sql` work. The store is
 /// opened read-only so an ad-hoc query can never mutate the derived data.
-fn sql(harness: &Harness, query: Option<&str>, format: Format, db: &Path) -> Result<()> {
+fn sql(sess: &Session, query: Option<&str>, format: Format) -> Result<()> {
     let query = match query {
         Some(q) => q.to_string(),
         None => {
@@ -1002,11 +1033,7 @@ fn sql(harness: &Harness, query: Option<&str>, format: Format, db: &Path) -> Res
         anyhow::bail!("no SQL provided — pass it as an argument or on stdin");
     }
 
-    let store = Store::open_readonly(db)
-        .with_context(|| format!("open store {} (run `analyze` first?)", db.display()))?;
-    // A store built by another harness is a wrong-harness read even here —
-    // `sql` cannot migrate or refresh, but it can still refuse loudly.
-    guard_harness(&store, harness, db)?;
+    let store = &sess.store;
     // `sql` never mutates the store, so it cannot auto-refresh — surface the
     // store's age instead so a stale read is at least visible. An old db whose
     // schema predates `meta` just skips the header.
@@ -1035,18 +1062,12 @@ fn sql(harness: &Harness, query: Option<&str>, format: Format, db: &Path) -> Res
 /// split by the config layer that owns each fix — the global picture first,
 /// then each project's own findings ("optimize my global setup" and "optimize
 /// this project" are different tasks). `--scope` narrows to one layer.
-fn doctor(
-    harness: &Harness,
-    filter: &ScopeFilter,
-    format: Format,
-    frozen: bool,
-    db: &Path,
-) -> Result<()> {
+fn doctor(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
     if format == Format::Markdown {
         anyhow::bail!("summary has no markdown form — use the default text or --format json");
     }
-    let store = open_for_read(harness, db, frozen)?;
-    let f = collect_findings(&store)?;
+    let store = &sess.store;
+    let f = collect_findings(store)?;
 
     if format == Format::Json {
         // The routed findings, filtered the same way the text form is: the
@@ -1081,7 +1102,7 @@ fn doctor(
         style.heading(&format!(
             "{} usage health check — {session_count} sessions across \
              {project_count} projects",
-            harness.display_name()
+            sess.harness.display_name()
         ))
     );
 
@@ -1120,7 +1141,8 @@ fn doctor(
                 cat.label,
                 style.dim(&format!(
                     "— {}",
-                    ErrorCategory::from_label(&cat.label).suggestion(harness.instruction_file())
+                    ErrorCategory::from_label(&cat.label)
+                        .suggestion(sess.harness.instruction_file())
                 ))
             ));
         }
@@ -1134,7 +1156,7 @@ fn doctor(
         }
         lines.push(format!(
             "  Fix in this project's own {} — details: {}",
-            harness.project_config_ref(),
+            sess.harness.project_config_ref(),
             style.command(&format!(
                 "saniwalens failures --scope project:{}",
                 p.project
@@ -1158,13 +1180,13 @@ fn doctor(
                         style.dim(&format!(
                             "— {}",
                             ErrorCategory::from_label(&cat.label)
-                                .suggestion(harness.instruction_file())
+                                .suggestion(sess.harness.instruction_file())
                         ))
                     ),
                     format!(
                         "  No single project owns it, so the fix belongs in {} — \
                          details: {}",
-                        harness.global_config_ref(),
+                        sess.harness.global_config_ref(),
                         style.command("saniwalens failures --scope global")
                     ),
                 ],
@@ -1182,7 +1204,7 @@ fn doctor(
                     "{} of all Bash commands are just `cd` — a working-directory \
                      convention in your global {} would cut the churn.",
                     style.warn(&format!("{cd_pct}%")),
-                    harness.instruction_file()
+                    sess.harness.instruction_file()
                 )],
             });
         }
@@ -1235,7 +1257,7 @@ fn doctor(
                     "  {} comes from your own global config files; the other {} is {}",
                     fmt_tokens(f.config_tokens),
                     fmt_tokens(residual),
-                    harness.display_name()
+                    sess.harness.display_name()
                 );
                 println!(
                     "  {}",
@@ -1276,7 +1298,7 @@ fn doctor(
     if filter.includes_global() && (!f.unused.is_empty() || !f.always_on_heavy.is_empty()) {
         pruning.push(format!(
             "  {}: {} → {}",
-            harness.global_config_ref(),
+            sess.harness.global_config_ref(),
             prune_phrase(&f.unused, &f.always_on_heavy),
             style.command("saniwalens waste --scope global")
         ));
@@ -1487,10 +1509,10 @@ fn shorten_to_tilde(path: &str, home: Option<&str>) -> String {
 /// got stuck and kept retrying, as opposed to a hotspot's healthy spread-out
 /// edits. An episode is one session's edits to one path, so parallel work on
 /// a same-named file is never presented as one agent looping (`core::thrash`).
-fn stuck(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn stuck(sess: &Session, format: Format) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
-    let store = open_for_read(harness, db, frozen)?;
+    let store = &sess.store;
     let episodes = detect_thrash(&store.file_edits()?, GAP_SECS, MIN_EDITS);
     if format == Format::Json {
         let episodes: Vec<serde_json::Value> = episodes
@@ -1556,13 +1578,7 @@ fn note(text: &str) {
 /// `--scope` routes by ownership (`core::scope`): `global` shows the failures
 /// no project owns, `project` each project's majority-owned failures, and
 /// `project:<slug>` everything that happened in that one project.
-fn failures(
-    harness: &Harness,
-    filter: &ScopeFilter,
-    format: Format,
-    frozen: bool,
-    db: &Path,
-) -> Result<()> {
+fn failures(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
     struct FrictionRow {
         project: Option<String>,
         category: String,
@@ -1571,7 +1587,7 @@ fn failures(
         spread: Option<usize>,
     }
 
-    let store = open_for_read(harness, db, frozen)?;
+    let store = &sess.store;
     let cells = store.error_counts_by_project()?;
 
     let counts: Vec<FrictionRow> = match filter {
@@ -1630,7 +1646,7 @@ fn failures(
                     "count": row.count,
                     "spread_projects": row.spread,
                     "suggestion": ErrorCategory::from_label(&row.category)
-                        .suggestion(harness.instruction_file()),
+                        .suggestion(sess.harness.instruction_file()),
                 })
             })
             .collect();
@@ -1653,21 +1669,21 @@ fn failures(
                 format!(
                     "Failures spread across several projects — no single project owns them, so\n\
                      they read as habits or global-config problems. Fix these in {}.",
-                    harness.global_config_ref()
+                    sess.harness.global_config_ref()
                 )
             }
             ScopeFilter::Project(None) => {
                 format!(
                     "Failures each project owns (it holds the majority of that kind). Fix each\n\
                      in that project's own {}, not globally.",
-                    harness.project_config_ref()
+                    sess.harness.project_config_ref()
                 )
             }
             ScopeFilter::Project(Some(_)) => {
                 format!(
                     "Every recurring failure inside this one project, most frequent first.\n\
                      Fix them in this project's own {}.",
-                    harness.project_config_ref()
+                    sess.harness.project_config_ref()
                 )
             }
         },
@@ -1687,7 +1703,8 @@ fn failures(
             cells.extend([
                 error,
                 row.count.to_string(),
-                ErrorCategory::from_label(&row.category).suggestion(harness.instruction_file()),
+                ErrorCategory::from_label(&row.category)
+                    .suggestion(sess.harness.instruction_file()),
             ]);
             cells
         })
@@ -1714,8 +1731,8 @@ fn failures(
 /// Show the mix of how the user steers the session, and what it suggests. Heavy
 /// steering points to room for more autonomy; frequent corrections point to
 /// clearer upfront specs. The classes are lexical heuristics (`core::prompt`).
-fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(harness, db, frozen)?;
+fn prompts(sess: &Session, format: Format) -> Result<()> {
+    let store = &sess.store;
     let counts = store.prompt_behavior_counts()?;
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
     if format == Format::Json {
@@ -1756,7 +1773,7 @@ fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result
             "How you steer {}, classified per prompt: instruct (substantive asks),\n\
              steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
              steering = room for more autonomy; lots of correcting = unclear upfront specs.",
-            harness.display_name()
+            sess.harness.display_name()
         ),
     );
     let pct = |n: i64| (n as f64 * 100.0 / total as f64).round() as i64;
@@ -1822,8 +1839,8 @@ fn prompts(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result
 /// leaves the residual — system prompt, built-in tools, and MCP tool schemas the
 /// catalog cannot weigh. The per-project floors let you infer an MCP server's
 /// real cost by comparing a project that enables it against one that does not.
-fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Result<()> {
-    let store = open_for_read(harness, db, frozen)?;
+fn overhead(sess: &Session, format: Format) -> Result<()> {
+    let store = &sess.store;
     let floor = store.baseline_floor()?;
     let config = store.always_on_config_tokens()?;
     let residual = floor.map(|floor| (floor - config).max(0));
@@ -1861,9 +1878,9 @@ fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Resul
                  the floor appears as newer sessions are analyzed. Discarding the store\n\
                  would backfill it from the {} still on disk, at the cost of every\n\
                  session whose {} {} has already pruned.",
-                harness.raw_source(),
-                harness.source_noun(),
-                harness.display_name()
+                sess.harness.raw_source(),
+                sess.harness.source_noun(),
+                sess.harness.display_name()
             );
         }
         return Ok(());
@@ -1882,7 +1899,7 @@ fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Resul
     );
     println!(
         "  readable config ({}): {config} tokens",
-        harness.readable_config()
+        sess.harness.readable_config()
     );
     println!(
         "  residual (system prompt + built-in tools + MCP schemas):                {residual} tokens"
@@ -1917,19 +1934,9 @@ fn overhead(harness: &Harness, format: Format, frozen: bool, db: &Path) -> Resul
 /// as "heavy" — a tuning knob, not a hard rule.
 const HEAVY_TOKENS: u64 = 800;
 
-/// Counters from one analyze run, for the command's summary line and the
-/// freshness header on auto-refreshing reads.
-struct AnalyzeStats {
-    sessions: usize,
-    skipped: usize,
-    spans_total: usize,
-    surface_count: usize,
-    denials: usize,
-}
-
-fn analyze(harness: &Harness, projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
-    let stats = run_analyze(harness, projects, db)?;
-    let store = Store::open(db).context("open store")?;
+fn analyze(sess: &Session, projects: Option<PathBuf>, format: Format) -> Result<()> {
+    let stats = run_analyze(&sess.harness, projects, &sess.db_path)?;
+    let store = &sess.store;
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
     if format == Format::Json {
         return emit_json(&serde_json::json!({
@@ -1940,7 +1947,7 @@ fn analyze(harness: &Harness, projects: Option<PathBuf>, format: Format, db: &Pa
             "subagent_tokens": sub_tokens,
             "subagents": sub_agents,
             "permission_denials": stats.denials,
-            "db": db.display().to_string(),
+            "db": sess.db_path.display().to_string(),
         }));
     }
     println!(
@@ -1953,7 +1960,7 @@ fn analyze(harness: &Harness, projects: Option<PathBuf>, format: Format, db: &Pa
         stats.spans_total,
         stats.surface_count,
         stats.denials,
-        db.display()
+        sess.db_path.display()
     );
     Ok(())
 }
@@ -1968,21 +1975,6 @@ fn run_analyze(harness: &Harness, projects: Option<PathBuf>, db: &Path) -> Resul
         Harness::Opencode => run_analyze_opencode(projects, db),
         Harness::Kilocode => run_analyze_kilocode(projects, db),
     }
-}
-
-/// Refuse to analyze into a store another harness built. A store with no
-/// `harness` key predates the flag and is adopted (the Claude default), never
-/// refused.
-fn guard_harness(store: &Store, harness: &Harness, db: &Path) -> Result<()> {
-    if let Some(existing) = store.meta("harness")?
-        && existing != harness.label()
-    {
-        anyhow::bail!(
-            "the store at {} holds {existing} sessions — rerun with --harness {existing} (or pick another --db)",
-            db.display()
-        );
-    }
-    Ok(())
 }
 
 fn run_analyze_claude(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
@@ -2471,43 +2463,6 @@ fn task_fingerprint(conversation: &Path, ui: &Path) -> Option<(i64, i64)> {
     Some((conversation.0.max(ui.0), conversation.1 + ui.1))
 }
 
-/// Open the store for a read command. Unless `--frozen`, the analysis is
-/// refreshed first — incremental, so an up-to-date store costs one stat per
-/// transcript — which makes stale reads structurally impossible (`optimize` has
-/// always worked this way; the views now compose the same stage). A one-line
-/// freshness header goes to **stderr** so piped stdout stays clean.
-fn open_for_read(harness: &Harness, db: &Path, frozen: bool) -> Result<Store> {
-    if !frozen {
-        // Re-analyze against the roots the store was built from (recorded in
-        // meta); a fresh db falls back to the defaults.
-        let projects = match db.exists() {
-            true => Store::open(db)
-                .context("open store")?
-                .meta("projects_dir")?
-                .map(PathBuf::from),
-            false => None,
-        };
-        let stats = run_analyze(harness, projects, db)?;
-        eprintln!(
-            "{}",
-            Style::stderr().dim(&format!(
-                "store: refreshed just now ({} {} re-analyzed, {} unchanged)",
-                stats.sessions,
-                harness.input_unit(),
-                stats.skipped
-            ))
-        );
-        return Store::open(db).context("open store");
-    }
-
-    let store = Store::open(db).context("open store")?;
-    // No refresh ran, so no guard ran either — refuse a wrong-harness read
-    // here rather than reporting another harness's rows as this one's.
-    guard_harness(&store, harness, db)?;
-    eprint_freshness(&freshness_line(store.meta("analyzed_at")?.as_deref()));
-    Ok(store)
-}
-
 /// Warn when a report knows a subagent total but not its per-agent split.
 ///
 /// A store written before runs were extracted keeps its session totals, and
@@ -2530,47 +2485,6 @@ fn warn_missing_agent_split(coverage: &SplitCoverage) {
                  — run `saniwalens analyze` (or drop --frozen) to fill it in"
             )
         );
-    }
-}
-
-/// Print a freshness line to stderr — dimmed context normally, highlighted
-/// when it carries a staleness hint the user should act on.
-fn eprint_freshness(line: &str) {
-    let style = Style::stderr();
-    if line.contains("saniwalens analyze") {
-        eprintln!("{}", style.warn(line));
-    } else {
-        eprintln!("{}", style.dim(line));
-    }
-}
-
-/// The `--frozen` freshness header: how old the store is, with a refresh hint
-/// once it is older than a day. This is what lets the user *notice* staleness.
-fn freshness_line(analyzed_at: Option<&str>) -> String {
-    let Some(parsed) = analyzed_at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-    else {
-        return "store: freshness unknown (no analyze recorded) — run `saniwalens analyze`"
-            .to_string();
-    };
-    let age_secs = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
-    let hint = if age_secs >= 24 * 3600 {
-        " — run `saniwalens analyze` (or drop --frozen) to refresh"
-    } else {
-        ""
-    };
-    format!(
-        "store: analyzed {} ago (--frozen){hint}",
-        humanize_age(age_secs)
-    )
-}
-
-fn humanize_age(secs: i64) -> String {
-    let secs = secs.max(0);
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m", secs / 60),
-        3600..86400 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86400),
     }
 }
 
@@ -2671,19 +2585,13 @@ fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
     runs
 }
 
-fn usage(
-    harness: &Harness,
-    by: Option<&str>,
-    format: Format,
-    frozen: bool,
-    db: &Path,
-) -> Result<()> {
-    let store = open_for_read(harness, db, frozen)?;
+fn usage(sess: &Session, by: Option<&str>, format: Format) -> Result<()> {
+    let store = &sess.store;
 
     if let Some(by) = by {
         let bucket = Bucket::parse(by)
             .with_context(|| format!("unknown --by value '{by}' (year|month|week|day|hour)"))?;
-        return usage_by_time(&store, bucket, format);
+        return usage_by_time(store, bucket, format);
     }
 
     let skills = store.skill_usage()?;
@@ -2885,14 +2793,8 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 /// Join the catalogued surfaces against usage: each installed surface with its
 /// static cost and (for usage-measurable kinds) invocation count, unused ones
 /// flagged. Usage with no matching surface is shown as orphaned.
-fn inventory(
-    harness: &Harness,
-    filter: &ScopeFilter,
-    format: Format,
-    frozen: bool,
-    db: &Path,
-) -> Result<()> {
-    let store = open_for_read(harness, db, frozen)?;
+fn inventory(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
+    let store = &sess.store;
     let catalog: Vec<_> = store
         .effective_catalog()?
         .into_iter()
@@ -2942,7 +2844,7 @@ fn inventory(
         return Ok(());
     }
 
-    preamble(format, harness.inventory_preamble());
+    preamble(format, sess.harness.inventory_preamble());
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
@@ -3041,14 +2943,8 @@ fn scope_cell(scope: &str, project: &str) -> String {
 /// at session start — real always-on tokens first, then MCP schemas, then
 /// declutter-only (skills/agents, whose body is on-demand). This is the "where
 /// and how to optimize" view, honest about which removals save context.
-fn waste(
-    harness: &Harness,
-    filter: &ScopeFilter,
-    format: Format,
-    frozen: bool,
-    db: &Path,
-) -> Result<()> {
-    let store = open_for_read(harness, db, frozen)?;
+fn waste(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
+    let store = &sess.store;
     let catalog: Vec<_> = store
         .effective_catalog()?
         .into_iter()
@@ -3320,137 +3216,6 @@ fn claude_home() -> Result<PathBuf> {
     })
 }
 
-/// Resolve `--db`, defaulting to a **user-level** store rather than a
-/// cwd-relative file. What gets analyzed is every transcript under
-/// `~/.claude/projects` — one cross-project dataset — so a per-directory
-/// default would build a separate copy of the same store per directory saniwalens
-/// happens to run from, and leave a database inside unrelated Git working
-/// trees.
-///
-/// State, not cache. The store accumulates rows whose source transcripts Claude
-/// Code later prunes, at which point it is the only surviving record of those
-/// sessions and nothing on disk can rebuild it (`storage.md`). A cache
-/// directory is by definition somewhere a cleaner may empty without asking —
-/// exactly the one thing this file cannot survive.
-///
-/// Pure over its inputs (the environment is read by the caller) so the
-/// resolution is testable. Each harness resolves to its own file name, so a
-/// store built by one harness is never reinterpreted as another's rows
-/// (`docs/specs/harness.md`).
-fn store_path(
-    db: Option<PathBuf>,
-    harness: &Harness,
-    state_home: Option<&Path>,
-    home: Option<&Path>,
-) -> Result<PathBuf> {
-    if let Some(db) = db {
-        return Ok(db);
-    }
-    // Both roots must be absolute, for the same reason: honoring a relative one
-    // would reintroduce the cwd-relative store this default exists to avoid.
-    // (For `XDG_STATE_HOME` the XDG spec says as much — a non-absolute value is
-    // invalid and must be ignored.)
-    let base = match state_home.filter(|dir| dir.is_absolute()) {
-        Some(dir) => dir.to_path_buf(),
-        None => home
-            .filter(|dir| dir.is_absolute())
-            .context("HOME is not set to an absolute path")?
-            .join(".local")
-            .join("state"),
-    };
-    Ok(base.join("saniwalens").join(harness.db_file_name()))
-}
-
-/// Move a pre-rename store into place. The store outlives the transcripts it
-/// was parsed from (`storage.md`), so the rename must never orphan it: the
-/// binary has been renamed twice, so the first open under the current name
-/// moves whichever legacy directory exists — the intermediate `agentlens` or
-/// the original `cclens` — renamed under the new name with its per-harness
-/// files, never deleted, never copied over an existing store.
-fn migrate_legacy_store(resolved: &Path) {
-    const LEGACY_DIRS: [&str; 2] = ["agentlens", "cclens"];
-    let Some(new_dir) = resolved.parent() else {
-        return;
-    };
-    let Some(state_base) = new_dir.parent() else {
-        return;
-    };
-    if new_dir.exists() {
-        return;
-    }
-    let Some(legacy_dir) = LEGACY_DIRS
-        .iter()
-        .map(|name| state_base.join(name))
-        .find(|dir| dir.is_dir())
-    else {
-        return; // nothing to move
-    };
-    if std::fs::rename(&legacy_dir, new_dir).is_err() {
-        return; // a move we cannot make is not ours to force
-    }
-    // The per-harness files carry an old name too.
-    let Ok(entries) = std::fs::read_dir(new_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(stem) = name.to_str() else {
-            continue;
-        };
-        let Some(rest) = LEGACY_DIRS
-            .iter()
-            .find_map(|prefix| stem.strip_prefix(prefix))
-        else {
-            continue;
-        };
-        let _ = std::fs::rename(entry.path(), new_dir.join(format!("saniwalens{rest}")));
-    }
-}
-
-/// `store_path` plus the legacy-store move, testable without touching the
-/// environment: the caller supplies both roots. An explicit `--db` is the
-/// user's own choice — the rename is not ours to apply to it.
-fn resolve_db_from(
-    db: Option<&Path>,
-    harness: &Harness,
-    config_db: Option<&Path>,
-    state_home: Option<&Path>,
-    home: Option<&Path>,
-) -> Result<PathBuf> {
-    let explicit = db.or(config_db);
-    let path = store_path(explicit.map(PathBuf::from), harness, state_home, home)?;
-    // The legacy-store move only applies to the pure default resolution: an
-    // explicit `--db` or a configured one is the user's own choice.
-    if db.is_none() && config_db.is_none() {
-        migrate_legacy_store(&path);
-    }
-    Ok(path)
-}
-
-/// `store_path` against the live environment.
-fn resolve_db(db: Option<PathBuf>, harness: &Harness, config_db: Option<&Path>) -> Result<PathBuf> {
-    let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
-    resolve_db_from(
-        db.as_deref(),
-        harness,
-        config_db,
-        state_home.as_deref(),
-        home_dir().map(Path::new),
-    )
-}
-
-/// Where the tool's own config file lives, if anywhere: under
-/// `$XDG_CONFIG_HOME/saniwalens/`, else `~/.config/saniwalens/`. Pure over
-/// its inputs like `store_path`, for the same reason. `None` means there is
-/// no file to read, which means "behave exactly as before".
-fn config_file_path(config_home: Option<&Path>, home: Option<&str>) -> Option<PathBuf> {
-    if let Some(dir) = config_home.filter(|dir| dir.is_absolute()) {
-        return Some(dir.join("saniwalens/config.toml"));
-    }
-    home.filter(|dir| Path::new(dir).is_absolute())
-        .map(|dir| Path::new(dir).join(".config/saniwalens/config.toml"))
-}
-
 /// Column alignment for the table renderer.
 #[derive(Clone, Copy)]
 enum Align {
@@ -3481,70 +3246,6 @@ fn parse_format(value: Option<&str>) -> Result<Format> {
 fn emit_json(value: &serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
-}
-
-/// ANSI styling for the human formats. Colors turn on only when the target is
-/// a terminal, `NO_COLOR` is unset, and `TERM` is not `dumb` — so pipes,
-/// captures, and `--format markdown|json` always get plain bytes.
-#[derive(Clone, Copy)]
-struct Style {
-    on: bool,
-}
-
-impl Style {
-    fn stdout() -> Self {
-        use std::io::IsTerminal;
-        Self {
-            on: use_color(std::io::stdout().is_terminal()),
-        }
-    }
-
-    fn stderr() -> Self {
-        use std::io::IsTerminal;
-        Self {
-            on: use_color(std::io::stderr().is_terminal()),
-        }
-    }
-
-    fn paint(&self, code: &str, text: &str) -> String {
-        if self.on {
-            format!("\x1b[{code}m{text}\x1b[0m")
-        } else {
-            text.to_string()
-        }
-    }
-
-    fn bold(&self, text: &str) -> String {
-        self.paint("1", text)
-    }
-
-    fn dim(&self, text: &str) -> String {
-        self.paint("2", text)
-    }
-
-    /// Section headings (`== … ==`, table headers).
-    fn heading(&self, text: &str) -> String {
-        self.paint("1;36", text)
-    }
-
-    /// Pointers to follow-up commands.
-    fn command(&self, text: &str) -> String {
-        self.paint("36", text)
-    }
-
-    /// Attention: a finding's count, a wedge label, a staleness warning.
-    fn warn(&self, text: &str) -> String {
-        self.paint("33", text)
-    }
-
-    fn good(&self, text: &str) -> String {
-        self.paint("32", text)
-    }
-}
-
-fn use_color(tty: bool) -> bool {
-    tty && std::env::var_os("NO_COLOR").is_none()
-        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
 }
 
 /// Render a table as aligned text or GitHub-flavored markdown. Auto-sizes
@@ -3894,302 +3595,12 @@ mod tests {
     }
 
     #[test]
-    fn store_path_defaults_under_the_user_state_dir() {
-        assert_eq!(
-            store_path(
-                None,
-                &Harness::Claude,
-                Some(Path::new("/tmp/example/state")),
-                None
-            )
-            .unwrap(),
-            PathBuf::from("/tmp/example/state/saniwalens/saniwalens.db")
-        );
-        assert_eq!(
-            store_path(
-                None,
-                &Harness::Claude,
-                None,
-                Some(Path::new("/tmp/example/home"))
-            )
-            .unwrap(),
-            PathBuf::from("/tmp/example/home/.local/state/saniwalens/saniwalens.db")
-        );
-    }
-
-    #[test]
-    fn store_path_gives_each_harness_its_own_file() {
-        // One store per harness: an opencode run never lands in the Claude
-        // file, so an old store is never reinterpreted as another harness.
-        assert_eq!(
-            store_path(
-                None,
-                &Harness::Opencode,
-                Some(Path::new("/tmp/example/state")),
-                None
-            )
-            .unwrap(),
-            PathBuf::from("/tmp/example/state/saniwalens/saniwalens-opencode.db")
-        );
-    }
-
-    #[test]
-    fn store_path_ignores_a_relative_xdg_state_home() {
-        // XDG: a non-absolute XDG_STATE_HOME is invalid and must be ignored —
-        // honoring it would put the store back under the current directory.
-        assert_eq!(
-            store_path(
-                None,
-                &Harness::Claude,
-                Some(Path::new("relative/state")),
-                Some(Path::new("/tmp/example/home"))
-            )
-            .unwrap(),
-            PathBuf::from("/tmp/example/home/.local/state/saniwalens/saniwalens.db")
-        );
-    }
-
-    #[test]
-    fn store_path_without_a_home_is_an_error() {
-        assert!(store_path(None, &Harness::Claude, None, None).is_err());
-    }
-
-    #[test]
-    fn store_path_refuses_a_relative_home() {
-        // The fallback root is held to the same bar as XDG_STATE_HOME: a
-        // relative one would put the store back under the current directory.
-        assert!(
-            store_path(
-                None,
-                &Harness::Claude,
-                None,
-                Some(Path::new("relative/home"))
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn store_path_takes_an_explicit_db_as_is() {
-        // The escape hatch for a deliberately project-local store.
-        assert_eq!(
-            store_path(
-                Some(PathBuf::from("./saniwalens.db")),
-                &Harness::Opencode,
-                Some(Path::new("/tmp/example/state")),
-                Some(Path::new("/tmp/example/home"))
-            )
-            .unwrap(),
-            PathBuf::from("./saniwalens.db")
-        );
-    }
-
-    #[test]
-    fn first_open_moves_a_legacy_store_and_renames_its_files() {
-        // The store outlives the transcripts it was parsed from, so the
-        // rename must never orphan it: the pre-rename directory moves under
-        // the new name, its per-harness files included — never deleted.
-        let dir =
-            std::env::temp_dir().join(format!("saniwalens-migrate-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("cclens")).unwrap();
-        std::fs::write(dir.join("cclens/cclens.db"), b"rows").unwrap();
-        std::fs::write(dir.join("cclens/cclens-opencode.db"), b"rows").unwrap();
-
-        migrate_legacy_store(&dir.join("saniwalens/saniwalens.db"));
-
-        assert_eq!(
-            std::fs::read(dir.join("saniwalens/saniwalens.db")).unwrap(),
-            b"rows"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("saniwalens/saniwalens-opencode.db")).unwrap(),
-            b"rows"
-        );
-        assert!(!dir.join("cclens").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn first_open_moves_an_intermediate_legacy_store_too() {
-        // The binary has been renamed twice: a store living under the
-        // intermediate name moves as well, whichever legacy name it uses.
-        let dir = std::env::temp_dir().join(format!(
-            "saniwalens-migrate-mid-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("agentlens")).unwrap();
-        std::fs::write(dir.join("agentlens/agentlens.db"), b"rows").unwrap();
-        std::fs::write(dir.join("agentlens/agentlens-kilocode.db"), b"rows").unwrap();
-
-        migrate_legacy_store(&dir.join("saniwalens/saniwalens.db"));
-
-        assert_eq!(
-            std::fs::read(dir.join("saniwalens/saniwalens.db")).unwrap(),
-            b"rows"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("saniwalens/saniwalens-kilocode.db")).unwrap(),
-            b"rows"
-        );
-        assert!(!dir.join("agentlens").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_migration_never_touches_an_existing_store() {
-        // A move never overwrites: a store already living under the new name
-        // stays, and the legacy one survives beside it rather than being
-        // deleted to make room.
-        let dir = std::env::temp_dir().join(format!(
-            "saniwalens-migrate-keep-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("cclens")).unwrap();
-        std::fs::write(dir.join("cclens/cclens.db"), b"legacy").unwrap();
-        std::fs::create_dir_all(dir.join("saniwalens")).unwrap();
-        std::fs::write(dir.join("saniwalens/saniwalens.db"), b"current").unwrap();
-
-        migrate_legacy_store(&dir.join("saniwalens/saniwalens.db"));
-
-        assert_eq!(
-            std::fs::read(dir.join("saniwalens/saniwalens.db")).unwrap(),
-            b"current"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("cclens/cclens.db")).unwrap(),
-            b"legacy"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_migration_is_silent_when_nothing_is_to_move() {
-        let dir = std::env::temp_dir().join(format!(
-            "saniwalens-migrate-none-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        migrate_legacy_store(&dir.join("saniwalens/saniwalens.db"));
-
-        assert!(!dir.join("saniwalens").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_rename_applies_only_to_the_default_resolution() {
-        // An explicit `--db` is the user's own choice — the rename is not
-        // ours to apply to it. The default resolution moves the legacy store
-        // into place under the new name.
-        let dir =
-            std::env::temp_dir().join(format!("saniwalens-migrate-db-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("cclens")).unwrap();
-        std::fs::write(dir.join("cclens/cclens.db"), b"rows").unwrap();
-        let explicit = dir.join("chosen.db");
-
-        let resolved = resolve_db_from(
-            Some(&explicit),
-            &Harness::Claude,
-            None,
-            Some(&dir),
-            Some(&dir),
-        )
-        .unwrap();
-
-        assert_eq!(resolved, explicit);
-        assert!(dir.join("cclens/cclens.db").exists());
-
-        let default =
-            resolve_db_from(None, &Harness::Claude, None, Some(&dir), Some(&dir)).unwrap();
-
-        assert_eq!(default, dir.join("saniwalens/saniwalens.db"));
-        assert!(default.exists());
-        assert!(!dir.join("cclens").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn config_db_fills_in_only_when_no_explicit_db() {
-        // The file's db becomes the store, but an explicit `--db` still wins
-        // and the legacy-store move stays out of both.
-        let dir =
-            std::env::temp_dir().join(format!("saniwalens-config-db-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let from_file = dir.join("file.db");
-        let explicit = dir.join("chosen.db");
-
-        let resolved = resolve_db_from(
-            None,
-            &Harness::Claude,
-            Some(&from_file),
-            Some(&dir),
-            Some(&dir),
-        )
-        .unwrap();
-        assert_eq!(resolved, from_file);
-
-        let resolved = resolve_db_from(
-            Some(&explicit),
-            &Harness::Claude,
-            Some(&from_file),
-            Some(&dir),
-            Some(&dir),
-        )
-        .unwrap();
-        assert_eq!(resolved, explicit);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_harness_defaults_to_claude_and_rejects_the_rest() {
-        assert_eq!(parse_harness(None).unwrap(), Harness::Claude);
-        assert_eq!(parse_harness(Some("opencode")).unwrap(), Harness::Opencode);
-        assert!(parse_harness(Some("auto")).is_err());
-    }
-
-    #[test]
     fn parse_profile_defaults_to_none() {
-        // --profile is optional and global, like --harness.
+        // --profile is optional and global, like --sess.harness.
         let cli = Cli::try_parse_from(["saniwalens", "doctor"]).unwrap();
         assert_eq!(cli.profile, None);
         let cli = Cli::try_parse_from(["saniwalens", "--profile", "work", "doctor"]).unwrap();
         assert_eq!(cli.profile.as_deref(), Some("work"));
-    }
-
-    #[test]
-    fn config_file_path_defaults_under_the_user_config_dir() {
-        assert_eq!(
-            config_file_path(Some(Path::new("/tmp/example/config")), None),
-            Some(PathBuf::from("/tmp/example/config/saniwalens/config.toml"))
-        );
-        assert_eq!(
-            config_file_path(None, Some("/tmp/example/home")),
-            Some(PathBuf::from(
-                "/tmp/example/home/.config/saniwalens/config.toml"
-            ))
-        );
-    }
-
-    #[test]
-    fn config_file_path_ignores_a_relative_xdg_config_home() {
-        // A relative XDG_CONFIG_HOME is invalid and must be ignored, for the
-        // same reason store_path ignores a relative XDG_STATE_HOME.
-        assert_eq!(
-            config_file_path(Some(Path::new("relative/config")), None),
-            None
-        );
-    }
-
-    #[test]
-    fn config_file_path_without_a_home_is_none() {
-        // No roots means no file to read, which means "behave as before".
-        assert_eq!(config_file_path(None, None), None);
     }
 
     #[test]
@@ -4220,31 +3631,5 @@ mod tests {
                 optimize_mod::RunMode::Interactive
             ))
         );
-    }
-
-    #[test]
-    fn guard_harness_adopts_a_store_without_a_key() {
-        // A store predating the flag carries no `harness` key and is adopted
-        // by the Claude default, never refused.
-        let mut store = Store::in_memory().unwrap();
-        assert!(guard_harness(&store, &Harness::Claude, Path::new("/tmp/example/x.db")).is_ok());
-        store.set_meta("harness", Harness::Claude.label()).unwrap();
-        assert!(guard_harness(&store, &Harness::Claude, Path::new("/tmp/example/x.db")).is_ok());
-        assert!(guard_harness(&store, &Harness::Opencode, Path::new("/tmp/example/x.db")).is_err());
-    }
-
-    #[test]
-    fn frozen_reads_refuse_a_wrong_harness_store() {
-        // `--frozen` skips the analyze that guards, so the read path guards
-        // itself — otherwise a Claude read would report opencode rows.
-        let path = TempPath::new("guard.db");
-        {
-            let mut store = Store::open(&path.0).unwrap();
-            store
-                .set_meta("harness", Harness::Opencode.label())
-                .unwrap();
-        }
-        assert!(open_for_read(&Harness::Opencode, &path.0, true).is_ok());
-        assert!(open_for_read(&Harness::Claude, &path.0, true).is_err());
     }
 }
