@@ -8,4 +8,5 @@
 pub mod adapter;
 pub mod cli;
 pub mod core;
+pub mod session;
 pub mod store;
