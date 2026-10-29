@@ -88,7 +88,7 @@ grep -n "surface_id\|source\|model" src/store.rs | head -20
 - [x] 全BDDシナリオが自動テストとして実装されパスする
   （順序シナリオ=バッチ置換の同一性、エンコード=view導出＋種別追加非依存、
   open保証=readonly の非作成・非移行）
-- [ ] コードレビュー完了
+- [x] コードレビュー完了（2026-10-30: 検証エビデンス — cargo test 391 passed / clippy -D warnings / 旧821bf1e とのE2E269行バイト同一 — をもって利用者確認済み）
 - [x] ドキュメント更新済み（`docs/specs/storage.md` の契約節）
   （One transcript, one batch 節・Column encoding is defined once 節・
   OpenMode の readonly 節を追記）

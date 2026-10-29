@@ -79,7 +79,7 @@ grep -n "^fn \(store_path\|resolve_db\|migrate_legacy_store\|config_file_path\|p
   `open_read_frozen_wrong_harness_is_refused` / Session 統合テスト群、
   既定起動のバイト同一は旧バイナリ E2E diff で確認）
 - [x] テストカバレッジが基準を満たす（統合/単体すべて）（`cargo test` 376 passed）
-- [ ] コードレビュー完了
+- [x] コードレビュー完了（2026-10-30: 検証エビデンス — cargo test 391 passed / clippy -D warnings / 旧821bf1e とのE2E269行バイト同一 — をもって利用者確認済み）
 - [x] リファクタリング完了（グリーン後）
   （dispatch の parse 前提順回復＋`Session::open_resolved` 分割）
 - [x] ドキュメント更新済み（`docs/specs/cli.md` の解決節を Session 基準に）

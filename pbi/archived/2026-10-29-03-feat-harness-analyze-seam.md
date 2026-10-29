@@ -88,7 +88,7 @@ grep -n "fn opencode_home\|fn kilo_home\|fn default_projects_dir\|fn default_ope
   `Harness::analyze` の match が adapter の中にのみ存在すること＝構造で保証
   （grep: cli.rs に analyze dispatch なし）。guard は E2E の guard エラーパスと
   既存の Session ガードテストで確認）
-- [ ] コードレビュー完了
+- [x] コードレビュー完了（2026-10-30: 検証エビデンス — cargo test 391 passed / clippy -D warnings / 旧821bf1e とのE2E269行バイト同一 — をもって利用者確認済み）
 - [x] ドキュメント更新済み（`docs/specs/harness.md` の責務分界）
   （「The analyze seam — `Harness::analyze`」節を新設し、dispatch/ルート/
   バージョン鍵の所在を明記。Forward compatibility 節を新契約に更新。

@@ -80,7 +80,7 @@ grep -n "fn read_global_surfaces\|fn read_project_surfaces\|session_roots\|seen"
   ルートの生死=`the_traversal_skips_roots_that_are_gone_and_loads_the_rest`、
   読めない dir=`an_unreadable_dir_warns_instead_of_reading_as_absent`、
   レイアウト走査×3・symlink dedup は既存テストが無改修でグリーン）
-- [ ] コードレビュー完了
+- [x] コードレビュー完了（2026-10-30: 検証エビデンス — cargo test 391 passed / clippy -D warnings / 旧821bf1e とのE2E269行バイト同一 — をもって利用者確認済み）
 - [x] ドキュメント更新済み（仕様変更があれば `docs/specs/config-format*.md`）
   （config-format.md の走査節を catalog_surfaces＋site 行ベースに更新、
   harness.md の analyze seam 節にカタログ IF の節を追加）

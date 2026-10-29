@@ -81,7 +81,7 @@ grep -n "fn render_briefing\|fn compose_prompt" src/core/optimize.rs
   `assembly_routes_and_aggregates_like_the_recorded_briefing` /
   `no_observed_floor_reads_as_unknown_not_as_a_cost` を RED→GREEN。
   無効 scope の扱いは parse_scope 無変更＋E2E の不正 --scope パスで確認）
-- [ ] コードレビュー完了
+- [x] コードレビュー完了（2026-10-30: 検証エビデンス — cargo test 391 passed / clippy -D warnings / 旧821bf1e とのE2E269行バイト同一 — をもって利用者確認済み）
 - [x] ドキュメント更新済み（仕様変更があれば `docs/specs/`）
   （cli.md の optimize 節に fetch/assembly の分界を追記、
   architecture.md の core 行に findings 組立を明記）

@@ -79,7 +79,7 @@ grep -n "fn launch_command\|fn run_headless\|RunMode\|fn write_private_tempfile"
   `the_delivery_mode_is_the_flag_over_the_launch_shape`。
   --print の出力全文は旧821bf1e バイナリとのE2E269行のバイト同一で確認。
   実バイナリでの対話/ヘッドレス実起動は手動確認＝「ユーザー作業」に分離）
-- [ ] コードレビュー完了
+- [x] コードレビュー完了（2026-10-30: 検証エビデンス — cargo test 391 passed / clippy -D warnings / 旧821bf1e とのE2E269行バイト同一 — をもって利用者確認済み）
 - [x] ドキュメント更新済み（仕様変更があれば `docs/specs/cli.md`）
   （optimize 節の I/O 分界に deliver seam・DeliveryMode・AdvisorLaunch/
   ProcessAdvisor・Harness::copy を追記）
