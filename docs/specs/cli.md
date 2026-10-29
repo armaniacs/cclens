@@ -54,7 +54,7 @@ it — `--db ./saniwalens.db`.
 
 The tool's own config file lives at
 `${XDG_CONFIG_HOME:-~/.config}/saniwalens/config.toml` (`config_file_path` in
-`cli.rs`; a relative `XDG_CONFIG_HOME` is invalid and ignored, like its
+`session.rs`; a relative `XDG_CONFIG_HOME` is invalid and ignored, like its
 `XDG_STATE_HOME` sibling above). The file is optional — without it every
 invocation behaves exactly as before.
 
@@ -69,7 +69,10 @@ db = "work.db"                 # relative to the config file's directory
 It holds two kinds of defaults plus named profiles `--profile` selects.
 Resolution order, strongest first: explicit flags, the selected profile, the
 file's top-level defaults, then the builtins (`claude`, the per-harness store
-path). A relative `db` joins the directory holding `config.toml` — never the
+path). Flag *values* (`--scope`, `--format`) are parsed before the session is
+built, so an invalid flag fails on its own — no store open, no freshness line
+ahead of the error; `optimize` is the exception that resolves the store path
+first, exactly as the pre-`Session` dispatch did. A relative `db` joins the directory holding `config.toml` — never the
 current working directory — while an explicit `--db` is taken as is, even
 when relative; `~` is not expanded. Unknown keys are ignored so a newer file
 never breaks an older binary. A missing file is silence, not an error; anything

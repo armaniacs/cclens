@@ -118,6 +118,14 @@ impl Session {
         env: &SessionEnv,
     ) -> Result<Self> {
         let path = Self::resolve_path(harness, db, config_db, env)?;
+        Self::open_resolved(harness, path)
+    }
+
+    /// Open and guard an already-resolved path. Split from [`Session::open`]
+    /// so a caller can resolve the path, parse its own flags, and only then
+    /// open — the exact evaluation order `run()`'s optimize arm had before the
+    /// Session seam (`docs/specs/cli.md`).
+    pub(crate) fn open_resolved(harness: &Harness, path: PathBuf) -> Result<Self> {
         let store = Store::open(&path).context("open store")?;
         guard_harness(&store, harness, &path)?;
         Ok(Session {
@@ -200,7 +208,7 @@ impl Session {
         Ok(())
     }
 
-    fn resolve_path(
+    pub(crate) fn resolve_path(
         harness: &Harness,
         db: Option<PathBuf>,
         config_db: Option<&Path>,

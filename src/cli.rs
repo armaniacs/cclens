@@ -265,14 +265,20 @@ pub fn run() -> Result<()> {
     let resolved = resolve_cli(cli.harness.as_deref(), cli.profile.as_deref(), &env)?;
     let harness = resolved.harness;
     let config_db = resolved.config_db;
+    // Flags are parsed before the session is built — the pre-Session dispatch
+    // evaluated `parse_scope`/`parse_format` ahead of any store work, so an
+    // invalid flag fails on its own instead of surfacing a store error (or a
+    // freshness line) first. Byte-identical output, error ordering included
+    // (PBI 01's acceptance criterion).
     match cli.command {
         Command::Analyze {
             projects,
             format,
             db,
         } => {
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open(&harness, db, config_db.as_deref(), &env)?;
-            analyze(&sess, projects, parse_format(format.as_deref())?)
+            analyze(&sess, projects, fmt)
         }
         Command::Usage {
             by,
@@ -280,6 +286,7 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => {
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -288,7 +295,7 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            usage(&sess, by.as_deref(), parse_format(format.as_deref())?)
+            usage(&sess, by.as_deref(), fmt)
         }
         Command::Inventory {
             scope,
@@ -296,6 +303,8 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => {
+            let filter = parse_scope(scope.as_deref())?;
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -304,11 +313,7 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            inventory(
-                &sess,
-                &parse_scope(scope.as_deref())?,
-                parse_format(format.as_deref())?,
-            )
+            inventory(&sess, &filter, fmt)
         }
         Command::Waste {
             scope,
@@ -316,6 +321,8 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => {
+            let filter = parse_scope(scope.as_deref())?;
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -324,13 +331,10 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            waste(
-                &sess,
-                &parse_scope(scope.as_deref())?,
-                parse_format(format.as_deref())?,
-            )
+            waste(&sess, &filter, fmt)
         }
         Command::Overhead { format, frozen, db } => {
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -339,9 +343,10 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            overhead(&sess, parse_format(format.as_deref())?)
+            overhead(&sess, fmt)
         }
         Command::Prompts { format, frozen, db } => {
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -350,7 +355,7 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            prompts(&sess, parse_format(format.as_deref())?)
+            prompts(&sess, fmt)
         }
         Command::Failures {
             scope,
@@ -358,6 +363,8 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => {
+            let filter = parse_scope(scope.as_deref())?;
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -366,13 +373,10 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            failures(
-                &sess,
-                &parse_scope(scope.as_deref())?,
-                parse_format(format.as_deref())?,
-            )
+            failures(&sess, &filter, fmt)
         }
         Command::Stuck { format, frozen, db } => {
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -381,7 +385,7 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            stuck(&sess, parse_format(format.as_deref())?)
+            stuck(&sess, fmt)
         }
         Command::Doctor {
             scope,
@@ -389,6 +393,8 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => {
+            let filter = parse_scope(scope.as_deref())?;
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -397,15 +403,12 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            doctor(
-                &sess,
-                &parse_scope(scope.as_deref())?,
-                parse_format(format.as_deref())?,
-            )
+            doctor(&sess, &filter, fmt)
         }
         Command::Sql { query, format, db } => {
+            let fmt = parse_format(format.as_deref())?;
             let sess = Session::open_readonly(&harness, db, config_db.as_deref(), &env)?;
-            sql(&sess, query.as_deref(), parse_format(format.as_deref())?)
+            sql(&sess, query.as_deref(), fmt)
         }
         Command::Optimize {
             projects,
@@ -415,15 +418,13 @@ pub fn run() -> Result<()> {
             print,
             verbose,
         } => {
-            let sess = Session::open(&harness, db, config_db.as_deref(), &env)?;
-            optimize(
-                &sess,
-                projects,
-                &parse_scope(scope.as_deref())?,
-                frozen,
-                print,
-                verbose,
-            )
+            // Resolve (including the legacy-store move) before parsing --scope,
+            // then open after — the pre-Session dispatch's exact order, kept so
+            // double failures report the same error the old binary did.
+            let path = Session::resolve_path(&harness, db, config_db.as_deref(), &env)?;
+            let filter = parse_scope(scope.as_deref())?;
+            let sess = Session::open_resolved(&harness, path)?;
+            optimize(&sess, projects, &filter, frozen, print, verbose)
         }
     }
 }
