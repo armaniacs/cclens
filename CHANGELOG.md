@@ -7,6 +7,25 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に従い、
 バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
+## [0.5.1] - 2026-10-29
+
+### Added
+
+- 設定ファイル（`~/.config/saniwalens/config.toml`）に対応。
+  既定ハーネス・既定ストアと名前付きプロファイル（`--profile` で選択）
+  を持てる。相対 `db` は config ファイルのあるディレクトリ基準で解決する。
+
+### Changed
+
+- `saniwalens --version` がビルド元の版を名乗る（git タグ由来。ソース
+  ビルドの `0.0.0` 表示を解消）。
+- `keywords` の `claude` を `coding-agent` に（マルチハーネスの位置づけに合わせる）。
+
+### Fixed
+
+- トークン無しでも CI がグリーンになるよう cachix 手順を条件化。
+  リリース側の nix ジョブも同型でスキップする。
+
 ## [0.5.0] - 2026-10-28
 
 ### Added
