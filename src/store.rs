@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use rusqlite::params_from_iter;
 
+use crate::core::period::TimeRange;
 use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::SubagentRun;
 use crate::core::surface::Surface;
@@ -502,6 +504,64 @@ fn ensure_owner_only(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The SQL fragment (a leading ` AND `) and epoch binds that narrow `column`
+/// to `range`. Both ends are inclusive — `--until` counts the whole day it
+/// names — and an unbounded range renders nothing, so a query's text and its
+/// results are unchanged without the period flags. **The one place** the
+/// report views' window becomes SQL: queries assemble it into their WHERE
+/// rather than growing per-query branches.
+fn range_clause(range: TimeRange, column: &str) -> (String, Vec<i64>) {
+    let mut clauses = Vec::new();
+    let mut binds = Vec::new();
+    if let Some(start) = range.start {
+        clauses.push(format!("{column} >= ?"));
+        binds.push(start);
+    }
+    if let Some(end) = range.end {
+        clauses.push(format!("{column} <= ?"));
+        binds.push(end);
+    }
+    if clauses.is_empty() {
+        (String::new(), binds)
+    } else {
+        (format!(" AND {}", clauses.join(" AND ")), binds)
+    }
+}
+
+/// The same window for a uniform RFC 3339 UTC timestamp column
+/// (`sessions.started_at`): lexicographic order is chronological order for
+/// the one format the writer stamps (`epoch_ms_to_rfc3339`), and the upper
+/// bound is the *exclusive* next second, so a millisecond fraction inside the
+/// final second of the named day stays in. A session the writer could not
+/// stamp (empty timestamp, no observable start) is **excluded** from any
+/// windowed figure rather than guessed into it.
+fn range_clause_utc_text(range: TimeRange, column: &str) -> (String, Vec<String>) {
+    let mut clauses = Vec::new();
+    let mut binds = Vec::new();
+    if let Some(start) = range.start {
+        clauses.push(format!("{column} >= ?"));
+        binds.push(epoch_to_rfc3339_utc(start));
+    }
+    if let Some(end) = range.end {
+        clauses.push(format!("{column} < ?"));
+        binds.push(epoch_to_rfc3339_utc(end + 1));
+    }
+    if clauses.is_empty() {
+        (String::new(), binds)
+    } else {
+        clauses.push(format!("{column} <> ''"));
+        (format!(" AND {}", clauses.join(" AND ")), binds)
+    }
+}
+
+/// The RFC 3339 UTC text of an epoch second, in the one format
+/// `sessions.started_at` is stamped with.
+fn epoch_to_rfc3339_utc(epoch: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
 impl Store {
     /// Open the store at `path` under a typed guarantee ([`OpenMode`]): the one
     /// open path, with what it may do — create, chmod, migrate — spelled by the
@@ -909,19 +969,20 @@ impl Store {
     /// every store written before paths were recorded — invisibly, since the
     /// output would look normal. An empty result surfaces as "no thrash
     /// episodes", which tells the user to re-analyze.
-    pub fn file_edits(&self) -> Result<Vec<FileEdit>> {
+    pub fn file_edits(&self, range: TimeRange) -> Result<Vec<FileEdit>> {
         // Which column holds the full path is EVENT_ENCODING's definition for
         // `file_edit`; this reader takes it from there instead of repeating it.
         let path = encoding_column("file_edit", EventRole::FilePath);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
         let sql = format!(
             "SELECT s.project, e.session_id, e.{path}, e.started_epoch
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'file_edit' AND e.{path} IS NOT NULL
+             WHERE e.kind = 'file_edit' AND e.{path} IS NOT NULL{filter}
              ORDER BY e.started_epoch"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(FileEdit {
                     project: row.get(0)?,
                     session_id: row.get(1)?,
@@ -935,7 +996,7 @@ impl Store {
 
     /// Counts of a work-event kind by id (e.g. Bash leading word, edited file),
     /// most frequent first.
-    pub fn work_counts(&self, kind: &str) -> Result<Vec<(String, i64)>> {
+    pub fn work_counts(&self, kind: &str, range: TimeRange) -> Result<Vec<(String, i64)>> {
         // Which meaning a work row's id carries depends on its kind, and
         // EVENT_ENCODING is where that is defined; a kind with no entry is
         // rejected rather than read from an arbitrary column.
@@ -944,27 +1005,36 @@ impl Store {
             "bash_cmd" => encoding_column("bash_cmd", EventRole::CommandWord),
             other => anyhow::bail!("no encoding defined for work-event kind {other:?}"),
         };
+        let (filter, binds) = range_clause(range, "started_epoch");
         let sql = format!(
-            "SELECT {id}, COUNT(*) FROM events WHERE kind = ?1
+            "SELECT {id}, COUNT(*) FROM events WHERE kind = ?1{filter}
              GROUP BY {id} ORDER BY COUNT(*) DESC"
         );
+        let kind_cell = rusqlite::types::Value::Text(kind.to_string());
+        let mut params: Vec<rusqlite::types::Value> = vec![kind_cell];
+        params.extend(binds.iter().copied().map(rusqlite::types::Value::from));
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params_from_iter(params), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Counts of tool failures by category, most frequent first.
-    pub fn error_counts(&self) -> Result<Vec<(String, i64)>> {
+    pub fn error_counts(&self, range: TimeRange) -> Result<Vec<(String, i64)>> {
         let category = encoding_column("tool_error", EventRole::Category);
+        let (filter, binds) = range_clause(range, "started_epoch");
         let sql = format!(
-            "SELECT {category}, COUNT(*) FROM events WHERE kind = 'tool_error'
+            "SELECT {category}, COUNT(*) FROM events WHERE kind = 'tool_error'{filter}
              GROUP BY {category} ORDER BY COUNT(*) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -974,18 +1044,21 @@ impl Store {
     /// category can be attributed to the project whose config should carry the
     /// fix — backing a `--project` filter and the dominant-project line in the
     /// summary.
-    pub fn error_counts_by_project(&self) -> Result<Vec<(String, String, i64)>> {
+    pub fn error_counts_by_project(&self, range: TimeRange) -> Result<Vec<(String, String, i64)>> {
         let category = encoding_column("tool_error", EventRole::Category);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
         let sql = format!(
             "SELECT s.project, e.{category}, COUNT(*)
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'tool_error'
+             WHERE e.kind = 'tool_error'{filter}
              GROUP BY s.project, e.{category}
              ORDER BY COUNT(*) DESC, s.project, e.{category}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -995,9 +1068,14 @@ impl Store {
     /// behind a friction count — the actual failing paths/files — so the reader
     /// (or a seeded agent) need not re-mine the transcripts. Earliest examples
     /// first within a group; empty excerpts are skipped.
-    pub fn error_examples(&self, per_group: u32) -> Result<Vec<(String, String, String)>> {
+    pub fn error_examples(
+        &self,
+        per_group: u32,
+        range: TimeRange,
+    ) -> Result<Vec<(String, String, String)>> {
         let category = encoding_column("tool_error", EventRole::Category);
         let excerpt = encoding_column("tool_error", EventRole::Excerpt);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
         let sql = format!(
             "SELECT project, category, excerpt FROM (
                  SELECT s.project AS project, e.{category} AS category, e.{excerpt} AS excerpt,
@@ -1005,14 +1083,19 @@ impl Store {
                             PARTITION BY s.project, e.{category} ORDER BY e.id
                         ) AS rn
                  FROM events e JOIN sessions s ON e.session_id = s.id
-                 WHERE e.kind = 'tool_error' AND e.{excerpt} IS NOT NULL AND e.{excerpt} <> ''
+                 WHERE e.kind = 'tool_error' AND e.{excerpt} IS NOT NULL AND e.{excerpt} <> ''{filter}
              )
-             WHERE rn <= ?1
+             WHERE rn <= ?
              ORDER BY project, category, rn"
         );
+        // Anonymous placeholders throughout: the range bounds bind first (the
+        // filter sits before the LIMIT), the per-group cap last.
+        let mut params: Vec<rusqlite::types::Value> =
+            binds.iter().copied().map(rusqlite::types::Value::from).collect();
+        params.push(rusqlite::types::Value::Integer(i64::from(per_group)));
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([per_group], |row| {
+            .query_map(params_from_iter(params), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1025,19 +1108,23 @@ impl Store {
     /// Edit / a Playwright locator — so a report separates file friction from a
     /// browser miss that merely reads as "not found", and the seeded agent need
     /// not re-derive the attribution from the transcripts.
-    pub fn error_tool_breakdown(&self) -> Result<Vec<(String, String, String, i64)>> {
+    pub fn error_tool_breakdown(
+        &self,
+        range: TimeRange,
+    ) -> Result<Vec<(String, String, String, i64)>> {
         let category = encoding_column("tool_error", EventRole::Category);
         let tool = encoding_column("tool_error", EventRole::OriginatingTool);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
         let sql = format!(
             "SELECT s.project, e.{category}, COALESCE(e.{tool}, 'unknown'), COUNT(*)
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'tool_error'
+             WHERE e.kind = 'tool_error'{filter}
              GROUP BY s.project, e.{category}, e.{tool}
              ORDER BY COUNT(*) DESC, s.project, e.{category}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1046,34 +1133,38 @@ impl Store {
 
     /// Counts of prompts by behavioral class (`source` column on prompt events),
     /// most frequent first.
-    pub fn prompt_behavior_counts(&self) -> Result<Vec<(String, i64)>> {
+    pub fn prompt_behavior_counts(&self, range: TimeRange) -> Result<Vec<(String, i64)>> {
         let behavior = encoding_column("prompt", EventRole::PromptBehavior);
+        let (filter, binds) = range_clause(range, "started_epoch");
         let sql = format!(
-            "SELECT {behavior}, COUNT(*) FROM events WHERE kind = 'prompt' AND {behavior} IS NOT NULL
+            "SELECT {behavior}, COUNT(*) FROM events WHERE kind = 'prompt' AND {behavior} IS NOT NULL{filter}
              GROUP BY {behavior} ORDER BY COUNT(*) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Per-skill usage rollup, most-invoked first.
-    pub fn skill_usage(&self) -> Result<Vec<SkillUsage>> {
-        let mut stmt = self.conn.prepare(
+    pub fn skill_usage(&self, range: TimeRange) -> Result<Vec<SkillUsage>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT surface_id,
                     COUNT(*),
                     SUM(out_tokens),
                     SUM(ctx_growth),
                     SUM(duration_sec)
              FROM events
-             WHERE surface_kind = 'skill'
+             WHERE surface_kind = 'skill'{filter}
              GROUP BY surface_id
-             ORDER BY COUNT(*) DESC, surface_id",
-        )?;
+             ORDER BY COUNT(*) DESC, surface_id"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(SkillUsage {
                     skill: row.get(0)?,
                     invocations: row.get(1)?,
@@ -1114,16 +1205,19 @@ impl Store {
     /// count is part of the answer because the floor is a minimum over
     /// observations: one resumed session alone still overstates it, and the
     /// count is what makes that visible.
-    pub fn baseline_floor_per_project(&self) -> Result<Vec<(String, i64, i64)>> {
-        let mut stmt = self.conn.prepare(
+    pub fn baseline_floor_per_project(&self, range: TimeRange) -> Result<Vec<(String, i64, i64)>> {
+        let (filter, binds) = range_clause_utc_text(range, "s.started_at");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT s.project, MIN(e.ctx_start), COUNT(*)
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'session_start' AND e.ctx_start > 0
+             WHERE e.kind = 'session_start' AND e.ctx_start > 0{filter}
              GROUP BY s.project
-             ORDER BY MIN(e.ctx_start) DESC",
-        )?;
+             ORDER BY MIN(e.ctx_start) DESC"
+        ))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1131,11 +1225,15 @@ impl Store {
     /// The global empirical always-on floor — the leanest session start observed
     /// anywhere. `None` when no session start was observed at all, so callers
     /// report the metric as unavailable instead of inventing a zero.
-    pub fn baseline_floor(&self) -> Result<Option<i64>> {
+    pub fn baseline_floor(&self, range: TimeRange) -> Result<Option<i64>> {
+        let (filter, binds) = range_clause_utc_text(range, "s.started_at");
         let floor = self.conn.query_row(
-            "SELECT MIN(ctx_start) FROM events
-             WHERE kind = 'session_start' AND ctx_start > 0",
-            [],
+            &format!(
+                "SELECT MIN(e.ctx_start) FROM events e
+                 JOIN sessions s ON e.session_id = s.id
+                 WHERE e.kind = 'session_start' AND e.ctx_start > 0{filter}"
+            ),
+            params_from_iter(binds),
             |row| row.get(0),
         )?;
         Ok(floor)
@@ -1143,20 +1241,25 @@ impl Store {
 
     /// How much data the store holds: `(sessions, distinct projects)` — the
     /// summary's "what was analyzed" context line.
-    pub fn session_stats(&self) -> Result<(i64, i64)> {
+    pub fn session_stats(&self, range: TimeRange) -> Result<(i64, i64)> {
+        let (filter, binds) = range_clause_utc_text(range, "started_at");
         let row = self.conn.query_row(
-            "SELECT COUNT(*), COUNT(DISTINCT project) FROM sessions",
-            [],
+            &format!("SELECT COUNT(*), COUNT(DISTINCT project) FROM sessions WHERE 1=1{filter}"),
+            params_from_iter(binds),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(row)
     }
 
     /// Total subagent output tokens and subagent count across all sessions.
-    pub fn subagent_totals(&self) -> Result<(i64, i64)> {
+    pub fn subagent_totals(&self, range: TimeRange) -> Result<(i64, i64)> {
+        let (filter, binds) = range_clause_utc_text(range, "started_at");
         let row = self.conn.query_row(
-            "SELECT COALESCE(SUM(sub_tokens), 0), COALESCE(SUM(sub_agent_count), 0) FROM sessions",
-            [],
+            &format!(
+                "SELECT COALESCE(SUM(sub_tokens), 0), COALESCE(SUM(sub_agent_count), 0)
+                 FROM sessions WHERE 1=1{filter}"
+            ),
+            params_from_iter(binds),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(row)
@@ -1174,15 +1277,17 @@ impl Store {
     /// runs could be extracted keep their totals but have no rows here; a
     /// report reconciles the two with `core::subagent::SplitCoverage` rather
     /// than presenting these rows as the whole breakdown.
-    pub fn subagent_by_agent(&self) -> Result<Vec<AgentCost>> {
-        let mut stmt = self.conn.prepare(
+    pub fn subagent_by_agent(&self, range: TimeRange) -> Result<Vec<AgentCost>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT agent, COUNT(*), COALESCE(SUM(out_tokens), 0)
              FROM subagent_runs
+             WHERE 1=1{filter}
              GROUP BY agent
-             ORDER BY COALESCE(SUM(out_tokens), 0) DESC, COUNT(*) DESC",
-        )?;
+             ORDER BY COALESCE(SUM(out_tokens), 0) DESC, COUNT(*) DESC"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(AgentCost {
                     agent: row.get(0)?,
                     runs: row.get(1)?,
@@ -1195,28 +1300,32 @@ impl Store {
 
     /// Invocation counts per surface `(kind, id)` across all event kinds — the
     /// usage side of the catalog join for every surface, not just skills.
-    pub fn usage_counts(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
+    pub fn usage_counts(&self, range: TimeRange) -> Result<Vec<(String, String, i64)>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT surface_kind, surface_id, COUNT(*)
              FROM events
-             WHERE surface_kind IS NOT NULL
-             GROUP BY surface_kind, surface_id",
-        )?;
+             WHERE surface_kind IS NOT NULL{filter}
+             GROUP BY surface_kind, surface_id"
+        ))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Per-event costs for skill invocations, for time bucketing in the report.
-    pub fn skill_event_costs(&self) -> Result<Vec<EventCost>> {
-        let mut stmt = self.conn.prepare(
+    pub fn skill_event_costs(&self, range: TimeRange) -> Result<Vec<EventCost>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT started_epoch, out_tokens, ctx_growth, duration_sec
              FROM events
-             WHERE surface_kind = 'skill'",
-        )?;
+             WHERE surface_kind = 'skill'{filter}"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(EventCost {
                     started_epoch: row.get(0)?,
                     out_tokens: row.get(1)?,
@@ -1320,25 +1429,26 @@ impl Store {
     /// project P joins P's project row when one exists for that `(kind, id)`,
     /// else the global row. One event therefore counts on exactly one row
     /// (`docs/specs/surfaces.md`).
-    pub fn effective_catalog(&self) -> Result<Vec<CatalogEntry>> {
-        let mut stmt = self.conn.prepare(
+    pub fn effective_catalog(&self, range: TimeRange) -> Result<Vec<CatalogEntry>> {
+        let (filter, binds) = range_clause(range, "e.started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT f.kind, f.id, f.scope, f.project, f.static_tokens,
                     f.startup_tokens, f.load_mode, COUNT(u.event_id)
              FROM surfaces f
              LEFT JOIN (SELECT e.id AS event_id, e.surface_kind, e.surface_id,
                                s.project AS session_project
                         FROM events e JOIN sessions s ON e.session_id = s.id
-                        WHERE e.surface_kind IS NOT NULL) u
+                        WHERE e.surface_kind IS NOT NULL{filter}) u
                ON u.surface_kind = f.kind AND u.surface_id = f.id
               AND ((f.scope = 'project' AND u.session_project = f.project)
                 OR (f.scope = 'global' AND u.session_project NOT IN (
                       SELECT p.project FROM surfaces p
                       WHERE p.kind = f.kind AND p.id = f.id AND p.scope = 'project')))
              GROUP BY f.kind, f.id, f.scope, f.project
-             ORDER BY f.kind, f.id, f.scope, f.project",
-        )?;
+             ORDER BY f.kind, f.id, f.scope, f.project"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(CatalogEntry {
                     kind: row.get(0)?,
                     id: row.get(1)?,
@@ -1601,6 +1711,7 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::period::TimeRange;
     use crate::core::surface::{LoadMode, Scope};
 
     /// The store is agnostic to which analysis-semantics pair a harness
@@ -1725,7 +1836,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.subagent_by_agent().unwrap(),
+            store.subagent_by_agent(TimeRange::ALL).unwrap(),
             vec![
                 AgentCost {
                     agent: Some("code-writer".to_string()),
@@ -1833,7 +1944,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.subagent_by_agent().unwrap(),
+            store.subagent_by_agent(TimeRange::ALL).unwrap(),
             vec![AgentCost {
                 agent: Some("Explore".to_string()),
                 runs: 1,
@@ -1863,7 +1974,7 @@ mod tests {
             ))
             .unwrap();
 
-        let usage = store.skill_usage().unwrap();
+        let usage = store.skill_usage(TimeRange::ALL).unwrap();
 
         assert_eq!(
             usage,
@@ -1905,7 +2016,7 @@ mod tests {
             ))
             .unwrap();
 
-        let usage = store.skill_usage().unwrap();
+        let usage = store.skill_usage(TimeRange::ALL).unwrap();
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].invocations, 1);
         assert_eq!(usage[0].out_tokens, 999);
@@ -1961,7 +2072,7 @@ mod tests {
             ])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
 
         assert_eq!(catalog.len(), 2);
         let global = catalog.iter().find(|e| e.scope == "global").unwrap();
@@ -1997,7 +2108,7 @@ mod tests {
             .replace_surfaces(&[surface("pr-create", Scope::Global, 40)])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].uses, 2);
     }
@@ -2103,7 +2214,7 @@ mod tests {
 
         let store = Store::from_connection(store.conn).unwrap();
 
-        assert_eq!(store.effective_catalog().unwrap().len(), 1);
+        assert_eq!(store.effective_catalog(TimeRange::ALL).unwrap().len(), 1);
     }
 
     #[test]
@@ -2453,9 +2564,9 @@ mod tests {
         });
         store.ingest(IngestBatch::new(&beta, &[], &[])).unwrap();
 
-        assert_eq!(store.baseline_floor().unwrap(), Some(12000));
+        assert_eq!(store.baseline_floor(TimeRange::ALL).unwrap(), Some(12000));
         assert_eq!(
-            store.baseline_floor_per_project().unwrap(),
+            store.baseline_floor_per_project(TimeRange::ALL).unwrap(),
             vec![
                 ("beta".to_string(), 40000, 1),
                 ("alpha".to_string(), 12000, 2)
@@ -2481,7 +2592,7 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(store.baseline_floor().unwrap(), Some(50000));
+        assert_eq!(store.baseline_floor(TimeRange::ALL).unwrap(), Some(50000));
     }
 
     #[test]
@@ -2533,8 +2644,11 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(store.baseline_floor().unwrap(), None);
-        assert_eq!(store.baseline_floor_per_project().unwrap(), vec![]);
+        assert_eq!(store.baseline_floor(TimeRange::ALL).unwrap(), None);
+        assert_eq!(
+            store.baseline_floor_per_project(TimeRange::ALL).unwrap(),
+            vec![]
+        );
     }
 
     #[test]
@@ -2599,7 +2713,7 @@ mod tests {
             .replace_surfaces(&[skill_surface("repro", Scope::Global, 1015, 7)])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
         assert_eq!(catalog[0].static_tokens, Some(1015));
         assert_eq!(catalog[0].startup_tokens, Some(7));
     }
@@ -2614,7 +2728,7 @@ mod tests {
             .replace_surfaces(&[surface("new", Scope::Global, 1)])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].id, "new");
     }
@@ -2700,7 +2814,7 @@ mod tests {
             )]))
             .unwrap();
 
-        let rows = store.error_counts_by_project().unwrap();
+        let rows = store.error_counts_by_project(TimeRange::ALL).unwrap();
 
         // Densest (project, category) pair first — alpha owns the friction.
         assert_eq!(
@@ -2726,7 +2840,7 @@ mod tests {
             .unwrap();
 
         // Two examples per group, earliest first — the third is dropped.
-        let examples = store.error_examples(2).unwrap();
+        let examples = store.error_examples(2, TimeRange::ALL).unwrap();
         assert_eq!(
             examples,
             vec![
@@ -2757,7 +2871,7 @@ mod tests {
         store.ingest(IngestBatch::new(&b, &[], &[])).unwrap();
         store.ingest(IngestBatch::new(&c, &[], &[])).unwrap();
 
-        assert_eq!(store.session_stats().unwrap(), (3, 2));
+        assert_eq!(store.session_stats(TimeRange::ALL).unwrap(), (3, 2));
     }
 
     #[test]
@@ -2805,7 +2919,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.file_edits().unwrap(),
+            store.file_edits(TimeRange::ALL).unwrap(),
             vec![FileEdit {
                 project: "alpha".to_string(),
                 session_id: "a1".to_string(),
@@ -2831,7 +2945,7 @@ mod tests {
             )]))
             .unwrap();
 
-        assert_eq!(store.file_edits().unwrap(), vec![]);
+        assert_eq!(store.file_edits(TimeRange::ALL).unwrap(), vec![]);
     }
 
     #[test]
@@ -2939,7 +3053,7 @@ mod tests {
             .unwrap();
 
         // path-not-found splits Read 2 / Bash 1, densest tool first.
-        let rows = store.error_tool_breakdown().unwrap();
+        let rows = store.error_tool_breakdown(TimeRange::ALL).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -3126,5 +3240,164 @@ mod tests {
             tool_errors_view_sql(&extended),
             "the view is defined only by the tool_error entry"
         );
+    }
+
+    // ---- PBI 2026-10-30-01: the report views' evaluation window ----
+
+    fn span_at(skill: &str, epoch_secs: i64, out_tokens: u64) -> Span {
+        Span {
+            skill: skill.to_string(),
+            source: Source::Slash,
+            started_epoch_ms: epoch_secs * 1000,
+            duration_sec: 2.0,
+            out_tokens,
+            ctx_growth: 5,
+            ctx_start: 0,
+            ctx_peak: 5,
+            model: None,
+            is_trailing: false,
+            spawns: Vec::new(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            sub_tokens_estimated: false,
+        }
+    }
+
+    #[test]
+    fn a_range_narrows_event_aggregates_at_the_inclusive_bounds() {
+        let mut store = Store::in_memory().unwrap();
+        let s = session("s1");
+        let spans = [
+            span_at("commit", 1_000, 100),
+            span_at("commit", 2_000, 200),
+            span_at("commit", 3_000, 400),
+        ];
+        store.ingest(IngestBatch::new(&s, &spans, &[])).unwrap();
+
+        // Both ends are inclusive: a one-second window catches the span that
+        // starts at it, and nothing else.
+        let rollup = store
+            .skill_usage(TimeRange {
+                start: Some(2_000),
+                end: Some(2_000),
+            })
+            .unwrap();
+        assert_eq!(rollup.len(), 1);
+        assert_eq!(rollup[0].invocations, 1);
+        assert_eq!(rollup[0].out_tokens, 200);
+
+        // Without the period flags the whole spine comes back, unchanged.
+        assert_eq!(store.skill_usage(TimeRange::ALL).unwrap()[0].invocations, 3);
+    }
+
+    #[test]
+    fn a_range_narrows_session_aggregates_by_the_stamped_utc_text() {
+        let mut store = Store::in_memory().unwrap();
+        // Last second of JST 2026-10-07: local midnight of the 8th is
+        // 2026-10-07T15:00:00Z.
+        let end = 1_791_385_200 - 1;
+        // A session that started at 23:59:59.5 JST on the 7th — the millisecond
+        // fraction sits inside the final second, so it stays in the window.
+        let mut inside = session("inside");
+        inside.sub_tokens = 400;
+        inside.sub_agent_count = 1;
+        inside.start = Some(SessionStart {
+            timestamp_ms: end * 1000 + 500,
+            ctx: 10_000,
+        });
+        store.ingest(IngestBatch::new(&inside, &[], &[])).unwrap();
+        // A session that started at local midnight of the 8th — outside.
+        let mut outside = session("outside");
+        outside.sub_tokens = 500;
+        outside.sub_agent_count = 1;
+        outside.start = Some(SessionStart {
+            timestamp_ms: (end + 1) * 1000,
+            ctx: 11_000,
+        });
+        store.ingest(IngestBatch::new(&outside, &[], &[])).unwrap();
+
+        let range = TimeRange {
+            start: None,
+            end: Some(end),
+        };
+        assert_eq!(store.subagent_totals(range).unwrap(), (400, 1));
+        assert_eq!(store.session_stats(range).unwrap().0, 1);
+        // Without the flags both sessions count.
+        assert_eq!(store.subagent_totals(TimeRange::ALL).unwrap(), (900, 2));
+    }
+
+    #[test]
+    fn inventory_narrows_the_usage_half_and_keeps_the_catalog_rows() {
+        let mut store = Store::in_memory().unwrap();
+        let s = session("s1");
+        let spans = [span_at("commit", 1_000, 100)];
+        let calls = [UsageEvent {
+            surface_kind: "agent".to_string(),
+            surface_id: "Task".to_string(),
+            started_epoch_ms: 2_000_000,
+            tool_use_id: None,
+        }];
+        store.ingest(IngestBatch::new(&s, &spans, &calls)).unwrap();
+        store
+            .replace_surfaces(&[
+                skill_surface("commit", Scope::Global, 10, 5),
+                surface("Task", Scope::Global, 20),
+            ])
+            .unwrap();
+
+        // The span starts at 1_000, the agent call at 2_000: a window ending
+        // before the call narrows the usage half only — the catalog (current
+        // config) keeps both rows.
+        let catalog = store
+            .effective_catalog(TimeRange {
+                start: None,
+                end: Some(1_500),
+            })
+            .unwrap();
+        assert_eq!(catalog.len(), 2, "catalog rows never disappear");
+        let skill = catalog
+            .iter()
+            .find(|e| e.kind == "skill" && e.id == "commit")
+            .unwrap();
+        assert_eq!(skill.uses, 1, "the span is inside the window");
+        let task = catalog
+            .iter()
+            .find(|e| e.kind == "skill" && e.id == "Task")
+            .unwrap();
+        assert_eq!(task.uses, 0, "the call is outside the window");
+    }
+
+    #[test]
+    fn a_range_narrows_failure_counts_and_work_events() {
+        let mut store = Store::in_memory().unwrap();
+        let mut s1 = session("s1");
+        s1.start = Some(SessionStart {
+            timestamp_ms: 500_000,
+            ctx: 1_000,
+        });
+        let errors = [(1_000_000, "path-not-found", "no /x", "Read", "/x")];
+        let edits = [
+            (2_000_000, "file_edit", "main.rs", Some("/repo/main.rs")),
+            (3_000_000, "file_edit", "lib.rs", Some("/repo/lib.rs")),
+        ];
+        store
+            .ingest(
+                IngestBatch::new(&s1, &[], &[])
+                    .tool_errors(&errors)
+                    .work_events(&edits),
+            )
+            .unwrap();
+
+        let range = TimeRange {
+            start: Some(2_500),
+            end: None,
+        };
+        assert!(store.error_counts(range).unwrap().is_empty());
+        let edits = store.file_edits(range).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].path, "/repo/lib.rs");
+        // Unbounded, everything comes back.
+        assert_eq!(store.error_counts(TimeRange::ALL).unwrap().len(), 1);
+        assert_eq!(store.file_edits(TimeRange::ALL).unwrap().len(), 2);
     }
 }
