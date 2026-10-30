@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rusqlite::params_from_iter;
 
-use crate::core::period::TimeRange;
+use crate::core::period::{TimeRange, WindowPair};
 use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::SubagentRun;
 use crate::core::surface::Surface;
@@ -324,6 +324,74 @@ pub struct SkillUsage {
     pub out_tokens: i64,
     pub ctx_growth: i64,
     pub duration_sec: f64,
+}
+
+/// One row of the trend view's per-kind event rollup: how many events of the
+/// kind ran in a window, and the output tokens / wall-clock they cost.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct KindRollup {
+    pub kind: String,
+    pub events: i64,
+    pub out_tokens: i64,
+    pub duration_sec: f64,
+}
+
+/// One aggregate computed for both windows of a comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwoWindow<T> {
+    pub current: T,
+    pub previous: T,
+}
+
+/// The trend view's aggregates for one window: the per-kind event rollup, the
+/// per-skill usage, the session count, and the subagent runs/tokens total.
+#[derive(Debug, PartialEq)]
+pub struct TrendWindowAggregates {
+    pub by_kind: Vec<KindRollup>,
+    pub skills: Vec<SkillUsage>,
+    pub sessions: i64,
+    pub sub_tokens: i64,
+    pub subagent_runs: i64,
+}
+
+/// One skill's two-window row: the invocations in each window and the delta
+/// between them — the row the trend view orders by |delta|.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillDelta {
+    pub skill: String,
+    pub current: i64,
+    pub previous: i64,
+    /// `current - previous`.
+    pub delta: i64,
+}
+
+/// Pair the two windows' per-skill usage into delta rows, largest absolute
+/// delta first (ties by skill id) — the order the trend view lists skills in.
+/// A skill used in only one window keeps a 0 on the other side.
+pub fn skill_deltas(current: &[SkillUsage], previous: &[SkillUsage]) -> Vec<SkillDelta> {
+    let mut invocations: BTreeMap<&str, [i64; 2]> = BTreeMap::new();
+    for usage in current {
+        invocations.entry(usage.skill.as_str()).or_default()[0] += usage.invocations;
+    }
+    for usage in previous {
+        invocations.entry(usage.skill.as_str()).or_default()[1] += usage.invocations;
+    }
+    let mut rows: Vec<SkillDelta> = invocations
+        .into_iter()
+        .map(|(skill, sides)| SkillDelta {
+            skill: skill.to_string(),
+            current: sides[0],
+            previous: sides[1],
+            delta: sides[0] - sides[1],
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.delta
+            .abs()
+            .cmp(&a.delta.abs())
+            .then_with(|| a.skill.cmp(&b.skill))
+    });
+    rows
 }
 
 /// One catalogued surface row with its **effective** usage: the invocations
@@ -1178,6 +1246,59 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Per-kind event rollup for the trend view: every event kind's count,
+    /// output tokens, and wall-clock in the window, ordered by kind so the two
+    /// windows' rows line up for a diff. Kinds with no events in the window
+    /// are absent rather than zero, so a caller can tell "unused" from "unseen".
+    pub fn event_rollup_by_kind(&self, range: TimeRange) -> Result<Vec<KindRollup>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT kind,
+                    COUNT(*),
+                    COALESCE(SUM(out_tokens), 0),
+                    COALESCE(SUM(duration_sec), 0)
+             FROM events
+             WHERE 1=1{filter}
+             GROUP BY kind
+             ORDER BY kind"
+        ))?;
+        let rows = stmt
+            .query_map(params_from_iter(binds), |row| {
+                Ok(KindRollup {
+                    kind: row.get(0)?,
+                    events: row.get(1)?,
+                    out_tokens: row.get(2)?,
+                    duration_sec: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The trend view's aggregates for both windows of `pair`: per-kind event
+    /// rollups, per-skill usage, session count, and subagent totals. Each is
+    /// computed per window by the same windowed queries the single-window
+    /// views read — the trend compares the numbers those views report, never a
+    /// second implementation of them.
+    pub fn trend_aggregates(&self, pair: WindowPair) -> Result<TwoWindow<TrendWindowAggregates>> {
+        Ok(TwoWindow {
+            current: self.trend_window_aggregates(pair.current)?,
+            previous: self.trend_window_aggregates(pair.previous)?,
+        })
+    }
+
+    fn trend_window_aggregates(&self, range: TimeRange) -> Result<TrendWindowAggregates> {
+        let (sessions, _) = self.session_stats(range)?;
+        let (sub_tokens, subagent_runs) = self.subagent_totals(range)?;
+        Ok(TrendWindowAggregates {
+            by_kind: self.event_rollup_by_kind(range)?,
+            skills: self.skill_usage(range)?,
+            sessions,
+            subagent_runs,
+            sub_tokens,
+        })
     }
 
     /// Total startup tokens of **global** config — what every session pays
@@ -3507,5 +3628,186 @@ mod tests {
         // group.
         assert_eq!(store.error_examples(2, TimeRange::ALL).unwrap().len(), 3);
         assert_eq!(store.error_examples(10, TimeRange::ALL).unwrap().len(), 5);
+    }
+
+    // ---- PBI 2026-10-30-02: the trend view's two windows ----
+
+    fn skill_row(skill: &str, invocations: i64) -> SkillUsage {
+        SkillUsage {
+            skill: skill.to_string(),
+            invocations,
+            out_tokens: 0,
+            ctx_growth: 0,
+            duration_sec: 0.0,
+        }
+    }
+
+    #[test]
+    fn skill_deltas_order_by_the_largest_absolute_delta() {
+        let current = [
+            skill_row("commit", 1),
+            skill_row("review", 5),
+            skill_row("deploy", 2),
+            skill_row("fresh", 1),
+        ];
+        let previous = [
+            skill_row("commit", 4),
+            skill_row("review", 3),
+            skill_row("retired", 7),
+        ];
+        let deltas = skill_deltas(&current, &previous);
+        // |delta| first, ties by skill: retired was used only in the previous
+        // window, deploy only in the current one, and deploy/review tie.
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|d| (d.skill.as_str(), d.current, d.previous, d.delta))
+                .collect::<Vec<_>>(),
+            [
+                ("retired", 0, 7, -7),
+                ("commit", 1, 4, -3),
+                ("deploy", 2, 0, 2),
+                ("review", 5, 3, 2),
+                ("fresh", 1, 0, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_window_aggregation_splits_events_between_the_windows() {
+        // Adjacent same-length windows: previous [1_000, 2_000], current
+        // [2_001, 3_000] — no second is shared, so a boundary event lands in
+        // exactly one window.
+        let previous = TimeRange {
+            start: Some(1_000),
+            end: Some(2_000),
+        };
+        let current = TimeRange {
+            start: Some(2_001),
+            end: Some(3_000),
+        };
+        let mut store = Store::in_memory().unwrap();
+
+        // A session stamped into each window, so the session count and the
+        // subagent totals split too (the sessions table's own axis). The
+        // stamped start is the earliest of the declared start and the
+        // session's spans, so each window's spans ride its own session.
+        let mut past = session("past");
+        past.start = Some(SessionStart {
+            timestamp_ms: 1_500 * 1000,
+            ctx: 9_000,
+        });
+        past.sub_tokens = 400;
+        past.sub_agent_count = 1;
+        let past_spans = [
+            span_at("commit", 1_500, 100), // previous only
+            span_at("review", 1_800, 50),  // previous only
+            span_at("edge", 2_000, 10),    // the previous window's last second
+        ];
+        store
+            .ingest(IngestBatch::new(&past, &past_spans, &[]))
+            .unwrap();
+
+        let mut present = session("present");
+        present.start = Some(SessionStart {
+            timestamp_ms: 2_500 * 1000,
+            ctx: 10_000,
+        });
+        present.sub_tokens = 500;
+        present.sub_agent_count = 2;
+        let present_spans = [
+            span_at("commit", 2_500, 300), // current only
+            span_at("edge", 2_001, 10),    // the current window's first second
+        ];
+        store
+            .ingest(
+                IngestBatch::new(&present, &present_spans, &[]).work_events(&[(
+                    2_600_000,
+                    "file_edit",
+                    "main.rs",
+                    Some("/repo/main.rs"),
+                )]),
+            )
+            .unwrap();
+
+        let agg = store
+            .trend_aggregates(WindowPair { current, previous })
+            .unwrap();
+
+        // Per-kind rollups: the current window has a file_edit the previous
+        // one lacks; the skill invocations split 2 vs 3 and never leak across
+        // the seam — each boundary event stays in its own window.
+        let kinds: Vec<&str> = agg
+            .current
+            .by_kind
+            .iter()
+            .map(|k| k.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["file_edit", "session_start", "skill_invocation"]);
+        let cur_skill = agg
+            .current
+            .by_kind
+            .iter()
+            .find(|k| k.kind == "skill_invocation")
+            .unwrap();
+        assert_eq!(cur_skill.events, 2, "commit@2_500 + edge@2_001 only");
+        assert_eq!(cur_skill.out_tokens, 310);
+        assert_eq!(cur_skill.duration_sec, 4.0);
+        let prev_skill = agg
+            .previous
+            .by_kind
+            .iter()
+            .find(|k| k.kind == "skill_invocation")
+            .unwrap();
+        assert_eq!(
+            prev_skill.events, 3,
+            "commit@1_500 + review@1_800 + edge@2_000"
+        );
+        assert_eq!(prev_skill.out_tokens, 160);
+        let kinds: Vec<&str> = agg
+            .previous
+            .by_kind
+            .iter()
+            .map(|k| k.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["session_start", "skill_invocation"]);
+
+        // Per-skill usage per window, and the delta ordering across them.
+        assert_eq!(
+            agg.current
+                .skills
+                .iter()
+                .map(|s| (s.skill.as_str(), s.invocations))
+                .collect::<Vec<_>>(),
+            [("commit", 1), ("edge", 1)]
+        );
+        assert_eq!(
+            agg.previous
+                .skills
+                .iter()
+                .map(|s| (s.skill.as_str(), s.invocations))
+                .collect::<Vec<_>>(),
+            [("commit", 1), ("edge", 1), ("review", 1)]
+        );
+        let deltas = skill_deltas(&agg.current.skills, &agg.previous.skills);
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|d| (d.skill.as_str(), d.delta))
+                .collect::<Vec<_>>(),
+            [("review", -1), ("commit", 0), ("edge", 0)]
+        );
+
+        // Session count and subagent totals follow the sessions axis.
+        assert_eq!(agg.current.sessions, 1);
+        assert_eq!(agg.previous.sessions, 1);
+        assert_eq!(
+            (agg.current.sub_tokens, agg.current.subagent_runs),
+            (500, 2)
+        );
+        assert_eq!(
+            (agg.previous.sub_tokens, agg.previous.subagent_runs),
+            (400, 1)
+        );
     }
 }
