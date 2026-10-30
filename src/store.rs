@@ -1715,6 +1715,7 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
 mod tests {
     use super::*;
     use crate::core::period::TimeRange;
+    use crate::core::subagent::SplitCoverage;
     use crate::core::surface::{LoadMode, Scope};
 
     /// The store is agnostic to which analysis-semantics pair a harness
@@ -3327,6 +3328,55 @@ mod tests {
         assert_eq!(store.session_stats(range).unwrap().0, 1);
         // Without the flags both sessions count.
         assert_eq!(store.subagent_totals(TimeRange::ALL).unwrap(), (900, 2));
+    }
+
+    #[test]
+    fn a_session_that_straddles_until_keeps_its_total_but_drops_the_late_runs() {
+        // The two time axes: the total reads the session's stamped start, the
+        // per-agent rows read each run's own epoch. A session that started
+        // inside the window whose runs landed past `--until` keeps its total
+        // while its late runs drop out of the rows — and the gap sentence
+        // names the window, not the pruned transcripts.
+        let mut store = Store::in_memory().unwrap();
+        let end = 1_791_385_200 - 1; // the last second of JST 2026-10-07
+        let mut s = session("s1");
+        s.sub_tokens = 400;
+        s.sub_agent_count = 2;
+        s.start = Some(SessionStart {
+            timestamp_ms: (end - 60) * 1000, // the session starts inside the window
+            ctx: 10_000,
+        });
+        let mut early = subagent_run("Explore", "a1", "toolu_a1", 100);
+        early.started_epoch_ms = (end - 60) * 1000; // inside the window
+        let mut late = subagent_run("Explore", "a2", "toolu_a2", 300);
+        late.started_epoch_ms = (end + 60) * 1000; // the run lands past --until
+        store
+            .ingest(IngestBatch::new(&s, &[], &[]).subagent_runs(&[early, late]))
+            .unwrap();
+
+        let range = TimeRange {
+            start: None,
+            end: Some(end),
+        };
+        // The total stays intact: the session started inside the window.
+        assert_eq!(store.subagent_totals(range).unwrap(), (400, 2));
+        // The rows keep only the run inside the window.
+        let agents = store.subagent_by_agent(range).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].out_tokens, 100);
+        // Without the flags both runs come back unchanged.
+        assert_eq!(store.subagent_totals(TimeRange::ALL).unwrap(), (400, 2));
+        assert_eq!(store.subagent_by_agent(TimeRange::ALL).unwrap().len(), 1);
+
+        // The straddle's gap sentence names the window, not the transcripts.
+        let coverage = SplitCoverage::new(400, 2, agents.iter().map(|a| (a.runs, a.out_tokens)));
+        let note = coverage.partial_note_in(range).unwrap();
+        assert!(note.contains("fall outside the report window"), "{}", note);
+        assert!(
+            !note.contains("analyzed before runs were extracted"),
+            "{}",
+            note
+        );
     }
 
     #[test]

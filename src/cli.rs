@@ -1356,8 +1356,8 @@ fn doctor(sess: &Session, filter: &ScopeFilter, window: TimeRange, format: Forma
             fmt_tokens(f.sub_tokens),
             f.sub_agents
         );
-        warn_missing_agent_split(&f.agent_split);
-        for line in doctor_agent_lines(&f, &style.command("saniwalens usage")) {
+        warn_missing_agent_split(&f.agent_split, window);
+        for line in doctor_agent_lines(&f, &style.command("saniwalens usage"), window) {
             if line.starts_with('…') {
                 println!("  {}", style.dim(&line));
             } else {
@@ -1481,8 +1481,14 @@ fn plural(n: usize, noun: &str) -> String {
 /// are a partial split (`SplitCoverage`), the gap is stated first so the
 /// names are not read as the whole bill. `full_split` is the styled command
 /// that shows every row. An unavailable split yields nothing: that case is
-/// reported on stderr with its refresh hint.
-fn doctor_agent_lines(f: &optimize_mod::Findings, full_split: &str) -> Vec<String> {
+/// reported on stderr with its refresh hint. Under a drawn window the gap is
+/// the two time axes at work, so the sentence names the window instead of the
+/// pruned transcripts (`window.is_all()` keeps the full-history wording).
+fn doctor_agent_lines(
+    f: &optimize_mod::Findings,
+    full_split: &str,
+    window: TimeRange,
+) -> Vec<String> {
     let mut lines = Vec::new();
     let top: Vec<String> = f
         .agents
@@ -1504,13 +1510,23 @@ fn doctor_agent_lines(f: &optimize_mod::Findings, full_split: &str) -> Vec<Strin
     let coverage = &f.agent_split;
     let shown: i64 = f.agents.iter().take(top.len()).map(|a| a.out_tokens).sum();
     let intro = if coverage.is_partial() {
-        lines.push(format!(
-            "Only {} of those tokens ({} of {} runs) have a per-agent split — the rest were \
-             analyzed before runs were extracted and their transcripts are gone.",
-            fmt_tokens(coverage.known_tokens),
-            coverage.known_runs,
-            coverage.total_runs
-        ));
+        if window.is_all() {
+            lines.push(format!(
+                "Only {} of those tokens ({} of {} runs) have a per-agent split — the rest were \
+                 analyzed before runs were extracted and their transcripts are gone.",
+                fmt_tokens(coverage.known_tokens),
+                coverage.known_runs,
+                coverage.total_runs
+            ));
+        } else {
+            lines.push(format!(
+                "Only {} of those tokens ({} of {} runs) have a per-agent split — the rest \
+                 fall outside the report window.",
+                fmt_tokens(coverage.known_tokens),
+                coverage.known_runs,
+                coverage.total_runs
+            ));
+        }
         "Among the runs that have one"
     } else if coverage.is_majority(shown) {
         "Most of that subagent output"
@@ -2190,15 +2206,36 @@ fn run_analyze(harness: &Harness, projects: Option<PathBuf>, db: &Path) -> Resul
 /// A *partial* split is not warned about here: it is a property of the data
 /// that no refresh can change, so each report labels it in-band beside the
 /// rows it qualifies (`SplitCoverage::partial_note`).
-fn warn_missing_agent_split(coverage: &SplitCoverage) {
-    if coverage.is_unavailable() {
-        eprintln!(
-            "{}",
-            Style::stderr().warn(
-                "store: per-agent subagent split unavailable (store predates it) \
-                 — run `saniwalens analyze` (or drop --frozen) to fill it in"
-            )
-        );
+///
+/// Under a drawn window an empty split is usually the two time axes at work —
+/// the total reads the session's stamped start, the rows read each run's own
+/// epoch — so the message names the window instead of pointing at a refresh
+/// that cannot fill a straddle. Without the flags the refresh hint stays.
+fn warn_missing_agent_split(coverage: &SplitCoverage, window: TimeRange) {
+    if let Some(message) = missing_split_warning(coverage, window) {
+        eprintln!("{}", Style::stderr().warn(&message));
+    }
+}
+
+/// The missing-split message, if there is one to print: the refresh hint
+/// without a window, the window note under one, `None` when the rows cover
+/// the total.
+fn missing_split_warning(coverage: &SplitCoverage, window: TimeRange) -> Option<String> {
+    if !coverage.is_unavailable() {
+        return None;
+    }
+    if window.is_all() {
+        Some(
+            "store: per-agent subagent split unavailable (store predates it) \
+             — run `saniwalens analyze` (or drop --frozen) to fill it in"
+                .to_string(),
+        )
+    } else {
+        Some(format!(
+            "store: per-agent subagent split unavailable in this window — those \
+             {} tokens over {} run(s) fall outside the report window",
+            coverage.missing_tokens, coverage.missing_runs
+        ))
     }
 }
 fn usage(sess: &Session, by: Option<&str>, window: TimeRange, format: Format) -> Result<()> {
@@ -2230,7 +2267,7 @@ fn usage(sess: &Session, by: Option<&str>, window: TimeRange, format: Format) ->
     // Ahead of the format branches: a machine consumer reading an empty `agents`
     // beside a nonzero total needs the reason as much as a human does, and it
     // goes to stderr precisely so it can be given to both.
-    warn_missing_agent_split(&agent_split);
+    warn_missing_agent_split(&agent_split, window);
     if format == Format::Json {
         return emit_json(&with_window(
             serde_json::json!({
@@ -2273,8 +2310,9 @@ fn usage(sess: &Session, by: Option<&str>, window: TimeRange, format: Format) ->
         "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)"
     );
     // Stated between the total and the table, so the table below is read as
-    // the part it is.
-    if let Some(note) = agent_split.partial_note() {
+    // the part it is. Under a drawn window the gap is the straddle, so the
+    // note names the window rather than the pruned transcripts.
+    if let Some(note) = agent_split.partial_note_in(window) {
         println!("{note}");
     }
     println!();
@@ -2899,7 +2937,7 @@ mod tests {
             10,
             vec![agent("a", 4, 700_000), agent("b", 6, 300_000)],
         );
-        let lines = doctor_agent_lines(&f, "saniwalens usage");
+        let lines = doctor_agent_lines(&f, "saniwalens usage", TimeRange::ALL);
         assert_eq!(
             lines,
             vec![
@@ -2917,7 +2955,7 @@ mod tests {
             .map(|i| agent(&format!("t{i}"), 1, 100_000))
             .collect();
         let f = findings_with_agents(1_000_000, 10, agents);
-        let lines = doctor_agent_lines(&f, "saniwalens usage");
+        let lines = doctor_agent_lines(&f, "saniwalens usage", TimeRange::ALL);
         assert_eq!(
             lines,
             vec![
@@ -2940,7 +2978,7 @@ mod tests {
                 agent("codex:codex-rescue", 14, 62_067),
             ],
         );
-        let lines = doctor_agent_lines(&f, "saniwalens usage");
+        let lines = doctor_agent_lines(&f, "saniwalens usage", TimeRange::ALL);
         assert_eq!(
             lines,
             vec![
@@ -2953,11 +2991,79 @@ mod tests {
     }
 
     #[test]
+    fn doctor_labels_a_windowed_partial_split_with_the_window() {
+        // Under a drawn window the gap is the straddle — the total reads the
+        // session's stamped start, the rows read each run's own epoch — so the
+        // doctor names the window instead of the pruned transcripts.
+        let f = findings_with_agents(
+            3_093_466,
+            375,
+            vec![
+                agent("general-purpose", 11, 315_663),
+                agent("codex:codex-rescue", 14, 62_067),
+            ],
+        );
+        let window = TimeRange {
+            start: Some(1_790_780_400),
+            end: Some(1_791_385_199),
+        };
+        let lines = doctor_agent_lines(&f, "saniwalens usage", window);
+        assert!(
+            lines[0].contains("fall outside the report window"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("analyzed before runs were extracted"),
+            "{}",
+            lines[0]
+        );
+        // Without a window the pruned-transcript wording stays, byte for byte.
+        let lines = doctor_agent_lines(&f, "saniwalens usage", TimeRange::ALL);
+        assert!(
+            lines[0].contains("analyzed before runs were extracted"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
     fn doctor_names_no_agents_when_the_split_is_unavailable() {
         // The gap is reported on stderr with its refresh hint; there is
         // nothing to list in-band.
         let f = findings_with_agents(3_093_466, 375, vec![]);
-        assert!(doctor_agent_lines(&f, "saniwalens usage").is_empty());
+        assert!(doctor_agent_lines(&f, "saniwalens usage", TimeRange::ALL).is_empty());
+    }
+
+    #[test]
+    fn a_windowed_unavailable_split_names_the_window_not_a_refresh() {
+        // A total with no rows behind it under a drawn window is the straddle,
+        // not a store that predates the split — `analyze` (or dropping
+        // --frozen) cannot fill it, so the message names the window instead.
+        let f = findings_with_agents(3_093_466, 375, vec![]);
+        let window = TimeRange {
+            start: Some(1_790_780_400),
+            end: Some(1_791_385_199),
+        };
+        let warning = missing_split_warning(&f.agent_split, window).unwrap();
+        assert!(
+            warning.contains("fall outside the report window"),
+            "{warning}"
+        );
+        assert!(!warning.contains("run `saniwalens analyze`"), "{warning}");
+
+        // Without the flags the refresh hint stays, byte for byte.
+        assert_eq!(
+            missing_split_warning(&f.agent_split, TimeRange::ALL).unwrap(),
+            "store: per-agent subagent split unavailable (store predates it) \
+             — run `saniwalens analyze` (or drop --frozen) to fill it in"
+        );
+        // A split the rows cover warns about nothing.
+        let complete = findings_with_agents(100, 1, vec![agent("a", 1, 100)]);
+        assert_eq!(
+            missing_split_warning(&complete.agent_split, TimeRange::ALL),
+            None
+        );
     }
 
     /// A path in the temp dir that no other test uses, removed on drop so a

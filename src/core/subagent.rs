@@ -163,11 +163,33 @@ impl SplitCoverage {
             )
         })
     }
+
+    /// The windowed variant of [`Self::partial_note`]: under a drawn window
+    /// the total and the rows ride different time axes — the total reads the
+    /// session's stamped start (`sessions.started_at`), the rows read each
+    /// run's own epoch — so a session that started inside the window keeps its
+    /// total while runs that landed past the boundary drop out of the rows.
+    /// The pruned-transcript reason would be false there, so the sentence
+    /// names the window instead. Without a window this is exactly
+    /// [`Self::partial_note`], byte for byte.
+    pub fn partial_note_in(&self, window: crate::core::period::TimeRange) -> Option<String> {
+        if window.is_all() {
+            return self.partial_note();
+        }
+        self.is_partial().then(|| {
+            format!(
+                "per-agent split covers {} tokens over {} run(s); the other {} tokens over \
+                 {} run(s) fall outside the report window",
+                self.known_tokens, self.known_runs, self.missing_tokens, self.missing_runs
+            )
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::period::TimeRange;
 
     fn run(agent_id: &str, parent: Option<&str>, tool_use_id: Option<&str>) -> SubagentRun {
         SubagentRun {
@@ -303,5 +325,33 @@ mod tests {
         // An unavailable split is a different message (a refresh may fix it),
         // so it is not described as partial.
         assert_eq!(SplitCoverage::new(100, 1, []).partial_note(), None);
+    }
+
+    #[test]
+    fn a_windowed_partial_split_names_the_window_not_pruned_transcripts() {
+        // Under a drawn window the gap is the two time axes at work: the total
+        // reads the session's stamped start, the rows read each run's own
+        // epoch — so the pruned-transcript reason would be false there.
+        let coverage = SplitCoverage::new(3_093_466, 375, [(11, 315_663), (14, 62_067)]);
+        let window = TimeRange {
+            start: Some(1_790_780_400),
+            end: Some(1_791_385_199),
+        };
+        let note = coverage.partial_note_in(window).unwrap();
+        assert_eq!(
+            note,
+            "per-agent split covers 377730 tokens over 25 run(s); the other 2715736 \
+             tokens over 350 run(s) fall outside the report window"
+        );
+        assert!(
+            !note.contains("analyzed before runs were extracted"),
+            "{note}"
+        );
+
+        // Without a window the sentence is the full-history one, byte for byte.
+        assert_eq!(
+            coverage.partial_note_in(TimeRange::ALL),
+            coverage.partial_note()
+        );
     }
 }

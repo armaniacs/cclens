@@ -236,6 +236,10 @@ caveats in `events.md` / `surfaces.md`):
   so on stderr instead of letting an absent breakdown pass for a zero one
   (`storage.md`'s report-the-gap contract). It rides with the freshness line
   rather than in the table, so piped stdout and `--format json` stay clean.
+  Under a drawn window an empty split is usually the two time axes at work —
+  the total reads the session's stamped start, the rows read each run's own
+  epoch — so the message names the window instead of pointing at a refresh
+  that cannot fill a straddle; the refresh hint stays without the flags.
 - When they sum to only *part* of it — sessions analyzed before runs were
   extracted keep their totals (`storage.md`: the store outlives its inputs), but
   once Claude Code has pruned their transcripts no refresh can ever produce their
@@ -244,10 +248,13 @@ caveats in `events.md` / `surfaces.md`):
   refresh could cure: `usage` prints the covered and uncovered figures between
   the total and the table, `doctor` states the gap before naming any agent, the
   briefing does the same under its subagent line, and JSON carries the
-  reconciliation as `agent_split` (`core::subagent::SplitCoverage`). `doctor`
-  introduces its top rows as "most of" the subagent output only when they
-  exceed half of the total — a long tail, or a partial split, gets a wording
-  that claims no more than the rows show.
+  reconciliation as `agent_split` (`core::subagent::SplitCoverage`). Under a
+  drawn window the same gap is the straddle, so the in-band labels say the
+  uncovered tokens fall outside the report window instead of the
+  pruned-transcript reason; without the flags the wording is unchanged.
+  `doctor` introduces its top rows as "most of" the subagent output only when
+  they exceed half of the total — a long tail, or a partial split, gets a
+  wording that claims no more than the rows show.
 
 Meta-skills are not nested (`events.md`): a driver and the skills it ran are
 each their own span, so a child's cost lands on the child and no figure is
