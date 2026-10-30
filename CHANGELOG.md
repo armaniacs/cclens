@@ -9,6 +9,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- レポートビュー 8 つ（usage / inventory / waste / overhead / prompts /
+  failures / stuck / doctor）に期間フィルタ（`--since` / `--until` /
+  `--last`）を追加。集計が期間に絞られ、引いたウィンドウは freshness 行・
+  framing block・JSON の `window` で明示される。フラグ無しの出力は従来と
+  バイト同一。`sql` / `analyze` / `optimize` は変更なし（PR #14）。
+
 ### Changed
 
 - 起動時解決（設定→フラグ→既定値→ハーネス→ストアパス→旧ストア移行→
