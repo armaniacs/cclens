@@ -9,22 +9,14 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use rusqlite::params_from_iter;
 
+use crate::core::period::{TimeRange, WindowPair};
 use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::SubagentRun;
 use crate::core::surface::Surface;
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
-
-/// The `meta` key holding the analysis semantics a store's rows were built with.
-const ANALYZER_META_KEY: &str = "analyzer_version";
-
-/// The analysis semantics this build produces. **Bump it whenever extraction or
-/// classification changes what an unchanged transcript yields** — that is the
-/// only way rows behind the incremental-ingest skip get rebuilt. It is not the
-/// crate version: a release that changes no analysis should not force everyone
-/// through a full re-analyze.
-const ANALYZER_VERSION: &str = "6";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -118,27 +110,170 @@ CREATE INDEX subagent_runs_by_agent ON subagent_runs(agent);
 CREATE INDEX subagent_runs_by_source ON subagent_runs(source_path);
 ";
 
-/// Views are pure definitions over the tables, declared apart from them for the
-/// same reason as indexes plus one of their own: `CREATE VIEW IF NOT EXISTS`
-/// would leave an older store's stale definition in place, and a reader would
-/// silently query yesterday's column mapping.
-const VIEW_SCHEMA: &str = "
--- A clean read view over tool_error events: the friction columns are overloaded
--- onto generic event columns (category in surface_id, excerpt in source, tool in
--- model), so this view names them and joins the project — letting an ad-hoc SQL
--- query (e.g. from the optimize session) ask for any slice without knowing the
--- encoding. `project LIKE '%--wt%'` distinguishes a worktree from the main checkout.
+/// A kind-specific meaning an event kind carries in a generic `events` column.
+/// Its `Display` is the name such a meaning gets when projected (the
+/// `tool_errors` view's aliases), so the table reads as the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventRole {
+    /// `tool_error`: the friction category (`edit-precondition`, …).
+    Category,
+    /// `tool_error`: a short excerpt of the error text.
+    Excerpt,
+    /// `tool_error`: the tool that produced the failure.
+    OriginatingTool,
+    /// `tool_error`: the failed call's subject (file path / command).
+    FailureTarget,
+    /// `file_edit`: the basename hotspot rankings group on.
+    FileBasename,
+    /// `file_edit`: the edited file's full path.
+    FilePath,
+    /// `bash_cmd`: the command's leading word.
+    CommandWord,
+    /// `prompt`: the prompt's behavioral class.
+    PromptBehavior,
+    /// `agent_spawn`: the spawn call's id, joining `subagent_runs`.
+    SpawnCallId,
+}
+
+impl std::fmt::Display for EventRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EventRole::Category => "category",
+            EventRole::Excerpt => "excerpt",
+            EventRole::OriginatingTool => "tool",
+            EventRole::FailureTarget => "target",
+            EventRole::FileBasename => "basename",
+            EventRole::FilePath => "path",
+            EventRole::CommandWord => "word",
+            EventRole::PromptBehavior => "behavior",
+            EventRole::SpawnCallId => "call_id",
+        })
+    }
+}
+
+/// A generic `events` column that can carry a kind-specific meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventColumn {
+    SurfaceId,
+    Source,
+    Model,
+    Target,
+}
+
+impl EventColumn {
+    pub fn name(&self) -> &'static str {
+        match self {
+            EventColumn::SurfaceId => "surface_id",
+            EventColumn::Source => "source",
+            EventColumn::Model => "model",
+            EventColumn::Target => "target",
+        }
+    }
+}
+
+impl std::fmt::Display for EventColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// **The single place** a kind's overloaded-column meaning is defined
+/// (`docs/specs/storage.md`). The `tool_errors` view is generated from this
+/// table and the readers take their column names from it, so a new event kind
+/// is one row here — never an edit spread across view SQL and queries.
+///
+/// Kinds whose columns carry only their primary meaning (a `skill_invocation`'s
+/// `surface_id` *is* the joined skill) need no entry. The writers fill the
+/// physical columns without consulting the table — a `work_events` statement
+/// spans several kinds at once — and their mapping is pinned against the table
+/// by the round-trip tests (`tool_errors_view_exposes_named_columns_and_project`,
+/// `file_edits_carry_their_project_session_and_full_path`, …).
+pub const EVENT_ENCODING: &[(&str, &[(EventRole, EventColumn)])] = &[
+    (
+        "tool_error",
+        &[
+            (EventRole::Category, EventColumn::SurfaceId),
+            (EventRole::Excerpt, EventColumn::Source),
+            (EventRole::OriginatingTool, EventColumn::Model),
+            (EventRole::FailureTarget, EventColumn::Target),
+        ],
+    ),
+    (
+        "file_edit",
+        &[
+            (EventRole::FileBasename, EventColumn::SurfaceId),
+            (EventRole::FilePath, EventColumn::Target),
+        ],
+    ),
+    (
+        "bash_cmd",
+        &[(EventRole::CommandWord, EventColumn::SurfaceId)],
+    ),
+    (
+        "prompt",
+        &[(EventRole::PromptBehavior, EventColumn::Source)],
+    ),
+    (
+        "agent_spawn",
+        &[(EventRole::SpawnCallId, EventColumn::Target)],
+    ),
+];
+
+/// The column a `(kind, role)` meaning rides in. Panics on an entry missing
+/// from [`EVENT_ENCODING`] — every caller's pair is pinned by the tests below,
+/// so a panic here is a programming bug, not input.
+pub fn encoding_column(kind: &str, role: EventRole) -> &'static str {
+    let (_, roles) = EVENT_ENCODING
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .unwrap_or_else(|| panic!("event kind {kind:?} is not in EVENT_ENCODING"));
+    roles
+        .iter()
+        .find(|(r, _)| *r == role)
+        .unwrap_or_else(|| panic!("{kind} carries no {role} in EVENT_ENCODING"))
+        .1
+        .name()
+}
+
+/// The `tool_errors` view, generated from the encoding table's `tool_error`
+/// entry — the view and the table that defines the meaning cannot drift, and a
+/// kind added to the table leaves this definition untouched.
+fn tool_errors_view_sql(encoding: &[(&str, &[(EventRole, EventColumn)])]) -> String {
+    let (_, roles) = encoding
+        .iter()
+        .find(|(k, _)| *k == "tool_error")
+        .expect("the tool_errors view is defined by its tool_error entry");
+    // One projection per role, padded so the generated text matches what a
+    // store built before this table already holds — no view churn on open.
+    let projected: Vec<String> = roles
+        .iter()
+        .map(|(role, column)| format!("e.{column:<18} AS {role},"))
+        .collect();
+    format!(
+        "-- A clean read view over tool_error events: the friction columns are
+-- overloaded onto generic event columns (defined once in EVENT_ENCODING,
+-- which this view is generated from), so the view names them and joins
+-- the project — an ad-hoc SQL query asks for any slice without knowing
+-- the encoding. `project LIKE '%--wt%'` distinguishes a worktree from the main checkout.
 CREATE VIEW tool_errors AS
 SELECT e.session_id        AS session_id,
        s.project           AS project,
-       e.surface_id        AS category,
-       e.source            AS excerpt,
-       e.model             AS tool,
-       e.target            AS target,
+       {}
        e.started_epoch      AS started_epoch
 FROM events e JOIN sessions s ON e.session_id = s.id
-WHERE e.kind = 'tool_error';
-";
+WHERE e.kind = 'tool_error';",
+        projected.join("\n       ")
+    )
+}
+
+/// Views are pure definitions over the tables, declared apart from them for the
+/// same reason as indexes plus one of their own: `CREATE VIEW IF NOT EXISTS`
+/// would leave an older store's stale definition in place, and a reader would
+/// silently query yesterday's column mapping. The tool_error view is generated
+/// from [`EVENT_ENCODING`] so the definition and its meaning stay one thing.
+fn view_schema() -> String {
+    tool_errors_view_sql(EVENT_ENCODING)
+}
 
 /// Stamped into `PRAGMA user_version`. Bumped only for a change `migrate` cannot
 /// reconcile — an existing column removed, retyped, or given a new meaning.
@@ -191,6 +326,74 @@ pub struct SkillUsage {
     pub duration_sec: f64,
 }
 
+/// One row of the trend view's per-kind event rollup: how many events of the
+/// kind ran in a window, and the output tokens / wall-clock they cost.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct KindRollup {
+    pub kind: String,
+    pub events: i64,
+    pub out_tokens: i64,
+    pub duration_sec: f64,
+}
+
+/// One aggregate computed for both windows of a comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwoWindow<T> {
+    pub current: T,
+    pub previous: T,
+}
+
+/// The trend view's aggregates for one window: the per-kind event rollup, the
+/// per-skill usage, the session count, and the subagent runs/tokens total.
+#[derive(Debug, PartialEq)]
+pub struct TrendWindowAggregates {
+    pub by_kind: Vec<KindRollup>,
+    pub skills: Vec<SkillUsage>,
+    pub sessions: i64,
+    pub sub_tokens: i64,
+    pub subagent_runs: i64,
+}
+
+/// One skill's two-window row: the invocations in each window and the delta
+/// between them — the row the trend view orders by |delta|.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillDelta {
+    pub skill: String,
+    pub current: i64,
+    pub previous: i64,
+    /// `current - previous`.
+    pub delta: i64,
+}
+
+/// Pair the two windows' per-skill usage into delta rows, largest absolute
+/// delta first (ties by skill id) — the order the trend view lists skills in.
+/// A skill used in only one window keeps a 0 on the other side.
+pub fn skill_deltas(current: &[SkillUsage], previous: &[SkillUsage]) -> Vec<SkillDelta> {
+    let mut invocations: BTreeMap<&str, [i64; 2]> = BTreeMap::new();
+    for usage in current {
+        invocations.entry(usage.skill.as_str()).or_default()[0] += usage.invocations;
+    }
+    for usage in previous {
+        invocations.entry(usage.skill.as_str()).or_default()[1] += usage.invocations;
+    }
+    let mut rows: Vec<SkillDelta> = invocations
+        .into_iter()
+        .map(|(skill, sides)| SkillDelta {
+            skill: skill.to_string(),
+            current: sides[0],
+            previous: sides[1],
+            delta: sides[0] - sides[1],
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.delta
+            .abs()
+            .cmp(&a.delta.abs())
+            .then_with(|| a.skill.cmp(&b.skill))
+    });
+    rows
+}
+
 /// One catalogued surface row with its **effective** usage: the invocations
 /// attributed to this row under per-project shadowing (a project row absorbs
 /// its own project's events; the global row keeps everyone else's). See
@@ -231,8 +434,73 @@ pub struct EventCost {
     pub duration_sec: f64,
 }
 
+/// What opening a store is allowed to do — the guarantees that used to be
+/// spread across `open` / `open_readonly` names are now one open path with a
+/// typed mode (`docs/specs/storage.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Create the file if needed, narrow it to owner-only, and migrate the
+    /// schema in place. Every command but `sql`.
+    ReadWrite,
+    /// Open an existing file only: never create, never chmod, never migrate.
+    /// The `sql` command's ad-hoc query must not mutate the derived store, so
+    /// an old store's missing column surfaces as SQLite's own error.
+    ReadOnly,
+}
+
 pub struct Store {
     conn: Connection,
+}
+
+/// Everything one transcript yields, submitted as a single unit
+/// (`Store::ingest`). The store applies it inside one transaction in its own
+/// order, so the sequence the old five functions demanded of callers — the
+/// session row first, always — is unreachable rather than remembered
+/// (`docs/specs/storage.md`).
+pub struct IngestBatch<'a> {
+    pub session: &'a SessionMeta,
+    pub spans: &'a [Span],
+    pub usage: &'a [UsageEvent],
+    pub prompts: &'a [(usize, i64, &'a str)],
+    pub subagent_runs: &'a [SubagentRun],
+    pub tool_errors: &'a [(i64, &'a str, &'a str, &'a str, &'a str)],
+    pub work_events: &'a [(i64, &'a str, &'a str, Option<&'a str>)],
+}
+
+impl<'a> IngestBatch<'a> {
+    /// The batch's floor: the session row plus its spans and usage events.
+    /// Every child kind starts empty and is added by its builder method.
+    pub fn new(session: &'a SessionMeta, spans: &'a [Span], usage: &'a [UsageEvent]) -> Self {
+        Self {
+            session,
+            spans,
+            usage,
+            prompts: &[],
+            subagent_runs: &[],
+            tool_errors: &[],
+            work_events: &[],
+        }
+    }
+
+    pub fn prompts(mut self, prompts: &'a [(usize, i64, &'a str)]) -> Self {
+        self.prompts = prompts;
+        self
+    }
+
+    pub fn subagent_runs(mut self, runs: &'a [SubagentRun]) -> Self {
+        self.subagent_runs = runs;
+        self
+    }
+
+    pub fn tool_errors(mut self, errors: &'a [(i64, &'a str, &'a str, &'a str, &'a str)]) -> Self {
+        self.tool_errors = errors;
+        self
+    }
+
+    pub fn work_events(mut self, events: &'a [(i64, &'a str, &'a str, Option<&'a str>)]) -> Self {
+        self.work_events = events;
+        self
+    }
 }
 
 /// `create_dir_all` with owner-only permissions on every directory it creates —
@@ -304,35 +572,97 @@ fn ensure_owner_only(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-impl Store {
-    /// Open (creating if needed) a store at `path`, ensuring the schema exists.
-    /// The directory is created too: the default store lives under the user
-    /// state directory, which need not exist yet, and SQLite will not create it.
-    ///
-    /// Both are **owner-only**. The store aggregates transcript-derived data —
-    /// file paths, error excerpts, project names — for every project at one
-    /// well-known user-level path, so the umask default (commonly a
-    /// group/world-readable `0755` directory and `0644` file) would expose it to
-    /// other local accounts.
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            create_private_dir_all(parent)
-                .with_context(|| format!("create store directory {}", parent.display()))?;
-        }
-        ensure_owner_only(path)?;
-        Self::from_connection(Connection::open(path)?)
+/// The SQL fragment (a leading ` AND `) and epoch binds that narrow `column`
+/// to `range`. Both ends are inclusive — `--until` counts the whole day it
+/// names — and an unbounded range renders nothing, so a query's text and its
+/// results are unchanged without the period flags. **The one place** the
+/// report views' window becomes SQL: queries assemble it into their WHERE
+/// rather than growing per-query branches.
+fn range_clause(range: TimeRange, column: &str) -> (String, Vec<i64>) {
+    let mut clauses = Vec::new();
+    let mut binds = Vec::new();
+    if let Some(start) = range.start {
+        clauses.push(format!("{column} >= ?"));
+        binds.push(start);
     }
+    if let Some(end) = range.end {
+        clauses.push(format!("{column} <= ?"));
+        binds.push(end);
+    }
+    if clauses.is_empty() {
+        (String::new(), binds)
+    } else {
+        (format!(" AND {}", clauses.join(" AND ")), binds)
+    }
+}
 
-    /// Open an existing store **read-only**, without touching the schema. For
-    /// the `sql` command, where an ad-hoc query must never mutate the derived
-    /// store (and an absent db is an error, not a fresh empty one).
-    pub fn open_readonly(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        Ok(Self { conn })
+/// The same window for a uniform RFC 3339 UTC timestamp column
+/// (`sessions.started_at`): lexicographic order is chronological order for
+/// the one format the writer stamps (`epoch_ms_to_rfc3339`), and the upper
+/// bound is the *exclusive* next second, so a millisecond fraction inside the
+/// final second of the named day stays in. A session the writer could not
+/// stamp (empty timestamp, no observable start) is **excluded** from any
+/// windowed figure rather than guessed into it.
+fn range_clause_utc_text(range: TimeRange, column: &str) -> (String, Vec<String>) {
+    let mut clauses = Vec::new();
+    let mut binds = Vec::new();
+    if let Some(start) = range.start {
+        clauses.push(format!("{column} >= ?"));
+        binds.push(epoch_to_rfc3339_utc(start));
+    }
+    if let Some(end) = range.end {
+        clauses.push(format!("{column} < ?"));
+        binds.push(epoch_to_rfc3339_utc(end + 1));
+    }
+    if clauses.is_empty() {
+        (String::new(), binds)
+    } else {
+        clauses.push(format!("{column} <> ''"));
+        (format!(" AND {}", clauses.join(" AND ")), binds)
+    }
+}
+
+/// The RFC 3339 UTC text of an epoch second, in the one format
+/// `sessions.started_at` is stamped with.
+fn epoch_to_rfc3339_utc(epoch: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
+impl Store {
+    /// Open the store at `path` under a typed guarantee ([`OpenMode`]): the one
+    /// open path, with what it may do — create, chmod, migrate — spelled by the
+    /// mode argument rather than by which of several constructors was called.
+    ///
+    /// In `ReadWrite` mode the directory and file are **owner-only**: the store
+    /// aggregates transcript-derived data — file paths, error excerpts, project
+    /// names — for every project at one well-known user-level path, so the umask
+    /// default (commonly a group/world-readable `0755` directory and `0644`
+    /// file) would expose it to other local accounts.
+    pub fn open(path: impl AsRef<std::path::Path>, mode: OpenMode) -> Result<Self> {
+        match mode {
+            OpenMode::ReadWrite => {
+                let path = path.as_ref();
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    create_private_dir_all(parent)
+                        .with_context(|| format!("create store directory {}", parent.display()))?;
+                }
+                ensure_owner_only(path)?;
+                Self::from_connection(Connection::open(path)?)
+            }
+            OpenMode::ReadOnly => {
+                // No create, no chmod, no migration: an ad-hoc query must never
+                // mutate the derived store (and an absent db is an error, not a
+                // fresh empty one).
+                let conn = Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                Ok(Self { conn })
+            }
+        }
     }
 
     /// An ephemeral in-memory store, for tests.
@@ -382,12 +712,31 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Replace a session's events with a freshly-extracted set (idempotent
-    /// re-ingest keyed on `source_path`; see `docs/specs/storage.md`). `spans`
-    /// are skill executions with cost; `usage` are point events (agent spawns,
-    /// MCP tool calls) counted for the catalog join.
-    pub fn ingest_session(
-        &mut self,
+    /// Ingest one transcript's extraction as a single unit: one transaction,
+    /// applied in the store's own order (session row → replace the file's rows
+    /// → child rows → spawn settle). The old five-function API left that order
+    /// to the caller's convention — `ingest_session` had to run first or its
+    /// delete silently dropped the children — so the order now lives inside
+    /// this one entry point (`docs/specs/storage.md`).
+    pub fn ingest(&mut self, batch: IngestBatch<'_>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        Self::write_session(&tx, batch.session, batch.spans, batch.usage)?;
+        Self::write_prompts(&tx, batch.session, batch.prompts)?;
+        Self::write_subagent_runs(&tx, batch.session, batch.subagent_runs)?;
+        Self::write_tool_errors(&tx, batch.session, batch.tool_errors)?;
+        Self::write_work_events(&tx, batch.session, batch.work_events)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The session row plus the replace of everything this file put into
+    /// `events` — the delete-then-insert that makes re-ingest "replace, not
+    /// append" (`docs/specs/storage.md`), owned by the batch so no caller can
+    /// run it in the wrong order. `spans` are skill executions with cost;
+    /// `usage` are point events (agent spawns, MCP tool calls) counted for the
+    /// catalog join.
+    fn write_session(
+        tx: &rusqlite::Transaction<'_>,
         session: &SessionMeta,
         spans: &[Span],
         usage: &[UsageEvent],
@@ -405,7 +754,6 @@ impl Store {
             .map(epoch_ms_to_rfc3339)
             .unwrap_or_default();
 
-        let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO sessions
                (id, project, slug, root, source_path, started_at, sub_tokens, sub_agent_count)
@@ -479,7 +827,7 @@ impl Store {
                 "tool_use"
             };
             // An agent spawn keeps its call id in `target` — the join key to the
-            // subagent run it started (`ingest_subagent_runs`).
+            // subagent run it started (`write_subagent_runs`).
             tx.execute(
                 "INSERT INTO events
                    (session_id, source_path, kind, surface_kind, surface_id, source,
@@ -498,45 +846,47 @@ impl Store {
                 ),
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
-    /// Insert prompt-pointer events for a session: `(source_line, epoch_ms)`
-    /// per user prompt. The text is not stored — only the pointer
-    /// (`source_path` with `source_line`) so it can be re-read later
-    /// (`docs/specs/storage.md`). Call after `ingest_session`, whose
-    /// delete-by-`source_path` already cleared any prior prompt rows for this file.
-    pub fn ingest_prompts(
-        &mut self,
-        session_id: &str,
-        source_path: &str,
+    /// Prompt-pointer events for a session: `(source_line, epoch_ms)` per user
+    /// prompt. The text is not stored — only the pointer (`source_path` with
+    /// `source_line`) so it can be re-read later (`docs/specs/storage.md`).
+    /// Runs inside the batch transaction, after [`Self::write_session`] has
+    /// replaced the file's prior rows.
+    fn write_prompts(
+        tx: &rusqlite::Transaction<'_>,
+        session: &SessionMeta,
         prompts: &[(usize, i64, &str)],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        // The prompt's behavioral class rides in the column EVENT_ENCODING
+        // names for `prompt`.
+        let behavior_column = encoding_column("prompt", EventRole::PromptBehavior);
+        let insert = format!(
+            "INSERT INTO events
+               (session_id, source_path, source_line, kind, {behavior_column},
+                started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                ctx_start, ctx_peak)
+             VALUES (?1, ?2, ?3, 'prompt', ?4, '', ?5, 0, 0, 0, 0, 0)"
+        );
         for (line_no, epoch_ms, behavior) in prompts {
-            // The prompt's behavioral class rides in the unused `source` column.
             tx.execute(
-                "INSERT INTO events
-                   (session_id, source_path, source_line, kind, source,
-                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
-                    ctx_start, ctx_peak)
-                 VALUES (?1, ?2, ?3, 'prompt', ?4, '', ?5, 0, 0, 0, 0, 0)",
+                &insert,
                 (
-                    session_id,
-                    source_path,
+                    &session.id,
+                    &session.source_path,
                     *line_no as i64,
                     *behavior,
                     epoch_ms / 1000,
                 ),
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
-    /// Persist a session's subagent runs, and settle the cost of the spawns that
-    /// started them.
+    /// A session's subagent runs, and the settle of the cost of the spawns that
+    /// started them — inside the batch transaction, after [`Self::write_session`]
+    /// inserted those spawn events (the order the old API left to its callers).
     ///
     /// Two rows describe one subagent from opposite sides: the `agent_spawn`
     /// event is what the main thread *did*, the run is what it *cost*. They are
@@ -544,18 +894,14 @@ impl Store {
     /// spawn's own `out_tokens` becomes the run's output and its `sub_tokens`
     /// the output of everything that run spawned in turn. A spawn whose run is
     /// missing keeps its zeros rather than borrowing another's figures.
-    ///
-    /// Call after `ingest_session`, which inserted those spawn events.
-    pub fn ingest_subagent_runs(
-        &mut self,
-        session_id: &str,
-        source_path: &str,
+    fn write_subagent_runs(
+        tx: &rusqlite::Transaction<'_>,
+        session: &SessionMeta,
         runs: &[SubagentRun],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM subagent_runs WHERE source_path = ?1",
-            (source_path,),
+            (&session.source_path,),
         )?;
         for run in runs {
             tx.execute(
@@ -565,8 +911,8 @@ impl Store {
                     out_tokens, started_at, started_epoch)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 (
-                    session_id,
-                    source_path,
+                    &session.id,
+                    &session.source_path,
                     &run.run_path,
                     &run.agent,
                     &run.agent_id,
@@ -600,38 +946,42 @@ impl Store {
                                           AND r.root_tool_use_id = events.target
                                           AND r.tool_use_id IS NOT events.target)
               WHERE kind = 'agent_spawn' AND source_path = ?1 AND target IS NOT NULL",
-            (source_path,),
+            (&session.source_path,),
         )?;
-        tx.commit()?;
         Ok(())
     }
 
-    /// Insert tool-failure events for a session: `(epoch_ms, category, excerpt,
-    /// tool, target)`. For a `tool_error` row the otherwise-unused detail columns
-    /// carry the friction signal: `surface_id` = category, `source` = a short
-    /// excerpt of the error text, `model` = the originating tool, `target` = the
-    /// call's subject (file_path / command). `surface_kind` stays NULL so these
-    /// never enter the surface-catalog join. The excerpt, tool, and target let a
-    /// report show concrete instances, which tool produced them, and which file
-    /// or command they hit — without re-reading the transcript. Call after
-    /// `ingest_session`, whose delete-by-`source_path` already cleared prior rows.
-    pub fn ingest_tool_errors(
-        &mut self,
-        session_id: &str,
-        source_path: &str,
+    /// Tool-failure events for a session: `(epoch_ms, category, excerpt, tool,
+    /// target)` — inside the batch transaction, after [`Self::write_session`]'s
+    /// replace. For a `tool_error` row the otherwise-unused detail columns carry
+    /// the friction signal, per `EVENT_ENCODING`: category, excerpt, originating
+    /// tool, call subject. `surface_kind` stays NULL so these never enter the
+    /// surface-catalog join. The excerpt, tool, and target let a report show
+    /// concrete instances, which tool produced them, and which file or command
+    /// they hit — without re-reading the transcript. The columns come from the
+    /// encoding table, so the writer, the view, and the readers cannot disagree.
+    fn write_tool_errors(
+        tx: &rusqlite::Transaction<'_>,
+        session: &SessionMeta,
         errors: &[(i64, &str, &str, &str, &str)],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let category = encoding_column("tool_error", EventRole::Category);
+        let excerpt = encoding_column("tool_error", EventRole::Excerpt);
+        let tool = encoding_column("tool_error", EventRole::OriginatingTool);
+        let target = encoding_column("tool_error", EventRole::FailureTarget);
+        let insert = format!(
+            "INSERT INTO events
+               (session_id, source_path, kind, {category}, {excerpt}, {tool}, {target},
+                started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                ctx_start, ctx_peak)
+             VALUES (?1, ?2, 'tool_error', ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, 0)"
+        );
         for (epoch_ms, category, excerpt, tool, target) in errors {
             tx.execute(
-                "INSERT INTO events
-                   (session_id, source_path, kind, surface_id, source, model, target,
-                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
-                    ctx_start, ctx_peak)
-                 VALUES (?1, ?2, 'tool_error', ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, 0)",
+                &insert,
                 (
-                    session_id,
-                    source_path,
+                    &session.id,
+                    &session.source_path,
                     *category,
                     *excerpt,
                     *tool,
@@ -641,23 +991,21 @@ impl Store {
                 ),
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
-    /// Insert work events `(epoch_ms, kind, id)` — Bash leading words and edited
-    /// file basenames — kept out of the catalog join (`surface_kind` NULL).
-    /// Persist work events as `(epoch_ms, kind, id, path)`. A file edit's full
-    /// path goes to `target` — the generic detail column
-    /// (`docs/specs/storage.md`) — while `surface_id` keeps the basename that
-    /// hotspot rankings group on.
-    pub fn ingest_work_events(
-        &mut self,
-        session_id: &str,
-        source_path: &str,
+    /// Work events `(epoch_ms, kind, id, path)` — Bash leading words and edited
+    /// file basenames — kept out of the catalog join (`surface_kind` NULL), for
+    /// a session whose rows [`Self::write_session`] just replaced. A file edit's
+    /// full path goes to `target` while `surface_id` keeps the basename that
+    /// hotspot rankings group on; which meaning a row's value carries depends on
+    /// its `kind` and is read back per `EVENT_ENCODING` (one statement spans
+    /// several kinds, so the writer fills the physical columns as they are).
+    fn write_work_events(
+        tx: &rusqlite::Transaction<'_>,
+        session: &SessionMeta,
         events: &[(i64, &str, &str, Option<&str>)],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
         for (epoch_ms, kind, id, path) in events {
             tx.execute(
                 "INSERT INTO events
@@ -666,8 +1014,8 @@ impl Store {
                     ctx_start, ctx_peak)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, 0, 0)",
                 (
-                    session_id,
-                    source_path,
+                    &session.id,
+                    &session.source_path,
                     kind,
                     id,
                     path,
@@ -676,7 +1024,6 @@ impl Store {
                 ),
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -690,15 +1037,20 @@ impl Store {
     /// every store written before paths were recorded — invisibly, since the
     /// output would look normal. An empty result surfaces as "no thrash
     /// episodes", which tells the user to re-analyze.
-    pub fn file_edits(&self) -> Result<Vec<FileEdit>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.project, e.session_id, e.target, e.started_epoch
+    pub fn file_edits(&self, range: TimeRange) -> Result<Vec<FileEdit>> {
+        // Which column holds the full path is EVENT_ENCODING's definition for
+        // `file_edit`; this reader takes it from there instead of repeating it.
+        let path = encoding_column("file_edit", EventRole::FilePath);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
+        let sql = format!(
+            "SELECT s.project, e.session_id, e.{path}, e.started_epoch
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'file_edit' AND e.target IS NOT NULL
-             ORDER BY e.started_epoch",
-        )?;
+             WHERE e.kind = 'file_edit' AND e.{path} IS NOT NULL{filter}
+             ORDER BY e.started_epoch"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(FileEdit {
                     project: row.get(0)?,
                     session_id: row.get(1)?,
@@ -712,25 +1064,45 @@ impl Store {
 
     /// Counts of a work-event kind by id (e.g. Bash leading word, edited file),
     /// most frequent first.
-    pub fn work_counts(&self, kind: &str) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT surface_id, COUNT(*) FROM events WHERE kind = ?1
-             GROUP BY surface_id ORDER BY COUNT(*) DESC",
-        )?;
+    pub fn work_counts(&self, kind: &str, range: TimeRange) -> Result<Vec<(String, i64)>> {
+        // Which meaning a work row's id carries depends on its kind, and
+        // EVENT_ENCODING is where that is defined; a kind with no entry is
+        // rejected rather than read from an arbitrary column.
+        let id = match kind {
+            "file_edit" => encoding_column("file_edit", EventRole::FileBasename),
+            "bash_cmd" => encoding_column("bash_cmd", EventRole::CommandWord),
+            other => anyhow::bail!("no encoding defined for work-event kind {other:?}"),
+        };
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let sql = format!(
+            "SELECT {id}, COUNT(*) FROM events WHERE kind = ?1{filter}
+             GROUP BY {id} ORDER BY COUNT(*) DESC"
+        );
+        let kind_cell = rusqlite::types::Value::Text(kind.to_string());
+        let mut params: Vec<rusqlite::types::Value> = vec![kind_cell];
+        params.extend(binds.iter().copied().map(rusqlite::types::Value::from));
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params_from_iter(params), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Counts of tool failures by category, most frequent first.
-    pub fn error_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT surface_id, COUNT(*) FROM events WHERE kind = 'tool_error'
-             GROUP BY surface_id ORDER BY COUNT(*) DESC",
-        )?;
+    pub fn error_counts(&self, range: TimeRange) -> Result<Vec<(String, i64)>> {
+        let category = encoding_column("tool_error", EventRole::Category);
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let sql = format!(
+            "SELECT {category}, COUNT(*) FROM events WHERE kind = 'tool_error'{filter}
+             GROUP BY {category} ORDER BY COUNT(*) DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -740,16 +1112,21 @@ impl Store {
     /// category can be attributed to the project whose config should carry the
     /// fix — backing a `--project` filter and the dominant-project line in the
     /// summary.
-    pub fn error_counts_by_project(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.project, e.surface_id, COUNT(*)
+    pub fn error_counts_by_project(&self, range: TimeRange) -> Result<Vec<(String, String, i64)>> {
+        let category = encoding_column("tool_error", EventRole::Category);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
+        let sql = format!(
+            "SELECT s.project, e.{category}, COUNT(*)
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'tool_error'
-             GROUP BY s.project, e.surface_id
-             ORDER BY COUNT(*) DESC, s.project, e.surface_id",
-        )?;
+             WHERE e.kind = 'tool_error'{filter}
+             GROUP BY s.project, e.{category}
+             ORDER BY COUNT(*) DESC, s.project, e.{category}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -759,21 +1136,37 @@ impl Store {
     /// behind a friction count — the actual failing paths/files — so the reader
     /// (or a seeded agent) need not re-mine the transcripts. Earliest examples
     /// first within a group; empty excerpts are skipped.
-    pub fn error_examples(&self, per_group: u32) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+    pub fn error_examples(
+        &self,
+        per_group: u32,
+        range: TimeRange,
+    ) -> Result<Vec<(String, String, String)>> {
+        let category = encoding_column("tool_error", EventRole::Category);
+        let excerpt = encoding_column("tool_error", EventRole::Excerpt);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
+        let sql = format!(
             "SELECT project, category, excerpt FROM (
-                 SELECT s.project AS project, e.surface_id AS category, e.source AS excerpt,
+                 SELECT s.project AS project, e.{category} AS category, e.{excerpt} AS excerpt,
                         ROW_NUMBER() OVER (
-                            PARTITION BY s.project, e.surface_id ORDER BY e.id
+                            PARTITION BY s.project, e.{category} ORDER BY e.id
                         ) AS rn
                  FROM events e JOIN sessions s ON e.session_id = s.id
-                 WHERE e.kind = 'tool_error' AND e.source IS NOT NULL AND e.source <> ''
+                 WHERE e.kind = 'tool_error' AND e.{excerpt} IS NOT NULL AND e.{excerpt} <> ''{filter}
              )
-             WHERE rn <= ?1
-             ORDER BY project, category, rn",
-        )?;
+             WHERE rn <= ?
+             ORDER BY project, category, rn"
+        );
+        // Anonymous placeholders throughout: the range bounds bind first (the
+        // filter sits before the LIMIT), the per-group cap last.
+        let mut params: Vec<rusqlite::types::Value> = binds
+            .iter()
+            .copied()
+            .map(rusqlite::types::Value::from)
+            .collect();
+        params.push(rusqlite::types::Value::Integer(i64::from(per_group)));
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([per_group], |row| {
+            .query_map(params_from_iter(params), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -786,16 +1179,23 @@ impl Store {
     /// Edit / a Playwright locator — so a report separates file friction from a
     /// browser miss that merely reads as "not found", and the seeded agent need
     /// not re-derive the attribution from the transcripts.
-    pub fn error_tool_breakdown(&self) -> Result<Vec<(String, String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.project, e.surface_id, COALESCE(e.model, 'unknown'), COUNT(*)
+    pub fn error_tool_breakdown(
+        &self,
+        range: TimeRange,
+    ) -> Result<Vec<(String, String, String, i64)>> {
+        let category = encoding_column("tool_error", EventRole::Category);
+        let tool = encoding_column("tool_error", EventRole::OriginatingTool);
+        let (filter, binds) = range_clause(range, "e.started_epoch");
+        let sql = format!(
+            "SELECT s.project, e.{category}, COALESCE(e.{tool}, 'unknown'), COUNT(*)
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'tool_error'
-             GROUP BY s.project, e.surface_id, e.model
-             ORDER BY COUNT(*) DESC, s.project, e.surface_id",
-        )?;
+             WHERE e.kind = 'tool_error'{filter}
+             GROUP BY s.project, e.{category}, e.{tool}
+             ORDER BY COUNT(*) DESC, s.project, e.{category}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -804,32 +1204,38 @@ impl Store {
 
     /// Counts of prompts by behavioral class (`source` column on prompt events),
     /// most frequent first.
-    pub fn prompt_behavior_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT source, COUNT(*) FROM events WHERE kind = 'prompt' AND source IS NOT NULL
-             GROUP BY source ORDER BY COUNT(*) DESC",
-        )?;
+    pub fn prompt_behavior_counts(&self, range: TimeRange) -> Result<Vec<(String, i64)>> {
+        let behavior = encoding_column("prompt", EventRole::PromptBehavior);
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let sql = format!(
+            "SELECT {behavior}, COUNT(*) FROM events WHERE kind = 'prompt' AND {behavior} IS NOT NULL{filter}
+             GROUP BY {behavior} ORDER BY COUNT(*) DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Per-skill usage rollup, most-invoked first.
-    pub fn skill_usage(&self) -> Result<Vec<SkillUsage>> {
-        let mut stmt = self.conn.prepare(
+    pub fn skill_usage(&self, range: TimeRange) -> Result<Vec<SkillUsage>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT surface_id,
                     COUNT(*),
                     SUM(out_tokens),
                     SUM(ctx_growth),
                     SUM(duration_sec)
              FROM events
-             WHERE surface_kind = 'skill'
+             WHERE surface_kind = 'skill'{filter}
              GROUP BY surface_id
-             ORDER BY COUNT(*) DESC, surface_id",
-        )?;
+             ORDER BY COUNT(*) DESC, surface_id"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(SkillUsage {
                     skill: row.get(0)?,
                     invocations: row.get(1)?,
@@ -840,6 +1246,59 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Per-kind event rollup for the trend view: every event kind's count,
+    /// output tokens, and wall-clock in the window, ordered by kind so the two
+    /// windows' rows line up for a diff. Kinds with no events in the window
+    /// are absent rather than zero, so a caller can tell "unused" from "unseen".
+    pub fn event_rollup_by_kind(&self, range: TimeRange) -> Result<Vec<KindRollup>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT kind,
+                    COUNT(*),
+                    COALESCE(SUM(out_tokens), 0),
+                    COALESCE(SUM(duration_sec), 0)
+             FROM events
+             WHERE 1=1{filter}
+             GROUP BY kind
+             ORDER BY kind"
+        ))?;
+        let rows = stmt
+            .query_map(params_from_iter(binds), |row| {
+                Ok(KindRollup {
+                    kind: row.get(0)?,
+                    events: row.get(1)?,
+                    out_tokens: row.get(2)?,
+                    duration_sec: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The trend view's aggregates for both windows of `pair`: per-kind event
+    /// rollups, per-skill usage, session count, and subagent totals. Each is
+    /// computed per window by the same windowed queries the single-window
+    /// views read — the trend compares the numbers those views report, never a
+    /// second implementation of them.
+    pub fn trend_aggregates(&self, pair: WindowPair) -> Result<TwoWindow<TrendWindowAggregates>> {
+        Ok(TwoWindow {
+            current: self.trend_window_aggregates(pair.current)?,
+            previous: self.trend_window_aggregates(pair.previous)?,
+        })
+    }
+
+    fn trend_window_aggregates(&self, range: TimeRange) -> Result<TrendWindowAggregates> {
+        let (sessions, _) = self.session_stats(range)?;
+        let (sub_tokens, subagent_runs) = self.subagent_totals(range)?;
+        Ok(TrendWindowAggregates {
+            by_kind: self.event_rollup_by_kind(range)?,
+            skills: self.skill_usage(range)?,
+            sessions,
+            subagent_runs,
+            sub_tokens,
+        })
     }
 
     /// Total startup tokens of **global** config — what every session pays
@@ -870,16 +1329,19 @@ impl Store {
     /// count is part of the answer because the floor is a minimum over
     /// observations: one resumed session alone still overstates it, and the
     /// count is what makes that visible.
-    pub fn baseline_floor_per_project(&self) -> Result<Vec<(String, i64, i64)>> {
-        let mut stmt = self.conn.prepare(
+    pub fn baseline_floor_per_project(&self, range: TimeRange) -> Result<Vec<(String, i64, i64)>> {
+        let (filter, binds) = range_clause_utc_text(range, "s.started_at");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT s.project, MIN(e.ctx_start), COUNT(*)
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = 'session_start' AND e.ctx_start > 0
+             WHERE e.kind = 'session_start' AND e.ctx_start > 0{filter}
              GROUP BY s.project
-             ORDER BY MIN(e.ctx_start) DESC",
-        )?;
+             ORDER BY MIN(e.ctx_start) DESC"
+        ))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -887,11 +1349,15 @@ impl Store {
     /// The global empirical always-on floor — the leanest session start observed
     /// anywhere. `None` when no session start was observed at all, so callers
     /// report the metric as unavailable instead of inventing a zero.
-    pub fn baseline_floor(&self) -> Result<Option<i64>> {
+    pub fn baseline_floor(&self, range: TimeRange) -> Result<Option<i64>> {
+        let (filter, binds) = range_clause_utc_text(range, "s.started_at");
         let floor = self.conn.query_row(
-            "SELECT MIN(ctx_start) FROM events
-             WHERE kind = 'session_start' AND ctx_start > 0",
-            [],
+            &format!(
+                "SELECT MIN(e.ctx_start) FROM events e
+                 JOIN sessions s ON e.session_id = s.id
+                 WHERE e.kind = 'session_start' AND e.ctx_start > 0{filter}"
+            ),
+            params_from_iter(binds),
             |row| row.get(0),
         )?;
         Ok(floor)
@@ -899,20 +1365,25 @@ impl Store {
 
     /// How much data the store holds: `(sessions, distinct projects)` — the
     /// summary's "what was analyzed" context line.
-    pub fn session_stats(&self) -> Result<(i64, i64)> {
+    pub fn session_stats(&self, range: TimeRange) -> Result<(i64, i64)> {
+        let (filter, binds) = range_clause_utc_text(range, "started_at");
         let row = self.conn.query_row(
-            "SELECT COUNT(*), COUNT(DISTINCT project) FROM sessions",
-            [],
+            &format!("SELECT COUNT(*), COUNT(DISTINCT project) FROM sessions WHERE 1=1{filter}"),
+            params_from_iter(binds),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(row)
     }
 
     /// Total subagent output tokens and subagent count across all sessions.
-    pub fn subagent_totals(&self) -> Result<(i64, i64)> {
+    pub fn subagent_totals(&self, range: TimeRange) -> Result<(i64, i64)> {
+        let (filter, binds) = range_clause_utc_text(range, "started_at");
         let row = self.conn.query_row(
-            "SELECT COALESCE(SUM(sub_tokens), 0), COALESCE(SUM(sub_agent_count), 0) FROM sessions",
-            [],
+            &format!(
+                "SELECT COALESCE(SUM(sub_tokens), 0), COALESCE(SUM(sub_agent_count), 0)
+                 FROM sessions WHERE 1=1{filter}"
+            ),
+            params_from_iter(binds),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(row)
@@ -930,15 +1401,17 @@ impl Store {
     /// runs could be extracted keep their totals but have no rows here; a
     /// report reconciles the two with `core::subagent::SplitCoverage` rather
     /// than presenting these rows as the whole breakdown.
-    pub fn subagent_by_agent(&self) -> Result<Vec<AgentCost>> {
-        let mut stmt = self.conn.prepare(
+    pub fn subagent_by_agent(&self, range: TimeRange) -> Result<Vec<AgentCost>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT agent, COUNT(*), COALESCE(SUM(out_tokens), 0)
              FROM subagent_runs
+             WHERE 1=1{filter}
              GROUP BY agent
-             ORDER BY COALESCE(SUM(out_tokens), 0) DESC, COUNT(*) DESC",
-        )?;
+             ORDER BY COALESCE(SUM(out_tokens), 0) DESC, COUNT(*) DESC"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(AgentCost {
                     agent: row.get(0)?,
                     runs: row.get(1)?,
@@ -951,28 +1424,32 @@ impl Store {
 
     /// Invocation counts per surface `(kind, id)` across all event kinds — the
     /// usage side of the catalog join for every surface, not just skills.
-    pub fn usage_counts(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
+    pub fn usage_counts(&self, range: TimeRange) -> Result<Vec<(String, String, i64)>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT surface_kind, surface_id, COUNT(*)
              FROM events
-             WHERE surface_kind IS NOT NULL
-             GROUP BY surface_kind, surface_id",
-        )?;
+             WHERE surface_kind IS NOT NULL{filter}
+             GROUP BY surface_kind, surface_id"
+        ))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params_from_iter(binds), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Per-event costs for skill invocations, for time bucketing in the report.
-    pub fn skill_event_costs(&self) -> Result<Vec<EventCost>> {
-        let mut stmt = self.conn.prepare(
+    pub fn skill_event_costs(&self, range: TimeRange) -> Result<Vec<EventCost>> {
+        let (filter, binds) = range_clause(range, "started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT started_epoch, out_tokens, ctx_growth, duration_sec
              FROM events
-             WHERE surface_kind = 'skill'",
-        )?;
+             WHERE surface_kind = 'skill'{filter}"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(EventCost {
                     started_epoch: row.get(0)?,
                     out_tokens: row.get(1)?,
@@ -1007,14 +1484,19 @@ impl Store {
     /// everything once (`docs/specs/storage.md`). "Everything" means every
     /// transcript still on disk — rows whose source file is gone can never be
     /// re-derived, so they stay as last extracted.
-    pub fn is_analyzer_current(&self) -> Result<bool> {
-        Ok(self.meta(ANALYZER_META_KEY)?.as_deref() == Some(ANALYZER_VERSION))
+    ///
+    /// Which `key`/`version` pair a harness uses is the harness's own business
+    /// (`adapter::transcript` for Claude Code, `adapter::opencode`,
+    /// `adapter::kilocode`); the store only compares what it was handed, so it
+    /// stays harness-agnostic.
+    pub fn is_analyzer_current(&self, key: &str, version: &str) -> Result<bool> {
+        Ok(self.meta(key)?.as_deref() == Some(version))
     }
 
     /// Stamp the store with the analysis semantics its rows were produced by.
     /// Call once a full analyze run has completed.
-    pub fn record_analyzer_version(&mut self) -> Result<()> {
-        self.set_meta(ANALYZER_META_KEY, ANALYZER_VERSION)
+    pub fn record_analyzer_version(&mut self, key: &str, version: &str) -> Result<()> {
+        self.set_meta(key, version)
     }
 
     /// Whether a source file's `(mtime, size)` matches its recorded ingest
@@ -1071,25 +1553,26 @@ impl Store {
     /// project P joins P's project row when one exists for that `(kind, id)`,
     /// else the global row. One event therefore counts on exactly one row
     /// (`docs/specs/surfaces.md`).
-    pub fn effective_catalog(&self) -> Result<Vec<CatalogEntry>> {
-        let mut stmt = self.conn.prepare(
+    pub fn effective_catalog(&self, range: TimeRange) -> Result<Vec<CatalogEntry>> {
+        let (filter, binds) = range_clause(range, "e.started_epoch");
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT f.kind, f.id, f.scope, f.project, f.static_tokens,
                     f.startup_tokens, f.load_mode, COUNT(u.event_id)
              FROM surfaces f
              LEFT JOIN (SELECT e.id AS event_id, e.surface_kind, e.surface_id,
                                s.project AS session_project
                         FROM events e JOIN sessions s ON e.session_id = s.id
-                        WHERE e.surface_kind IS NOT NULL) u
+                        WHERE e.surface_kind IS NOT NULL{filter}) u
                ON u.surface_kind = f.kind AND u.surface_id = f.id
               AND ((f.scope = 'project' AND u.session_project = f.project)
                 OR (f.scope = 'global' AND u.session_project NOT IN (
                       SELECT p.project FROM surfaces p
                       WHERE p.kind = f.kind AND p.id = f.id AND p.scope = 'project')))
              GROUP BY f.kind, f.id, f.scope, f.project
-             ORDER BY f.kind, f.id, f.scope, f.project",
-        )?;
+             ORDER BY f.kind, f.id, f.scope, f.project"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params_from_iter(binds), |row| {
                 Ok(CatalogEntry {
                     kind: row.get(0)?,
                     id: row.get(1)?,
@@ -1162,7 +1645,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     let desired = Connection::open_in_memory()?;
     desired.execute_batch(SCHEMA)?;
     desired.execute_batch(INDEX_SCHEMA)?;
-    desired.execute_batch(VIEW_SCHEMA)?;
+    desired.execute_batch(&view_schema())?;
 
     // One transaction for the whole migration, as every other multi-statement
     // write in this file does: reconciliation may bail partway through, and a
@@ -1352,7 +1835,15 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::period::TimeRange;
+    use crate::core::subagent::SplitCoverage;
     use crate::core::surface::{LoadMode, Scope};
+
+    /// The store is agnostic to which analysis-semantics pair a harness
+    /// stamps, so the tests use their own — nothing here depends on a real
+    /// harness's key or version.
+    const TEST_ANALYZER_KEY: &str = "test_analyzer_version";
+    const TEST_ANALYZER_VERSION: &str = "1";
 
     /// Permissions are the reason this test and the next one work on a real
     /// temp directory instead of `Store::in_memory`: the default store path
@@ -1364,7 +1855,7 @@ mod tests {
         let path = dir.join("saniwalens").join("saniwalens.db");
         let _ = std::fs::remove_dir_all(&dir);
 
-        drop(Store::open(&path).unwrap());
+        drop(Store::open(&path, OpenMode::ReadWrite).unwrap());
 
         assert!(path.exists(), "the store was not created at {path:?}");
         #[cfg(unix)]
@@ -1390,10 +1881,10 @@ mod tests {
         let path = dir.join("saniwalens.db");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        drop(Store::open(&path).unwrap());
+        drop(Store::open(&path, OpenMode::ReadWrite).unwrap());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        drop(Store::open(&path).unwrap());
+        drop(Store::open(&path, OpenMode::ReadWrite).unwrap());
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -1461,21 +1952,16 @@ mod tests {
     fn subagent_cost_rolls_up_per_agent_type() {
         let mut store = Store::in_memory().unwrap();
         let s1 = session("s1");
-        store.ingest_session(&s1, &[], &[]).unwrap();
         store
-            .ingest_subagent_runs(
-                &s1.id,
-                &s1.source_path,
-                &[
-                    subagent_run("Explore", "a1", "toolu_a1", 400),
-                    subagent_run("Explore", "a2", "toolu_a2", 100),
-                    subagent_run("code-writer", "a3", "toolu_a3", 900),
-                ],
-            )
+            .ingest(IngestBatch::new(&s1, &[], &[]).subagent_runs(&[
+                subagent_run("Explore", "a1", "toolu_a1", 400),
+                subagent_run("Explore", "a2", "toolu_a2", 100),
+                subagent_run("code-writer", "a3", "toolu_a3", 900),
+            ]))
             .unwrap();
 
         assert_eq!(
-            store.subagent_by_agent().unwrap(),
+            store.subagent_by_agent(TimeRange::ALL).unwrap(),
             vec![
                 AgentCost {
                     agent: Some("code-writer".to_string()),
@@ -1495,17 +1981,13 @@ mod tests {
     fn a_spawn_event_takes_the_cost_of_the_run_it_started() {
         let mut store = Store::in_memory().unwrap();
         let s1 = session("s1");
-        store
-            .ingest_session(&s1, &[], &[agent_spawn("Explore", "toolu_a1")])
-            .unwrap();
         let mut nested = subagent_run("code-writer", "a2", "toolu_a1", 700);
         nested.parent_agent_id = Some("a1".to_string());
         nested.spawn_depth = 2;
         store
-            .ingest_subagent_runs(
-                &s1.id,
-                &s1.source_path,
-                &[subagent_run("Explore", "a1", "toolu_a1", 400), nested],
+            .ingest(
+                IngestBatch::new(&s1, &[], &[agent_spawn("Explore", "toolu_a1")])
+                    .subagent_runs(&[subagent_run("Explore", "a1", "toolu_a1", 400), nested]),
             )
             .unwrap();
 
@@ -1527,13 +2009,9 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let s1 = session("s1");
         store
-            .ingest_session(&s1, &[], &[agent_spawn("Explore", "toolu_gone")])
-            .unwrap();
-        store
-            .ingest_subagent_runs(
-                &s1.id,
-                &s1.source_path,
-                &[subagent_run("Explore", "a1", "toolu_a1", 400)],
+            .ingest(
+                IngestBatch::new(&s1, &[], &[agent_spawn("Explore", "toolu_gone")])
+                    .subagent_runs(&[subagent_run("Explore", "a1", "toolu_a1", 400)]),
             )
             .unwrap();
 
@@ -1550,23 +2028,15 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let (s1, s2) = (session("s1"), session("s2"));
         store
-            .ingest_session(&s1, &[], &[agent_spawn("Explore", "toolu_a1")])
-            .unwrap();
-        store
-            .ingest_session(&s2, &[], &[agent_spawn("Explore", "toolu_a1")])
-            .unwrap();
-        store
-            .ingest_subagent_runs(
-                &s1.id,
-                &s1.source_path,
-                &[subagent_run("Explore", "a1", "toolu_a1", 400)],
+            .ingest(
+                IngestBatch::new(&s1, &[], &[agent_spawn("Explore", "toolu_a1")])
+                    .subagent_runs(&[subagent_run("Explore", "a1", "toolu_a1", 400)]),
             )
             .unwrap();
         store
-            .ingest_subagent_runs(
-                &s2.id,
-                &s2.source_path,
-                &[subagent_run("Explore", "a1", "toolu_a1", 900)],
+            .ingest(
+                IngestBatch::new(&s2, &[], &[agent_spawn("Explore", "toolu_a1")])
+                    .subagent_runs(&[subagent_run("Explore", "a1", "toolu_a1", 900)]),
             )
             .unwrap();
 
@@ -1589,17 +2059,17 @@ mod tests {
     fn re_ingesting_a_session_replaces_its_subagent_runs() {
         let mut store = Store::in_memory().unwrap();
         let s1 = session("s1");
-        store.ingest_session(&s1, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&s1, &[], &[])).unwrap();
         let runs = [subagent_run("Explore", "a1", "toolu_a1", 400)];
         store
-            .ingest_subagent_runs(&s1.id, &s1.source_path, &runs)
+            .ingest(IngestBatch::new(&s1, &[], &[]).subagent_runs(&runs))
             .unwrap();
         store
-            .ingest_subagent_runs(&s1.id, &s1.source_path, &runs)
+            .ingest(IngestBatch::new(&s1, &[], &[]).subagent_runs(&runs))
             .unwrap();
 
         assert_eq!(
-            store.subagent_by_agent().unwrap(),
+            store.subagent_by_agent(TimeRange::ALL).unwrap(),
             vec![AgentCost {
                 agent: Some("Explore".to_string()),
                 runs: 1,
@@ -1612,20 +2082,24 @@ mod tests {
     fn rolls_up_usage_per_skill_across_sessions() {
         let mut store = Store::in_memory().unwrap();
         store
-            .ingest_session(
+            .ingest(IngestBatch::new(
                 &session("s1"),
                 &[
                     span("git-commit", 100, 50, 2.0),
                     span("git-commit", 200, 30, 1.0),
                 ],
                 &[],
-            )
+            ))
             .unwrap();
         store
-            .ingest_session(&session("s2"), &[span("pr-create", 10, 5, 0.5)], &[])
+            .ingest(IngestBatch::new(
+                &session("s2"),
+                &[span("pr-create", 10, 5, 0.5)],
+                &[],
+            ))
             .unwrap();
 
-        let usage = store.skill_usage().unwrap();
+        let usage = store.skill_usage(TimeRange::ALL).unwrap();
 
         assert_eq!(
             usage,
@@ -1652,14 +2126,22 @@ mod tests {
     fn re_ingesting_a_session_replaces_its_events() {
         let mut store = Store::in_memory().unwrap();
         store
-            .ingest_session(&session("s1"), &[span("git-commit", 100, 50, 2.0)], &[])
+            .ingest(IngestBatch::new(
+                &session("s1"),
+                &[span("git-commit", 100, 50, 2.0)],
+                &[],
+            ))
             .unwrap();
         // Same source_path, different content — must supersede, not accumulate.
         store
-            .ingest_session(&session("s1"), &[span("git-commit", 999, 999, 9.0)], &[])
+            .ingest(IngestBatch::new(
+                &session("s1"),
+                &[span("git-commit", 999, 999, 9.0)],
+                &[],
+            ))
             .unwrap();
 
-        let usage = store.skill_usage().unwrap();
+        let usage = store.skill_usage(TimeRange::ALL).unwrap();
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].invocations, 1);
         assert_eq!(usage[0].out_tokens, 999);
@@ -1695,10 +2177,18 @@ mod tests {
         let mut beta = session("b1");
         beta.project = "beta".to_string();
         store
-            .ingest_session(&alpha, &[span("git-commit", 1, 1, 1.0)], &[])
+            .ingest(IngestBatch::new(
+                &alpha,
+                &[span("git-commit", 1, 1, 1.0)],
+                &[],
+            ))
             .unwrap();
         store
-            .ingest_session(&beta, &[span("git-commit", 1, 1, 1.0)], &[])
+            .ingest(IngestBatch::new(
+                &beta,
+                &[span("git-commit", 1, 1, 1.0)],
+                &[],
+            ))
             .unwrap();
         store
             .replace_surfaces(&[
@@ -1707,7 +2197,7 @@ mod tests {
             ])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
 
         assert_eq!(catalog.len(), 2);
         let global = catalog.iter().find(|e| e.scope == "global").unwrap();
@@ -1726,16 +2216,24 @@ mod tests {
         let mut beta = session("b1");
         beta.project = "beta".to_string();
         store
-            .ingest_session(&alpha, &[span("pr-create", 1, 1, 1.0)], &[])
+            .ingest(IngestBatch::new(
+                &alpha,
+                &[span("pr-create", 1, 1, 1.0)],
+                &[],
+            ))
             .unwrap();
         store
-            .ingest_session(&beta, &[span("pr-create", 1, 1, 1.0)], &[])
+            .ingest(IngestBatch::new(
+                &beta,
+                &[span("pr-create", 1, 1, 1.0)],
+                &[],
+            ))
             .unwrap();
         store
             .replace_surfaces(&[surface("pr-create", Scope::Global, 40)])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].uses, 2);
     }
@@ -1750,9 +2248,9 @@ mod tests {
         b.root = "/tmp/example/app".to_string(); // duplicate root
         b.project = "alpha".to_string();
         let c = session("c1"); // root unknown (empty)
-        store.ingest_session(&a, &[], &[]).unwrap();
-        store.ingest_session(&b, &[], &[]).unwrap();
-        store.ingest_session(&c, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&a, &[], &[])).unwrap();
+        store.ingest(IngestBatch::new(&b, &[], &[])).unwrap();
+        store.ingest(IngestBatch::new(&c, &[], &[])).unwrap();
 
         assert_eq!(
             store.session_roots().unwrap(),
@@ -1841,7 +2339,7 @@ mod tests {
 
         let store = Store::from_connection(store.conn).unwrap();
 
-        assert_eq!(store.effective_catalog().unwrap().len(), 1);
+        assert_eq!(store.effective_catalog(TimeRange::ALL).unwrap().len(), 1);
     }
 
     #[test]
@@ -2112,12 +2610,16 @@ mod tests {
             .execute_batch("DROP TABLE subagent_runs")
             .unwrap();
         // Stamped by a build that predates subagent extraction.
-        store.set_meta(ANALYZER_META_KEY, "1").unwrap();
+        store.set_meta(TEST_ANALYZER_KEY, "0").unwrap();
 
         let store = Store::from_connection(store.conn).unwrap();
 
         assert!(table_exists(&store.conn, "subagent_runs").unwrap());
-        assert!(!store.is_analyzer_current().unwrap());
+        assert!(
+            !store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2128,10 +2630,16 @@ mod tests {
         store
             .record_ingested_file("/tmp/example/s1.jsonl", 1, 2)
             .unwrap();
-        store.record_analyzer_version().unwrap();
+        store
+            .record_analyzer_version(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+            .unwrap();
         let store = Store::from_connection(store.conn).unwrap();
 
-        assert!(store.is_analyzer_current().unwrap());
+        assert!(
+            store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
         assert!(store.is_ingested("/tmp/example/s1.jsonl", 1, 2).unwrap());
     }
 
@@ -2165,25 +2673,25 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             ctx: 30000,
         });
-        store.ingest_session(&alpha1, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&alpha1, &[], &[])).unwrap();
         let mut alpha2 = session("a2");
         alpha2.project = "alpha".to_string();
         alpha2.start = Some(SessionStart {
             timestamp_ms: 1_700_000_000_000,
             ctx: 12000,
         });
-        store.ingest_session(&alpha2, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&alpha2, &[], &[])).unwrap();
         let mut beta = session("b1");
         beta.project = "beta".to_string();
         beta.start = Some(SessionStart {
             timestamp_ms: 1_700_000_000_000,
             ctx: 40000,
         });
-        store.ingest_session(&beta, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&beta, &[], &[])).unwrap();
 
-        assert_eq!(store.baseline_floor().unwrap(), Some(12000));
+        assert_eq!(store.baseline_floor(TimeRange::ALL).unwrap(), Some(12000));
         assert_eq!(
-            store.baseline_floor_per_project().unwrap(),
+            store.baseline_floor_per_project(TimeRange::ALL).unwrap(),
             vec![
                 ("beta".to_string(), 40000, 1),
                 ("alpha".to_string(), 12000, 2)
@@ -2202,10 +2710,14 @@ mod tests {
             ctx: 50000,
         });
         store
-            .ingest_session(&meta, &[span_at_ctx("git-commit", 430000)], &[])
+            .ingest(IngestBatch::new(
+                &meta,
+                &[span_at_ctx("git-commit", 430000)],
+                &[],
+            ))
             .unwrap();
 
-        assert_eq!(store.baseline_floor().unwrap(), Some(50000));
+        assert_eq!(store.baseline_floor(TimeRange::ALL).unwrap(), Some(50000));
     }
 
     #[test]
@@ -2218,7 +2730,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             ctx: 50000,
         });
-        store.ingest_session(&meta, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&meta, &[], &[])).unwrap();
 
         let (_, rows) = store
             .query("SELECT started_epoch, started_at FROM events WHERE kind = 'session_start'")
@@ -2237,7 +2749,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             ctx: 50000,
         });
-        store.ingest_session(&meta, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&meta, &[], &[])).unwrap();
 
         let (_, rows) = store
             .query("SELECT started_at FROM sessions WHERE id = 's1'")
@@ -2250,11 +2762,18 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let meta = session("s1");
         store
-            .ingest_session(&meta, &[span_at_ctx("git-commit", 430000)], &[])
+            .ingest(IngestBatch::new(
+                &meta,
+                &[span_at_ctx("git-commit", 430000)],
+                &[],
+            ))
             .unwrap();
 
-        assert_eq!(store.baseline_floor().unwrap(), None);
-        assert_eq!(store.baseline_floor_per_project().unwrap(), vec![]);
+        assert_eq!(store.baseline_floor(TimeRange::ALL).unwrap(), None);
+        assert_eq!(
+            store.baseline_floor_per_project(TimeRange::ALL).unwrap(),
+            vec![]
+        );
     }
 
     #[test]
@@ -2319,7 +2838,7 @@ mod tests {
             .replace_surfaces(&[skill_surface("repro", Scope::Global, 1015, 7)])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
         assert_eq!(catalog[0].static_tokens, Some(1015));
         assert_eq!(catalog[0].startup_tokens, Some(7));
     }
@@ -2334,7 +2853,7 @@ mod tests {
             .replace_surfaces(&[surface("new", Scope::Global, 1)])
             .unwrap();
 
-        let catalog = store.effective_catalog().unwrap();
+        let catalog = store.effective_catalog(TimeRange::ALL).unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].id, "new");
     }
@@ -2375,11 +2894,25 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         // A store written by an older analyzer (or none at all) is stale, so
         // `analyze` re-ingests even the transcripts whose fingerprint matches.
-        assert!(!store.is_analyzer_current().unwrap());
-        store.set_meta(ANALYZER_META_KEY, "0").unwrap();
-        assert!(!store.is_analyzer_current().unwrap());
-        store.record_analyzer_version().unwrap();
-        assert!(store.is_analyzer_current().unwrap());
+        assert!(
+            !store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
+        store.set_meta(TEST_ANALYZER_KEY, "0").unwrap();
+        assert!(
+            !store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
+        store
+            .record_analyzer_version(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+            .unwrap();
+        assert!(
+            store
+                .is_analyzer_current(TEST_ANALYZER_KEY, TEST_ANALYZER_VERSION)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2390,27 +2923,23 @@ mod tests {
         alpha.project = "alpha".to_string();
         let mut beta = session("b1");
         beta.project = "beta".to_string();
-        store.ingest_session(&alpha, &[], &[]).unwrap();
-        store.ingest_session(&beta, &[], &[]).unwrap();
         store
-            .ingest_tool_errors(
-                "a1",
-                &alpha.source_path,
-                &[
-                    (100, "edit-precondition", "x", "Edit", "f"),
-                    (200, "edit-precondition", "y", "Edit", "f"),
-                ],
-            )
+            .ingest(IngestBatch::new(&alpha, &[], &[]).tool_errors(&[
+                (100, "edit-precondition", "x", "Edit", "f"),
+                (200, "edit-precondition", "y", "Edit", "f"),
+            ]))
             .unwrap();
         store
-            .ingest_tool_errors(
-                "b1",
-                &beta.source_path,
-                &[(300, "edit-precondition", "z", "Write", "f")],
-            )
+            .ingest(IngestBatch::new(&beta, &[], &[]).tool_errors(&[(
+                300,
+                "edit-precondition",
+                "z",
+                "Write",
+                "f",
+            )]))
             .unwrap();
 
-        let rows = store.error_counts_by_project().unwrap();
+        let rows = store.error_counts_by_project(TimeRange::ALL).unwrap();
 
         // Densest (project, category) pair first — alpha owns the friction.
         assert_eq!(
@@ -2427,21 +2956,16 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
         alpha.project = "alpha".to_string();
-        store.ingest_session(&alpha, &[], &[]).unwrap();
         store
-            .ingest_tool_errors(
-                "a1",
-                &alpha.source_path,
-                &[
-                    (100, "path-not-found", "missing /a", "Read", "f"),
-                    (200, "path-not-found", "missing /b", "Read", "f"),
-                    (300, "path-not-found", "missing /c", "Bash", "f"),
-                ],
-            )
+            .ingest(IngestBatch::new(&alpha, &[], &[]).tool_errors(&[
+                (100, "path-not-found", "missing /a", "Read", "f"),
+                (200, "path-not-found", "missing /b", "Read", "f"),
+                (300, "path-not-found", "missing /c", "Bash", "f"),
+            ]))
             .unwrap();
 
         // Two examples per group, earliest first — the third is dropped.
-        let examples = store.error_examples(2).unwrap();
+        let examples = store.error_examples(2, TimeRange::ALL).unwrap();
         assert_eq!(
             examples,
             vec![
@@ -2468,11 +2992,11 @@ mod tests {
         b.project = "alpha".to_string();
         let mut c = session("c1");
         c.project = "beta".to_string();
-        store.ingest_session(&a, &[], &[]).unwrap();
-        store.ingest_session(&b, &[], &[]).unwrap();
-        store.ingest_session(&c, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&a, &[], &[])).unwrap();
+        store.ingest(IngestBatch::new(&b, &[], &[])).unwrap();
+        store.ingest(IngestBatch::new(&c, &[], &[])).unwrap();
 
-        assert_eq!(store.session_stats().unwrap(), (3, 2));
+        assert_eq!(store.session_stats(TimeRange::ALL).unwrap(), (3, 2));
     }
 
     #[test]
@@ -2481,25 +3005,18 @@ mod tests {
         // session wants the wall-clock time without re-deriving it, and the
         // headless walkthrough stalled on the empty column.
         let mut store = Store::in_memory().unwrap();
-        store.ingest_session(&session("a1"), &[], &[]).unwrap();
+        let a1 = session("a1");
         store
-            .ingest_work_events(
-                "a1",
-                "t.jsonl",
-                &[(1_000, "file_edit", "x.rs", Some("/repo/src/x.rs"))],
-            )
-            .unwrap();
-        store
-            .ingest_tool_errors(
-                "a1",
-                "t.jsonl",
-                &[(
-                    2_000,
-                    "path-not-found",
-                    "no such file",
-                    "read_file",
-                    "/repo/src/y.rs",
-                )],
+            .ingest(
+                IngestBatch::new(&a1, &[], &[])
+                    .tool_errors(&[(
+                        2_000,
+                        "path-not-found",
+                        "no such file",
+                        "read_file",
+                        "/repo/src/y.rs",
+                    )])
+                    .work_events(&[(1_000, "file_edit", "x.rs", Some("/repo/src/x.rs"))]),
             )
             .unwrap();
 
@@ -2517,17 +3034,17 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
         alpha.project = "alpha".to_string();
-        store.ingest_session(&alpha, &[], &[]).unwrap();
         store
-            .ingest_work_events(
-                "a1",
-                &alpha.source_path,
-                &[(1_000, "file_edit", "x.rs", Some("/repo/src/x.rs"))],
-            )
+            .ingest(IngestBatch::new(&alpha, &[], &[]).work_events(&[(
+                1_000,
+                "file_edit",
+                "x.rs",
+                Some("/repo/src/x.rs"),
+            )]))
             .unwrap();
 
         assert_eq!(
-            store.file_edits().unwrap(),
+            store.file_edits(TimeRange::ALL).unwrap(),
             vec![FileEdit {
                 project: "alpha".to_string(),
                 session_id: "a1".to_string(),
@@ -2544,16 +3061,16 @@ mod tests {
         // before paths were recorded.
         let mut store = Store::in_memory().unwrap();
         let alpha = session("a1");
-        store.ingest_session(&alpha, &[], &[]).unwrap();
         store
-            .ingest_work_events(
-                "a1",
-                &alpha.source_path,
-                &[(1_000, "file_edit", "x.rs", None)],
-            )
+            .ingest(IngestBatch::new(&alpha, &[], &[]).work_events(&[(
+                1_000,
+                "file_edit",
+                "x.rs",
+                None,
+            )]))
             .unwrap();
 
-        assert_eq!(store.file_edits().unwrap(), vec![]);
+        assert_eq!(store.file_edits(TimeRange::ALL).unwrap(), vec![]);
     }
 
     #[test]
@@ -2561,7 +3078,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
         alpha.project = "alpha".to_string();
-        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store.ingest(IngestBatch::new(&alpha, &[], &[])).unwrap();
 
         let (cols, rows) = store
             .query_json("SELECT project, COUNT(*) AS n, NULL AS absent, 1.5 AS ratio FROM sessions")
@@ -2586,13 +3103,14 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
         alpha.project = "alpha".to_string();
-        store.ingest_session(&alpha, &[], &[]).unwrap();
         store
-            .ingest_tool_errors(
-                "a1",
-                &alpha.source_path,
-                &[(100, "path-not-found", "missing /a", "Read", "f")],
-            )
+            .ingest(IngestBatch::new(&alpha, &[], &[]).tool_errors(&[(
+                100,
+                "path-not-found",
+                "missing /a",
+                "Read",
+                "f",
+            )]))
             .unwrap();
 
         let (cols, rows) = store
@@ -2614,13 +3132,14 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
         alpha.project = "demo--wt-feature".to_string();
-        store.ingest_session(&alpha, &[], &[]).unwrap();
         store
-            .ingest_tool_errors(
-                "a1",
-                &alpha.source_path,
-                &[(100, "path-not-found", "missing /a", "Read", "f")],
-            )
+            .ingest(IngestBatch::new(&alpha, &[], &[]).tool_errors(&[(
+                100,
+                "path-not-found",
+                "missing /a",
+                "Read",
+                "f",
+            )]))
             .unwrap();
 
         // An ad-hoc query against the view sees clean names, not the overloaded
@@ -2650,21 +3169,16 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
         alpha.project = "alpha".to_string();
-        store.ingest_session(&alpha, &[], &[]).unwrap();
         store
-            .ingest_tool_errors(
-                "a1",
-                &alpha.source_path,
-                &[
-                    (100, "path-not-found", "missing /a", "Read", "f"),
-                    (200, "path-not-found", "missing /b", "Read", "f"),
-                    (300, "path-not-found", "missing /c", "Bash", "f"),
-                ],
-            )
+            .ingest(IngestBatch::new(&alpha, &[], &[]).tool_errors(&[
+                (100, "path-not-found", "missing /a", "Read", "f"),
+                (200, "path-not-found", "missing /b", "Read", "f"),
+                (300, "path-not-found", "missing /c", "Bash", "f"),
+            ]))
             .unwrap();
 
         // path-not-found splits Read 2 / Bash 1, densest tool first.
-        let rows = store.error_tool_breakdown().unwrap();
+        let rows = store.error_tool_breakdown(TimeRange::ALL).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -2681,6 +3195,619 @@ mod tests {
                     1
                 ),
             ]
+        );
+    }
+
+    // ---- PBI 02: batch ingest order, typed open guarantees, encoding table ----
+
+    fn dump(store: &Store, table: &str) -> Vec<Vec<String>> {
+        store
+            .query(&format!("SELECT * FROM {table} ORDER BY id"))
+            .unwrap()
+            .1
+    }
+
+    /// Ingest the batch a caller would submit for a fresh read of one file.
+    fn ingest_fresh(store: &mut Store, meta: &SessionMeta) {
+        store
+            .ingest(
+                IngestBatch::new(
+                    meta,
+                    &[span("new-skill", 7, 7, 2.0)],
+                    &[agent_spawn("agent", "toolu_new")],
+                )
+                .prompts(&[(9, 1_700_000_100_000, "instruction")])
+                .subagent_runs(&[subagent_run("Explore", "new", "toolu_new", 222)])
+                .tool_errors(&[(2_000, "edit-precondition", "new", "Edit", "f")])
+                .work_events(&[(
+                    2_000,
+                    "file_edit",
+                    "new.rs",
+                    Some("/repo/new.rs"),
+                )]),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_batch_replaces_every_prior_row_for_the_file_wholesale() {
+        // Order-independence the old five-function API could not express: a
+        // store that previously held rows of every kind for this file must end
+        // up byte-identical to a store that only ever saw the fresh batch.
+        let mut seen = Store::in_memory().unwrap();
+        let meta = session("s1");
+        seen.ingest(
+            IngestBatch::new(
+                &meta,
+                &[span("old-skill", 5, 5, 1.0)],
+                &[agent_spawn("agent", "toolu_old")],
+            )
+            .prompts(&[(3, 1_700_000_000_000, "instruction")])
+            .subagent_runs(&[subagent_run("Explore", "old", "toolu_old", 111)])
+            .tool_errors(&[(1_000, "path-not-found", "old", "Read", "f")])
+            .work_events(&[(1_000, "file_edit", "old.rs", Some("/repo/old.rs"))]),
+        )
+        .unwrap();
+        ingest_fresh(&mut seen, &meta);
+
+        let mut fresh = Store::in_memory().unwrap();
+        ingest_fresh(&mut fresh, &meta);
+
+        for table in ["sessions", "events", "subagent_runs"] {
+            assert_eq!(
+                dump(&seen, table),
+                dump(&fresh, table),
+                "{table} must not depend on what was ingested before"
+            );
+        }
+    }
+
+    #[test]
+    fn one_batch_settles_the_spawn_costs_of_the_runs_it_carries() {
+        // The spawn-cost settle used to run in a separate call after
+        // `ingest_session`; inside a batch it must settle in the same commit.
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store
+            .ingest(
+                IngestBatch::new(&s1, &[], &[agent_spawn("Explore", "toolu_a1")])
+                    .subagent_runs(&[subagent_run("Explore", "a1", "toolu_a1", 400)]),
+            )
+            .unwrap();
+
+        let rows = store
+            .query("SELECT out_tokens FROM events WHERE kind = 'agent_spawn'")
+            .unwrap()
+            .1;
+        assert_eq!(rows, vec![vec!["400".to_string()]]);
+    }
+
+    #[test]
+    fn readonly_open_neither_creates_nor_migrates() {
+        // The two guarantees `open`/`open_readonly` used to bury in their names
+        // are now the `OpenMode` argument's contract.
+        let dir =
+            std::env::temp_dir().join(format!("saniwalens-readonly-test-{}", std::process::id()));
+        let path = dir.join("store.db");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            Store::open(&path, OpenMode::ReadOnly).is_err(),
+            "a missing store is an error, never a fresh empty one"
+        );
+        assert!(!path.exists(), "readonly must not create the file");
+
+        // An old-shape store opens readonly as-is: no migration runs, so the
+        // missing column surfaces as SQLite's own error.
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id          TEXT PRIMARY KEY,
+                 project     TEXT NOT NULL,
+                 slug        TEXT NOT NULL,
+                 source_path TEXT NOT NULL,
+                 started_at  TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        drop(conn);
+        {
+            let store = Store::open(&path, OpenMode::ReadOnly).unwrap();
+            assert!(
+                store.query("SELECT root FROM sessions").is_err(),
+                "readonly must not migrate a legacy store"
+            );
+        }
+        {
+            let store = Store::open(&path, OpenMode::ReadWrite).unwrap();
+            assert!(
+                store.query("SELECT root FROM sessions").is_ok(),
+                "ReadWrite is the migrating mode"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_tool_errors_view_is_derived_from_the_encoding_table() {
+        // Every meaning the view names must come from EVENT_ENCODING, not from
+        // hand-written SQL that can drift away from it.
+        let sql = tool_errors_view_sql(EVENT_ENCODING);
+        let (_, roles) = EVENT_ENCODING
+            .iter()
+            .find(|(kind, _)| *kind == "tool_error")
+            .expect("tool_error is in the encoding table");
+        // Collapse padding so the assertion checks which column feeds which
+        // alias, not how the generated text is laid out.
+        let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (role, column) in *roles {
+            assert!(
+                flat.contains(&format!("e.{column} AS {role}")),
+                "view misses {role} → {column}: {sql}"
+            );
+        }
+        assert!(flat.contains("WHERE e.kind = 'tool_error'"));
+    }
+
+    #[test]
+    fn adding_a_kind_to_the_encoding_table_leaves_the_view_untouched() {
+        // A new event kind is a row in the table — existing view definitions
+        // and readers must not need to change for it.
+        let mut extended: Vec<(&str, &[(EventRole, EventColumn)])> = EVENT_ENCODING.to_vec();
+        extended.push((
+            "brand_new_kind",
+            &[(EventRole::Category, EventColumn::Target)],
+        ));
+
+        assert_eq!(
+            tool_errors_view_sql(EVENT_ENCODING),
+            tool_errors_view_sql(&extended),
+            "the view is defined only by the tool_error entry"
+        );
+    }
+
+    // ---- PBI 2026-10-30-01: the report views' evaluation window ----
+
+    fn span_at(skill: &str, epoch_secs: i64, out_tokens: u64) -> Span {
+        Span {
+            skill: skill.to_string(),
+            source: Source::Slash,
+            started_epoch_ms: epoch_secs * 1000,
+            duration_sec: 2.0,
+            out_tokens,
+            ctx_growth: 5,
+            ctx_start: 0,
+            ctx_peak: 5,
+            model: None,
+            is_trailing: false,
+            spawns: Vec::new(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            sub_tokens_estimated: false,
+        }
+    }
+
+    #[test]
+    fn a_range_narrows_event_aggregates_at_the_inclusive_bounds() {
+        let mut store = Store::in_memory().unwrap();
+        let s = session("s1");
+        let spans = [
+            span_at("commit", 1_000, 100),
+            span_at("commit", 2_000, 200),
+            span_at("commit", 3_000, 400),
+        ];
+        store.ingest(IngestBatch::new(&s, &spans, &[])).unwrap();
+
+        // Both ends are inclusive: a one-second window catches the span that
+        // starts at it, and nothing else.
+        let rollup = store
+            .skill_usage(TimeRange {
+                start: Some(2_000),
+                end: Some(2_000),
+            })
+            .unwrap();
+        assert_eq!(rollup.len(), 1);
+        assert_eq!(rollup[0].invocations, 1);
+        assert_eq!(rollup[0].out_tokens, 200);
+
+        // Without the period flags the whole spine comes back, unchanged.
+        assert_eq!(store.skill_usage(TimeRange::ALL).unwrap()[0].invocations, 3);
+    }
+
+    #[test]
+    fn a_range_narrows_session_aggregates_by_the_stamped_utc_text() {
+        let mut store = Store::in_memory().unwrap();
+        // Last second of JST 2026-10-07: local midnight of the 8th is
+        // 2026-10-07T15:00:00Z.
+        let end = 1_791_385_200 - 1;
+        // A session that started at 23:59:59.5 JST on the 7th — the millisecond
+        // fraction sits inside the final second, so it stays in the window.
+        let mut inside = session("inside");
+        inside.sub_tokens = 400;
+        inside.sub_agent_count = 1;
+        inside.start = Some(SessionStart {
+            timestamp_ms: end * 1000 + 500,
+            ctx: 10_000,
+        });
+        store.ingest(IngestBatch::new(&inside, &[], &[])).unwrap();
+        // A session that started at local midnight of the 8th — outside.
+        let mut outside = session("outside");
+        outside.sub_tokens = 500;
+        outside.sub_agent_count = 1;
+        outside.start = Some(SessionStart {
+            timestamp_ms: (end + 1) * 1000,
+            ctx: 11_000,
+        });
+        store.ingest(IngestBatch::new(&outside, &[], &[])).unwrap();
+
+        let range = TimeRange {
+            start: None,
+            end: Some(end),
+        };
+        assert_eq!(store.subagent_totals(range).unwrap(), (400, 1));
+        assert_eq!(store.session_stats(range).unwrap().0, 1);
+        // Without the flags both sessions count.
+        assert_eq!(store.subagent_totals(TimeRange::ALL).unwrap(), (900, 2));
+    }
+
+    #[test]
+    fn a_session_that_straddles_until_keeps_its_total_but_drops_the_late_runs() {
+        // The two time axes: the total reads the session's stamped start, the
+        // per-agent rows read each run's own epoch. A session that started
+        // inside the window whose runs landed past `--until` keeps its total
+        // while its late runs drop out of the rows — and the gap sentence
+        // names the window, not the pruned transcripts.
+        let mut store = Store::in_memory().unwrap();
+        let end = 1_791_385_200 - 1; // the last second of JST 2026-10-07
+        let mut s = session("s1");
+        s.sub_tokens = 400;
+        s.sub_agent_count = 2;
+        s.start = Some(SessionStart {
+            timestamp_ms: (end - 60) * 1000, // the session starts inside the window
+            ctx: 10_000,
+        });
+        let mut early = subagent_run("Explore", "a1", "toolu_a1", 100);
+        early.started_epoch_ms = (end - 60) * 1000; // inside the window
+        let mut late = subagent_run("Explore", "a2", "toolu_a2", 300);
+        late.started_epoch_ms = (end + 60) * 1000; // the run lands past --until
+        store
+            .ingest(IngestBatch::new(&s, &[], &[]).subagent_runs(&[early, late]))
+            .unwrap();
+
+        let range = TimeRange {
+            start: None,
+            end: Some(end),
+        };
+        // The total stays intact: the session started inside the window.
+        assert_eq!(store.subagent_totals(range).unwrap(), (400, 2));
+        // The rows keep only the run inside the window.
+        let agents = store.subagent_by_agent(range).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].out_tokens, 100);
+        // Without the flags both runs come back unchanged.
+        assert_eq!(store.subagent_totals(TimeRange::ALL).unwrap(), (400, 2));
+        assert_eq!(store.subagent_by_agent(TimeRange::ALL).unwrap().len(), 1);
+
+        // The straddle's gap sentence names the window, not the transcripts.
+        let coverage = SplitCoverage::new(400, 2, agents.iter().map(|a| (a.runs, a.out_tokens)));
+        let note = coverage.partial_note_in(range).unwrap();
+        assert!(note.contains("fall outside the report window"), "{}", note);
+        assert!(
+            !note.contains("analyzed before runs were extracted"),
+            "{}",
+            note
+        );
+    }
+
+    #[test]
+    fn inventory_narrows_the_usage_half_and_keeps_the_catalog_rows() {
+        let mut store = Store::in_memory().unwrap();
+        let s = session("s1");
+        let spans = [span_at("commit", 1_000, 100)];
+        let calls = [UsageEvent {
+            surface_kind: "agent".to_string(),
+            surface_id: "Task".to_string(),
+            started_epoch_ms: 2_000_000,
+            tool_use_id: None,
+        }];
+        store.ingest(IngestBatch::new(&s, &spans, &calls)).unwrap();
+        store
+            .replace_surfaces(&[
+                skill_surface("commit", Scope::Global, 10, 5),
+                surface("Task", Scope::Global, 20),
+            ])
+            .unwrap();
+
+        // The span starts at 1_000, the agent call at 2_000: a window ending
+        // before the call narrows the usage half only — the catalog (current
+        // config) keeps both rows.
+        let catalog = store
+            .effective_catalog(TimeRange {
+                start: None,
+                end: Some(1_500),
+            })
+            .unwrap();
+        assert_eq!(catalog.len(), 2, "catalog rows never disappear");
+        let skill = catalog
+            .iter()
+            .find(|e| e.kind == "skill" && e.id == "commit")
+            .unwrap();
+        assert_eq!(skill.uses, 1, "the span is inside the window");
+        let task = catalog
+            .iter()
+            .find(|e| e.kind == "skill" && e.id == "Task")
+            .unwrap();
+        assert_eq!(task.uses, 0, "the call is outside the window");
+    }
+
+    #[test]
+    fn a_range_narrows_failure_counts_and_work_events() {
+        let mut store = Store::in_memory().unwrap();
+        let mut s1 = session("s1");
+        s1.start = Some(SessionStart {
+            timestamp_ms: 500_000,
+            ctx: 1_000,
+        });
+        let errors = [(1_000_000, "path-not-found", "no /x", "Read", "/x")];
+        let edits = [
+            (2_000_000, "file_edit", "main.rs", Some("/repo/main.rs")),
+            (3_000_000, "file_edit", "lib.rs", Some("/repo/lib.rs")),
+        ];
+        store
+            .ingest(
+                IngestBatch::new(&s1, &[], &[])
+                    .tool_errors(&errors)
+                    .work_events(&edits),
+            )
+            .unwrap();
+
+        let range = TimeRange {
+            start: Some(2_500),
+            end: None,
+        };
+        assert!(store.error_counts(range).unwrap().is_empty());
+        let edits = store.file_edits(range).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].path, "/repo/lib.rs");
+        // Unbounded, everything comes back.
+        assert_eq!(store.error_counts(TimeRange::ALL).unwrap().len(), 1);
+        assert_eq!(store.file_edits(TimeRange::ALL).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_range_narrows_error_examples_and_keeps_the_cap_binds_last() {
+        // The anonymous-placeholder trick is textual-order-sensitive: the
+        // range binds first (the filter sits before the per-group cap), the
+        // cap last. A windowed test pins that a refactor moving the filter
+        // cannot silently truncate the examples.
+        let mut store = Store::in_memory().unwrap();
+        let mut s1 = session("s1");
+        s1.start = Some(SessionStart {
+            timestamp_ms: 500_000,
+            ctx: 1_000,
+        });
+        let errors = [
+            (1_000_000, "path-not-found", "no /a", "Read", "/a"),
+            (1_100_000, "path-not-found", "no /b", "Read", "/b"),
+            (1_200_000, "path-not-found", "no /c", "Read", "/c"),
+            (2_000_000, "timeout", "timed out", "Bash", "cmd"),
+            (9_000_000, "path-not-found", "no /late", "Read", "/late"),
+        ];
+        store
+            .ingest(IngestBatch::new(&s1, &[], &[]).tool_errors(&errors))
+            .unwrap();
+
+        // A window that keeps only the timeout: the past-`--until` example
+        // and the pre-`--since` ones drop out.
+        let range = TimeRange {
+            start: Some(1_500),
+            end: Some(2_500),
+        };
+        assert_eq!(
+            store.error_examples(2, range).unwrap(),
+            vec![(
+                "demo".to_string(),
+                "timeout".to_string(),
+                "timed out".to_string()
+            )]
+        );
+
+        // The cap binds last: three in-group examples, per_group 2, keeps the
+        // two earliest — the past-`--until` one never sneaks in.
+        let range = TimeRange {
+            start: Some(900),
+            end: Some(1_500),
+        };
+        let examples = store.error_examples(2, range).unwrap();
+        assert_eq!(examples.len(), 2);
+        assert_eq!(examples[0].2, "no /a");
+        assert_eq!(examples[1].2, "no /b");
+
+        // Unbounded, every example comes back — the cap still applied per
+        // group.
+        assert_eq!(store.error_examples(2, TimeRange::ALL).unwrap().len(), 3);
+        assert_eq!(store.error_examples(10, TimeRange::ALL).unwrap().len(), 5);
+    }
+
+    // ---- PBI 2026-10-30-02: the trend view's two windows ----
+
+    fn skill_row(skill: &str, invocations: i64) -> SkillUsage {
+        SkillUsage {
+            skill: skill.to_string(),
+            invocations,
+            out_tokens: 0,
+            ctx_growth: 0,
+            duration_sec: 0.0,
+        }
+    }
+
+    #[test]
+    fn skill_deltas_order_by_the_largest_absolute_delta() {
+        let current = [
+            skill_row("commit", 1),
+            skill_row("review", 5),
+            skill_row("deploy", 2),
+            skill_row("fresh", 1),
+        ];
+        let previous = [
+            skill_row("commit", 4),
+            skill_row("review", 3),
+            skill_row("retired", 7),
+        ];
+        let deltas = skill_deltas(&current, &previous);
+        // |delta| first, ties by skill: retired was used only in the previous
+        // window, deploy only in the current one, and deploy/review tie.
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|d| (d.skill.as_str(), d.current, d.previous, d.delta))
+                .collect::<Vec<_>>(),
+            [
+                ("retired", 0, 7, -7),
+                ("commit", 1, 4, -3),
+                ("deploy", 2, 0, 2),
+                ("review", 5, 3, 2),
+                ("fresh", 1, 0, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_window_aggregation_splits_events_between_the_windows() {
+        // Adjacent same-length windows: previous [1_000, 2_000], current
+        // [2_001, 3_000] — no second is shared, so a boundary event lands in
+        // exactly one window.
+        let previous = TimeRange {
+            start: Some(1_000),
+            end: Some(2_000),
+        };
+        let current = TimeRange {
+            start: Some(2_001),
+            end: Some(3_000),
+        };
+        let mut store = Store::in_memory().unwrap();
+
+        // A session stamped into each window, so the session count and the
+        // subagent totals split too (the sessions table's own axis). The
+        // stamped start is the earliest of the declared start and the
+        // session's spans, so each window's spans ride its own session.
+        let mut past = session("past");
+        past.start = Some(SessionStart {
+            timestamp_ms: 1_500 * 1000,
+            ctx: 9_000,
+        });
+        past.sub_tokens = 400;
+        past.sub_agent_count = 1;
+        let past_spans = [
+            span_at("commit", 1_500, 100), // previous only
+            span_at("review", 1_800, 50),  // previous only
+            span_at("edge", 2_000, 10),    // the previous window's last second
+        ];
+        store
+            .ingest(IngestBatch::new(&past, &past_spans, &[]))
+            .unwrap();
+
+        let mut present = session("present");
+        present.start = Some(SessionStart {
+            timestamp_ms: 2_500 * 1000,
+            ctx: 10_000,
+        });
+        present.sub_tokens = 500;
+        present.sub_agent_count = 2;
+        let present_spans = [
+            span_at("commit", 2_500, 300), // current only
+            span_at("edge", 2_001, 10),    // the current window's first second
+        ];
+        store
+            .ingest(
+                IngestBatch::new(&present, &present_spans, &[]).work_events(&[(
+                    2_600_000,
+                    "file_edit",
+                    "main.rs",
+                    Some("/repo/main.rs"),
+                )]),
+            )
+            .unwrap();
+
+        let agg = store
+            .trend_aggregates(WindowPair { current, previous })
+            .unwrap();
+
+        // Per-kind rollups: the current window has a file_edit the previous
+        // one lacks; the skill invocations split 2 vs 3 and never leak across
+        // the seam — each boundary event stays in its own window.
+        let kinds: Vec<&str> = agg
+            .current
+            .by_kind
+            .iter()
+            .map(|k| k.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["file_edit", "session_start", "skill_invocation"]);
+        let cur_skill = agg
+            .current
+            .by_kind
+            .iter()
+            .find(|k| k.kind == "skill_invocation")
+            .unwrap();
+        assert_eq!(cur_skill.events, 2, "commit@2_500 + edge@2_001 only");
+        assert_eq!(cur_skill.out_tokens, 310);
+        assert_eq!(cur_skill.duration_sec, 4.0);
+        let prev_skill = agg
+            .previous
+            .by_kind
+            .iter()
+            .find(|k| k.kind == "skill_invocation")
+            .unwrap();
+        assert_eq!(
+            prev_skill.events, 3,
+            "commit@1_500 + review@1_800 + edge@2_000"
+        );
+        assert_eq!(prev_skill.out_tokens, 160);
+        let kinds: Vec<&str> = agg
+            .previous
+            .by_kind
+            .iter()
+            .map(|k| k.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["session_start", "skill_invocation"]);
+
+        // Per-skill usage per window, and the delta ordering across them.
+        assert_eq!(
+            agg.current
+                .skills
+                .iter()
+                .map(|s| (s.skill.as_str(), s.invocations))
+                .collect::<Vec<_>>(),
+            [("commit", 1), ("edge", 1)]
+        );
+        assert_eq!(
+            agg.previous
+                .skills
+                .iter()
+                .map(|s| (s.skill.as_str(), s.invocations))
+                .collect::<Vec<_>>(),
+            [("commit", 1), ("edge", 1), ("review", 1)]
+        );
+        let deltas = skill_deltas(&agg.current.skills, &agg.previous.skills);
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|d| (d.skill.as_str(), d.delta))
+                .collect::<Vec<_>>(),
+            [("review", -1), ("commit", 0), ("edge", 0)]
+        );
+
+        // Session count and subagent totals follow the sessions axis.
+        assert_eq!(agg.current.sessions, 1);
+        assert_eq!(agg.previous.sessions, 1);
+        assert_eq!(
+            (agg.current.sub_tokens, agg.current.subagent_runs),
+            (500, 2)
+        );
+        assert_eq!(
+            (agg.previous.sub_tokens, agg.previous.subagent_runs),
+            (400, 1)
         );
     }
 }

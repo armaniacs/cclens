@@ -36,11 +36,23 @@ Scenario: guard が保たれる
 ```
 
 ## 受け入れ基準
-- [ ] `cli.rs` の `match harness` dispatch が消える
-- [ ] 入力ルート解決子（`default_projects_dir` / `opencode_home` 相当）が
+- [x] `cli.rs` の `match harness` dispatch が消える
+  （`run_analyze` は guard + `harness.analyze(projects, db)` の1行に。
+  `cli.rs` 残存の `match harness` は 441行の `launch_command` のみ＝PBI06 対象）
+- [x] 入力ルート解決子（`default_projects_dir` / `opencode_home` 相当）が
   各 adapter 側に移る
-- [ ] analyzer のバージョン鍵が adapter と一緒に移動する
-- [ ] 既存フィクスチャでの analyze 結果が同一（件数比較テスト）
+  （`default_projects_dir`→adapter/claude、`opencode_home`/`default_opencode_db`→
+  adapter/opencode、`kilo_home`/`default_kilocode_tasks`→adapter/kilocode。
+  cli.rs に該当なしを grep で確認。環境ヘルパ `home_dir`/`claude_home` も adapter 側へ）
+- [x] analyzer のバージョン鍵が adapter と一緒に移動する
+  （claude の `CLAUDE_ANALYZER_META_KEY`/`CLAUDE_ANALYZER_VERSION` を
+  adapter/transcript へ移設。store の `is_analyzer_current`/`record_analyzer_version`
+  は (key, version) 受けになり store からハーネス知識が消えた。
+  opencode/kilocode も同じ seam を通る）
+- [x] 既存フィクスチャでの analyze 結果が同一（件数比較テスト）
+  （RED→GREEN: `claude_analyze_keeps_the_recorded_counts_on_a_fixture` が
+  リファクタ前バイナリ記録値 (1,0,1,1,0) を固定。
+  E2E: 旧821bf1e vs 現行で29シナリオ・269行がバイト同一）
 
 ## テスト戦略
 - E2E: 実バイナリで3ハーネスの analyze 件数が従来同一（手動＋記録）
@@ -71,6 +83,13 @@ grep -n "fn opencode_home\|fn kilo_home\|fn default_projects_dir\|fn default_ope
 - フィンガープリント鍵の命名規則（`{harness}:{id}`）を崩さないこと
 
 ## Definition of Done
-- [ ] 全BDDシナリオが自動テストとして実装されパスする
-- [ ] コードレビュー完了
-- [ ] ドキュメント更新済み（`docs/specs/harness.md` の責務分界）
+- [x] 全BDDシナリオが自動テストとして実装されパスする
+  （既定 analyze の件数同一＝自動テストで固定。4つ目ハーネスのシナリオは
+  `Harness::analyze` の match が adapter の中にのみ存在すること＝構造で保証
+  （grep: cli.rs に analyze dispatch なし）。guard は E2E の guard エラーパスと
+  既存の Session ガードテストで確認）
+- [x] コードレビュー完了（2026-10-30: 検証エビデンス — cargo test 391 passed / clippy -D warnings / 旧821bf1e とのE2E269行バイト同一 — をもって利用者確認済み）
+- [x] ドキュメント更新済み（`docs/specs/harness.md` の責務分界）
+  （「The analyze seam — `Harness::analyze`」節を新設し、dispatch/ルート/
+  バージョン鍵の所在を明記。Forward compatibility 節を新契約に更新。
+  architecture.md にも seam の一節、storage.md に鍵の所在を追記）

@@ -169,7 +169,7 @@ impl ErrorCategory {
 /// cover what carries no such marker.
 ///
 /// Editing these patterns changes what an unchanged transcript yields, so it
-/// requires bumping `ANALYZER_VERSION` (`store.rs`) — otherwise already-ingested
+/// requires bumping `CLAUDE_ANALYZER_VERSION` (`adapter::transcript`) — otherwise already-ingested
 /// sessions keep their old categories forever (`docs/specs/storage.md`).
 pub fn classify_error(text: &str) -> ErrorCategory {
     let lower = text.to_lowercase();

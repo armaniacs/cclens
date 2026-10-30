@@ -36,6 +36,11 @@ This project is **spec-driven and test-driven**.
   implementing, following the pbi-create-bdd skill (vertical slice, BDD
   scenarios, t-wada test strategy, implementer notes). This takes precedence
   over the brainstorming skill's design-doc flow when the user says so.
+- **Subagent-driven implementation.** When implementing (executing a plan or
+  PBI tasks), always choose the subagent-driven-development skill over inline
+  or separate-session execution: a fresh implementer subagent per task, a task
+  review (spec compliance + code quality) after each, and a broad whole-branch
+  review at the end.
 
 ## Architecture
 

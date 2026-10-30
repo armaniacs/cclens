@@ -11,18 +11,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::adapter::harness::{
+    AnalyzeStats, Harness, Site, SiteCtx, catalog_surfaces, home_dir, load_claude_md,
+    load_skills_deduped,
+};
 use crate::adapter::transcript::{ToolError, WorkEvent};
 use crate::core::friction::classify_error;
 use crate::core::path::basename;
-use crate::core::span::{Record, RecordKind, Source};
+use crate::core::span::{
+    DEFAULT_IDLE_GAP_MS, Record, RecordKind, Source, extract_spans, session_start,
+};
 use crate::core::surface::{LoadMode, Scope, Surface};
+use crate::core::usage::extract_usage_events;
+use crate::store::{IngestBatch, OpenMode, SessionMeta, Store};
 
 /// The model label when a message names none — honest, never a guess.
 const UNKNOWN_MODEL: &str = "unknown";
 
 /// The analysis semantics the opencode rows were built with. **Bump it
 /// whenever opencode extraction changes what an unchanged database yields.**
-/// It lives apart from the shared `ANALYZER_VERSION` (`store.rs`) on
+/// It lives apart from the shared `CLAUDE_ANALYZER_VERSION` (`adapter::transcript`) on
 /// purpose: an opencode-only change must never force every Claude Code user
 /// through a full re-analyze. Stored under its own `meta` key.
 pub const OPENCODE_ANALYZER_VERSION: &str = "3";
@@ -445,42 +453,71 @@ fn read_markdown_surfaces(
         .collect()
 }
 
-/// Read the global opencode config into surfaces: `command/` and `agent/`
-/// under the config dir, plus the three global skills sites the docs name
-/// (opencode-native first, then the compatible homes opencode also loads).
-/// (No global `AGENTS.md` — whether opencode loads one is unverified; see
-/// `docs/specs/config-format-opencode.md`.) `seen` carries the canonical
-/// definition paths already catalogued, so the project pass skips the same
-/// files reached through a project symlink.
+/// The opencode global config sites, as data (`adapter::harness::Site`):
+/// opencode-native first, then the compatible homes opencode also loads. No
+/// global `AGENTS.md` — whether opencode loads one is unverified
+/// (`docs/specs/config-format-opencode.md`).
+pub(crate) fn global_sites(config_dir: &Path, home: Option<&Path>) -> Vec<Site> {
+    let mut sites = vec![
+        Site::new(config_dir.join("command"), load_commands),
+        Site::new(config_dir.join("agent"), load_agents),
+        Site::new(config_dir.join("skills"), load_skills_deduped),
+    ];
+    if let Some(home) = home {
+        sites.push(Site::new(
+            home.join(".claude").join("skills"),
+            load_skills_deduped,
+        ));
+        sites.push(Site::new(
+            home.join(".agents").join("skills"),
+            load_skills_deduped,
+        ));
+    }
+    sites
+}
+
+/// Loaders for opencode's own `command/` and `agent/` readers — the format is
+/// opencode's, so the row names these, not the shared config readers.
+fn load_commands(site: &Site, scope: &Scope, _ctx: &mut SiteCtx) -> Vec<Surface> {
+    read_command_surfaces(&site.path, scope)
+}
+
+fn load_agents(site: &Site, scope: &Scope, _ctx: &mut SiteCtx) -> Vec<Surface> {
+    read_agent_surfaces(&site.path, scope)
+}
+
+/// Read all installed config (global scope) into one surface list — the
+/// direct entry point the catalog tests drive; `analyze` goes through
+/// `adapter::harness::catalog_surfaces`, which loads the same rows under the
+/// scope it builds. `seen` dedups skill definitions across sites.
 pub fn read_global_surfaces(
     config_dir: &Path,
     home: Option<&Path>,
     seen: &mut HashSet<PathBuf>,
 ) -> Vec<Surface> {
-    let scope = Scope::Global;
-    let mut surfaces = read_command_surfaces(&config_dir.join("command"), &scope);
-    surfaces.extend(read_agent_surfaces(&config_dir.join("agent"), &scope));
-    crate::adapter::config::add_skill_site(&config_dir.join("skills"), &scope, seen, &mut surfaces);
-    if let Some(home) = home {
-        crate::adapter::config::add_skill_site(
-            &home.join(".claude").join("skills"),
-            &scope,
-            seen,
-            &mut surfaces,
-        );
-        crate::adapter::config::add_skill_site(
-            &home.join(".agents").join("skills"),
-            &scope,
-            seen,
-            &mut surfaces,
-        );
-    }
-    surfaces
+    crate::adapter::harness::load_sites(&global_sites(config_dir, home), &Scope::Global, home, seen)
 }
 
-/// Read one project's opencode config into surfaces: `.opencode/command/`,
-/// `.opencode/agent/`, the three skills sites under the root, and `AGENTS.md`
-/// with its `@import`s. `home` resolves a `~/` import; `seen` skips skill
+/// The opencode per-project config sites, as data: the `.opencode` pair, the
+/// three skills sites under the root, and the repo `AGENTS.md`.
+pub(crate) fn project_sites(root: &Path) -> Vec<Site> {
+    let opencode = root.join(".opencode");
+    vec![
+        Site::new(opencode.join("command"), load_commands),
+        Site::new(opencode.join("agent"), load_agents),
+        Site::new(opencode.join("skills"), load_skills_deduped),
+        Site::new(root.join(".claude").join("skills"), load_skills_deduped),
+        Site::new(root.join(".agents").join("skills"), load_skills_deduped),
+        Site::with_payload(
+            root.to_path_buf(),
+            load_claude_md,
+            &[("AGENTS.md", "AGENTS.md")],
+        ),
+    ]
+}
+
+/// Read one project's opencode config into surfaces — the direct entry point
+/// the catalog tests drive (see `read_global_surfaces`). `seen` skips skill
 /// definitions already catalogued from the global sites.
 pub fn read_project_surfaces(
     root: &Path,
@@ -488,30 +525,12 @@ pub fn read_project_surfaces(
     home: Option<&Path>,
     seen: &mut HashSet<PathBuf>,
 ) -> Vec<Surface> {
-    let scope = Scope::Project(project.to_string());
-    let opencode = root.join(".opencode");
-    let mut surfaces = read_command_surfaces(&opencode.join("command"), &scope);
-    surfaces.extend(read_agent_surfaces(&opencode.join("agent"), &scope));
-    crate::adapter::config::add_skill_site(&opencode.join("skills"), &scope, seen, &mut surfaces);
-    crate::adapter::config::add_skill_site(
-        &root.join(".claude").join("skills"),
-        &scope,
-        seen,
-        &mut surfaces,
-    );
-    crate::adapter::config::add_skill_site(
-        &root.join(".agents").join("skills"),
-        &scope,
-        seen,
-        &mut surfaces,
-    );
-    let agents_md = root.join("AGENTS.md");
-    surfaces.extend(crate::adapter::config::read_claude_md_surfaces(
-        &[(&agents_md, "AGENTS.md")],
-        &scope,
+    crate::adapter::harness::load_sites(
+        &project_sites(root),
+        &Scope::Project(project.to_string()),
         home,
-    ));
-    surfaces
+        seen,
+    )
 }
 
 /// Add one skills site's `skills/*/SKILL.md` surfaces, deduped by canonical
@@ -627,6 +646,177 @@ fn truncate(s: &str) -> String {
         .collect()
 }
 
+/// The opencode database for this run: the environment read that
+/// `adapter::harness::opencode_db_path` deliberately does not do.
+fn default_opencode_db() -> Result<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    Harness::opencode_db_path(data_home.as_deref(), home_dir().map(Path::new))
+        .context("set XDG_DATA_HOME or HOME")
+}
+
+/// The opencode config root for this run: the environment read that
+/// `adapter::harness::opencode_config_dir` deliberately does not do.
+pub(crate) fn opencode_home() -> Result<PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    Harness::opencode_config_dir(config_home.as_deref(), home_dir().map(Path::new))
+        .context("set XDG_CONFIG_HOME or HOME")
+}
+
+/// Analyze an opencode database into the opencode store. The row-to-record
+/// mapping is `adapter::opencode`; this shell reads the database read-only,
+/// groups rows by session, and ingests each session idempotently. See
+/// `docs/specs/harness.md` for the v1 capability boundaries (no subagent
+/// runs, no prompts, no permission denials, empty surface catalog).
+pub fn analyze(input: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
+    let input = match input {
+        Some(path) => path,
+        None => default_opencode_db()?,
+    };
+    if !input.is_file() {
+        anyhow::bail!(
+            "no opencode database at {} — is opencode installed (or pass its path via --projects)?",
+            input.display()
+        );
+    }
+    let mut store = Store::open(db, OpenMode::ReadWrite).context("open store")?;
+    // The opencode version key lives apart from the shared analyzer version:
+    // an opencode-only extraction change must never force Claude Code users
+    // through a full re-analyze (`adapter::opencode::OPENCODE_ANALYZER_VERSION`).
+    let reuse_ingested =
+        store.is_analyzer_current(OPENCODE_ANALYZER_META_KEY, OPENCODE_ANALYZER_VERSION)?;
+
+    let snapshot = read_database(&input)?;
+    let mut messages_by_session: std::collections::HashMap<&str, Vec<&SnapshotMessage>> =
+        std::collections::HashMap::new();
+    for message in &snapshot.messages {
+        messages_by_session
+            .entry(message.session_id.as_str())
+            .or_default()
+            .push(message);
+    }
+    let mut parts_by_message: std::collections::HashMap<&str, Vec<&SnapshotPart>> =
+        std::collections::HashMap::new();
+    for part in &snapshot.parts {
+        parts_by_message
+            .entry(part.message_id.as_str())
+            .or_default()
+            .push(part);
+    }
+
+    let mut sessions = 0;
+    let mut skipped = 0;
+    let mut spans_total = 0;
+    for session in &snapshot.sessions {
+        let session_messages = messages_by_session
+            .get(session.id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        // Per-session fingerprint: the whole-file stat would re-ingest every
+        // session on each run (opencode appends constantly).
+        let fingerprint_key = format!("opencode:{}", session.id);
+        let message_count = session_messages.len() as i64;
+        if reuse_ingested
+            && store.is_ingested(&fingerprint_key, session.time_updated_ms, message_count)?
+        {
+            skipped += 1;
+            continue;
+        }
+        let message_rows: Vec<MessageRow> = session_messages
+            .iter()
+            .map(|m| MessageRow {
+                id: m.id.as_str(),
+                session_id: m.session_id.as_str(),
+                time_created_ms: m.time_created_ms,
+                parent_id: m.data.get("parentID").and_then(|v| v.as_str()),
+                data: &m.data,
+            })
+            .collect();
+        let mut part_rows: Vec<PartRow> = session_messages
+            .iter()
+            .flat_map(|m| {
+                parts_by_message
+                    .get(m.id.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .map(|p| PartRow {
+                id: p.id.as_str(),
+                message_id: p.message_id.as_str(),
+                session_id: p.session_id.as_str(),
+                time_created_ms: p.time_created_ms,
+                data: &p.data,
+            })
+            .collect();
+        part_rows.sort_by_key(|p| (p.time_created_ms, p.id));
+        let records = parse_session(&message_rows, &part_rows);
+        let spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
+        let usage = extract_usage_events(&records);
+        let meta = SessionMeta {
+            id: session.id.clone(),
+            project: session.directory.clone(),
+            slug: session.slug.clone(),
+            root: session.directory.clone(),
+            source_path: fingerprint_key.clone(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            start: session_start(&records),
+        };
+        // `raw_errors` owns the strings; `error_rows` borrows them.
+        let raw_errors = extract_tool_errors(&part_rows);
+        let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
+            .iter()
+            .map(|e| {
+                (
+                    e.epoch_ms,
+                    e.category.label(),
+                    e.excerpt.as_str(),
+                    e.tool.as_str(),
+                    e.target.as_str(),
+                )
+            })
+            .collect();
+        // `work` owns the strings; the rows borrow them.
+        let work = extract_work_events(&part_rows);
+        let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
+            .iter()
+            .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
+            .collect();
+        store.ingest(
+            IngestBatch::new(&meta, &spans, &usage)
+                .tool_errors(&error_rows)
+                .work_events(&work_rows),
+        )?;
+        store.record_ingested_file(&fingerprint_key, session.time_updated_ms, message_count)?;
+        sessions += 1;
+        spans_total += spans.len();
+    }
+
+    // Catalog the installed config — global scope plus every known project
+    // root that still exists on disk — so usage joins against what is
+    // installed. Skills join from the six documented sites (deduped by
+    // canonical path, since sites may be symlinks to one shared directory);
+    // MCP and permissions stay out of v1 (see
+    // `docs/specs/config-format-opencode.md`), so their live usage still
+    // shows as orphaned rows in `inventory`.
+    let config_dir = opencode_home()?;
+    let surfaces = catalog_surfaces(Harness::Opencode, &store.session_roots()?)?;
+    let surface_count = surfaces.len();
+    store.replace_surfaces(&surfaces)?;
+
+    store.record_analyzer_version(OPENCODE_ANALYZER_META_KEY, OPENCODE_ANALYZER_VERSION)?;
+    store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
+    store.set_meta("projects_dir", &input.display().to_string())?;
+    store.set_meta("config_dir", &config_dir.display().to_string())?;
+    store.set_meta("harness", Harness::Opencode.label())?;
+
+    Ok(AnalyzeStats {
+        sessions,
+        skipped,
+        spans_total,
+        surface_count,
+        denials: 0,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

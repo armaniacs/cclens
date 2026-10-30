@@ -108,7 +108,9 @@ CREATE TABLE meta (
 
 -- A clean read view over tool_error events for ad-hoc SQL (the `sql` command).
 -- The friction signal is overloaded onto generic event columns; the view names
--- it and joins the project so a query need not know the encoding.
+-- it and joins the project so a query need not know the encoding. The view
+-- statement is generated from `EVENT_ENCODING` (`store.rs`) — the table below
+-- is the definition, the view is a projection of it.
 CREATE VIEW tool_errors AS
 SELECT e.session_id, s.project,
        e.surface_id AS category, e.source AS excerpt, e.model AS tool,
@@ -116,6 +118,27 @@ SELECT e.session_id, s.project,
 FROM events e JOIN sessions s ON e.session_id = s.id
 WHERE e.kind = 'tool_error';
 ```
+
+### Column encoding is defined once
+
+The generic columns carry kind-specific meanings — `tool_error`'s friction
+category rides in `surface_id`, its excerpt in `source`, the originating tool
+in `model`; `file_edit` keeps the basename in `surface_id` and the full path in
+`target`; a prompt's behavioral class rides in `source`. That mapping is
+defined **once**, in `EVENT_ENCODING` (`store.rs`), and everything else derives
+from it: the `tool_errors` view is generated from the table, the readers take
+their column names from it (`encoding_column`), and the writer's `INSERT`
+columns for `tool_error` and `prompt` are spelled from it too. The work-event
+writer is the one place that fills physical columns without consulting the
+table — one statement spans several kinds, so the meaning a row's value carries
+depends on its `kind`, which is read back through the table.
+
+A new event kind is therefore a row in the table, not an edit scattered across
+view SQL and queries: existing queries keep passing untouched, and the
+round-trip tests (`tool_errors_view_exposes_named_columns_and_project`,
+`file_edits_carry_their_project_session_and_full_path`, …) pin the writers
+against the same table so writer and reader cannot disagree about which column
+holds what.
 
 The `REFERENCES` annotations above record which column joins which table; they
 are **not declared constraints**. SQLite does not enforce foreign keys unless
@@ -128,7 +151,8 @@ The store is also a **read surface for arbitrary queries** (`cli.md`: `sql`).
 Because it is plain SQLite holding already-extracted facts, the session-analysis
 slices a consumer might want — the `optimize` agent chasing a root cause, say —
 are a `SELECT` away, which is cheaper and less error-prone than re-parsing the
-raw transcripts. `sql` opens the db **read-only** (`Store::open_readonly`) so an
+raw transcripts. `sql` opens the db **read-only**
+(`Store::open(path, OpenMode::ReadOnly)`) so an
 ad-hoc query cannot mutate the derived store; views like `tool_errors` keep those
 queries clean despite the column overloading.
 
@@ -281,14 +305,32 @@ or given a new meaning). Reconciliation now *fails* on such drift rather than
 ignoring it, so the seam cannot be skipped by accident; the migration written to
 fill it must state what it discards, because the answer is no longer "nothing".
 
-`Store::open_readonly` (the `sql` command) cannot migrate. An ad-hoc query
-against a store older than this build surfaces SQLite's own missing-column
-error; any read command opens read-write and migrates first.
+`Store::open(path, OpenMode::ReadOnly)` (the `sql` command) cannot migrate —
+the mode argument is the typed statement of which guarantee applies: `ReadWrite`
+creates the file, narrows it to owner-only, and migrates in place; `ReadOnly`
+does none of the three. An ad-hoc query against a store older than this build
+surfaces SQLite's own missing-column error; any read command opens `ReadWrite`
+and migrates first.
 
 ## Incremental ingest
 
 Transcripts are append-only and **active sessions keep growing**, so re-running
 `analyze` must be cheap and idempotent.
+
+### One transcript, one batch
+
+`Store::ingest(IngestBatch)` is the only way rows enter the store. A caller
+submits everything one transcript yielded — session meta, spans, usage events,
+prompts, subagent runs, tool errors, work events — and the store applies it in
+**one transaction, in its own order**: the session row (insert-or-replace), the
+delete of everything this file previously put in `events`, then each child set,
+then the spawn-cost settle that reads the spawn events it just wrote. The order
+the old five-function API demanded of its callers — `ingest_session` first, or
+its delete silently dropped the children — is no longer a convention to
+remember: no entry point expresses it. Re-ingest of the same file is the same
+batch twice, which the replace contract below makes idempotent, and a batch's
+atomicity means a failure mid-ingest leaves the previous rows intact rather
+than a half-replaced file.
 
 - Before ingesting a file, compare `(mtime, size)` against `ingested_files`.
   Unchanged → skip. Changed or new → re-ingest.
@@ -326,7 +368,11 @@ ignores the fingerprint skip, re-ingests every transcript once (replace, per
 above, so this is safe to repeat), and stamps the new value. Bump it whenever
 extraction or classification changes what an *unchanged* transcript yields. It is
 deliberately not the crate version — a release that changes no analysis should not
-cost every user a full re-analyze.
+cost every user a full re-analyze. The Claude Code pair lives with its mapping in
+`adapter::transcript` (`CLAUDE_ANALYZER_META_KEY` / `CLAUDE_ANALYZER_VERSION`);
+each other harness carries its own beside its own mapping (`harness.md`), and
+`Store::is_analyzer_current(key, version)` compares whatever it is handed — the
+store owns no harness's key.
 
 Invalidation only recovers what the transcript actually holds. Where a signal was
 never recorded at all, the contract remains that a reader **reports the gap or

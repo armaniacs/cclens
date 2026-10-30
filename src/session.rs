@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 
 use crate::adapter::config_file;
 use crate::adapter::harness::Harness;
-use crate::store::Store;
+use crate::store::{OpenMode, Store};
 
 /// The environment `Session` resolution reads. The caller supplies both
 /// roots; tests pass temp dirs, production passes the live environment.
@@ -77,15 +77,9 @@ pub fn config_file_path(config_home: Option<&Path>, home: Option<&str>) -> Optio
 }
 
 /// Counters from one analyze run, for the command's summary line and the
-/// freshness header on auto-refreshing reads.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AnalyzeStats {
-    pub sessions: usize,
-    pub skipped: usize,
-    pub spans_total: usize,
-    pub surface_count: usize,
-    pub denials: usize,
-}
+/// freshness header on auto-refreshing reads. Owned by the analyze seam
+/// (`adapter::harness`), re-exported here for the shell's imports.
+pub use crate::adapter::harness::AnalyzeStats;
 
 /// One invocation's resolved world: which harness, which store file, and the
 /// opened, harness-guarded store. Every command builds exactly this and
@@ -118,7 +112,15 @@ impl Session {
         env: &SessionEnv,
     ) -> Result<Self> {
         let path = Self::resolve_path(harness, db, config_db, env)?;
-        let store = Store::open(&path).context("open store")?;
+        Self::open_resolved(harness, path)
+    }
+
+    /// Open and guard an already-resolved path. Split from [`Session::open`]
+    /// so a caller can resolve the path, parse its own flags, and only then
+    /// open — the exact evaluation order `run()`'s optimize arm had before the
+    /// Session seam (`docs/specs/cli.md`).
+    pub(crate) fn open_resolved(harness: &Harness, path: PathBuf) -> Result<Self> {
+        let store = Store::open(&path, OpenMode::ReadWrite).context("open store")?;
         guard_harness(&store, harness, &path)?;
         Ok(Session {
             harness: *harness,
@@ -163,7 +165,7 @@ impl Session {
         if pure_default {
             migrate_legacy_store(&path);
         }
-        let store = Store::open_readonly(&path)
+        let store = Store::open(&path, OpenMode::ReadOnly)
             .with_context(|| format!("open store {} (run `analyze` first?)", path.display()))?;
         guard_harness(&store, harness, &path)?;
         Ok(Session {
@@ -180,7 +182,7 @@ impl Session {
         analyze: impl FnOnce(&Harness, Option<PathBuf>, &Path) -> Result<AnalyzeStats>,
     ) -> Result<()> {
         let projects = match self.db_path.exists() {
-            true => Store::open(&self.db_path)
+            true => Store::open(&self.db_path, OpenMode::ReadWrite)
                 .context("open store")?
                 .meta("projects_dir")?
                 .map(PathBuf::from),
@@ -196,11 +198,11 @@ impl Session {
                 stats.skipped
             ))
         );
-        self.store = Store::open(&self.db_path).context("open store")?;
+        self.store = Store::open(&self.db_path, OpenMode::ReadWrite).context("open store")?;
         Ok(())
     }
 
-    fn resolve_path(
+    pub(crate) fn resolve_path(
         harness: &Harness,
         db: Option<PathBuf>,
         config_db: Option<&Path>,
@@ -573,7 +575,7 @@ mod tests {
 
     fn store_with_harness(dir: &Path, file: &str, label: Option<&str>) -> PathBuf {
         let path = dir.join(file);
-        let mut store = Store::open(&path).unwrap();
+        let mut store = Store::open(&path, OpenMode::ReadWrite).unwrap();
         if let Some(label) = label {
             store.set_meta("harness", label).unwrap();
         }
@@ -688,7 +690,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = store_with_harness(&dir, "s.db", Some(Harness::Claude.label()));
         {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = Store::open(&path, OpenMode::ReadWrite).unwrap();
             store
                 .set_meta("projects_dir", "/tmp/example/projects")
                 .unwrap();

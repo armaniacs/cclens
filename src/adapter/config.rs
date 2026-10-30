@@ -6,6 +6,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
+
+use crate::adapter::harness::home_dir;
 use crate::core::surface::{LoadMode, Scope, Surface};
 
 /// The Claude Code config root: `$CLAUDE_CONFIG_DIR` when it names a non-empty
@@ -443,21 +446,17 @@ pub fn read_claude_md_surfaces(
 /// A root with none of these yields nothing.
 pub fn read_project_surfaces(root: &Path, project: &str, home: Option<&Path>) -> Vec<Surface> {
     let scope = Scope::Project(project.to_string());
-    let claude = root.join(".claude");
-    let mut surfaces = read_skill_surfaces(&claude.join("skills"), &scope);
-    surfaces.extend(read_rule_surfaces(&claude.join("rules"), &scope));
-    surfaces.extend(read_agent_surfaces(&claude.join("agents"), &scope));
-    surfaces.extend(read_mcp_server_surfaces(&root.join(".mcp.json"), &scope));
-    // A repo that serves both agent conventions usually ships `AGENTS.md` as a
-    // symlink to `CLAUDE.md`; listing `CLAUDE.md` first makes it the one that
-    // is reported when the pair resolves to one file.
-    let (claude_md, agents_md) = (root.join("CLAUDE.md"), root.join("AGENTS.md"));
-    surfaces.extend(read_claude_md_surfaces(
-        &[(&claude_md, "CLAUDE.md"), (&agents_md, "AGENTS.md")],
+    // The site rows live with the harness (`adapter::claude::project_sites`);
+    // Claude Code's traversal carries no cross-site dedup, so the set here is
+    // throwaway. Row order keeps CLAUDE.md before AGENTS.md: a repo shipping
+    // `AGENTS.md` as a symlink to `CLAUDE.md` reports the first that loads.
+    let mut seen = HashSet::new();
+    crate::adapter::harness::load_sites(
+        &crate::adapter::claude::project_sites(root),
         &scope,
         home,
-    ));
-    surfaces
+        &mut seen,
+    )
 }
 
 /// Read MCP server declarations from an `mcp.json` (top-level `mcpServers`
@@ -526,6 +525,22 @@ fn read_markdown_files(dir: &Path) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// The Claude Code config root for this run: the environment read that
+/// `adapter::config::claude_config_dir` deliberately does not do, plus the
+/// advice to show when neither variable names one.
+pub(crate) fn claude_home() -> Result<PathBuf> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    // What can go wrong differs by platform, so the advice does too: only
+    // Windows requires the value to name a real directory, and telling a unix
+    // user otherwise sends them looking for a problem they do not have.
+    claude_config_dir(config_dir.as_deref(), home_dir().map(Path::new)).with_context(|| {
+        if cfg!(windows) {
+            "set CLAUDE_CONFIG_DIR, or HOME/USERPROFILE to an existing directory"
+        } else {
+            "set CLAUDE_CONFIG_DIR or HOME"
+        }
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

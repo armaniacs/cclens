@@ -22,6 +22,19 @@ const SYNTHETIC_MODEL: &str = "<synthetic>";
 /// are threaded across lines: the current turn's prompt id, stamped onto agent
 /// spawns whose own record does not carry it (the join key to the subagent
 /// transcript), and the output each API response has already reported, so a
+/// The `meta` key holding the analysis semantics a Claude Code store's rows
+/// were built with.
+pub const CLAUDE_ANALYZER_META_KEY: &str = "analyzer_version";
+
+/// The analysis semantics this build produces for Claude Code transcripts.
+/// **Bump it whenever extraction or classification changes what an unchanged
+/// transcript yields** — that is the only way rows behind the
+/// incremental-ingest skip get rebuilt. It is not the crate version: a release
+/// that changes no analysis should not force everyone through a full
+/// re-analyze. opencode and kilocode carry their own keys beside their own
+/// mappings (`adapter::opencode`, `adapter::kilocode`).
+pub const CLAUDE_ANALYZER_VERSION: &str = "6";
+
 /// response written as several lines is charged once (`assistant_records`).
 pub fn parse_session(jsonl: &str) -> Vec<Record> {
     let mut current_prompt_id: Option<String> = None;
@@ -392,7 +405,7 @@ fn wraps_tool_use_error(content: &Value) -> bool {
 /// `None` for a kind we do not know, so the error text still gets its say;
 /// upstream adds kinds over time and an unrecognised one must not erase what the
 /// text already reveals. Teaching this map a new kind requires bumping
-/// `ANALYZER_VERSION` (`store.rs`), or already-ingested sessions keep their old
+/// `CLAUDE_ANALYZER_VERSION` (this module), or already-ingested sessions keep their old
 /// categories forever (`docs/specs/storage.md`).
 fn denial_category(kind: &str) -> Option<ErrorCategory> {
     match kind {

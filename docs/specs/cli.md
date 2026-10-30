@@ -54,7 +54,7 @@ it — `--db ./saniwalens.db`.
 
 The tool's own config file lives at
 `${XDG_CONFIG_HOME:-~/.config}/saniwalens/config.toml` (`config_file_path` in
-`cli.rs`; a relative `XDG_CONFIG_HOME` is invalid and ignored, like its
+`session.rs`; a relative `XDG_CONFIG_HOME` is invalid and ignored, like its
 `XDG_STATE_HOME` sibling above). The file is optional — without it every
 invocation behaves exactly as before.
 
@@ -69,7 +69,10 @@ db = "work.db"                 # relative to the config file's directory
 It holds two kinds of defaults plus named profiles `--profile` selects.
 Resolution order, strongest first: explicit flags, the selected profile, the
 file's top-level defaults, then the builtins (`claude`, the per-harness store
-path). A relative `db` joins the directory holding `config.toml` — never the
+path). Flag *values* (`--scope`, `--format`) are parsed before the session is
+built, so an invalid flag fails on its own — no store open, no freshness line
+ahead of the error; `optimize` is the exception that resolves the store path
+first, exactly as the pre-`Session` dispatch did. A relative `db` joins the directory holding `config.toml` — never the
 current working directory — while an explicit `--db` is taken as is, even
 when relative; `~` is not expanded. Unknown keys are ignored so a newer file
 never breaks an older binary. A missing file is silence, not an error; anything
@@ -128,6 +131,7 @@ ranking.
 | `doctor` | The entry point: a one-screen health check **written for someone who has never seen saniwalens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units, naming the agent types behind the subagent figure — and, when the named rows cover only part of that figure, saying so first; see *Reporting honesty*), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
 | `inventory` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): startup cost, static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
 | `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table, then splits the subagent half **per agent type** (runs and output tokens, costliest first) — the aggregate is usually the larger number and the split is the part that can be acted on. JSON carries the split's coverage as `agent_split` in every state. In text, a partial split prints its covered and uncovered figures between the total and the table, an unavailable split (no rows at all) is warned on stderr, and rows that cover the total need no note (see *Reporting honesty*). A section with no rows is omitted rather than rendered as bare headers. |
+| `trend` | How usage moved: each kind of event (count / output tokens / duration), each skill (invocations, largest movement first), and the session / subagent totals — this window against the equal-length window right before it (default 7d vs the 7d before; `--last` or `--since` [+ `--until`] fixes the current one, the pair resolved by the Period section's rules). Every row carries both windows' values, the delta, and the direction; the previous window's emptiness makes a comparison `n/a` / `"unavailable"` with no delta claimed, never a drop to zero (see *Reporting honesty*). Both windows' ranges are disclosed like every view's window is, and `--format json` carries them as `window.current` / `window.previous`. A section with no rows (e.g. no skill usage in either window) is omitted rather than rendered as bare headers. |
 | `waste` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
 | `overhead` | Reconcile the empirical always-on floor (the leanest observed **session start**, not the context a skill happened to run at — `surfaces.md`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh. The per-project table carries the session count behind each floor, because the floor is a minimum over observations and a project with few sessions may never have caught a fresh one. Reports the metric as unavailable when no session start was observed at all. |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
@@ -162,6 +166,43 @@ Slices not covered here — the Bash command mix, the most-edited files, an erro
 category broken down any way — are a `sql` one-liner; those once had thin
 `commands`/`hotspots` views, dropped once `sql` existed.
 
+### Period — narrow a report to a window of the history
+
+The nine report views above take `--since` / `--until` / `--last` so "what did
+the agent cost last week" is a view flag, not a `sql` query. The other commands
+(`analyze`, `sql`, `optimize`) take none — they are whole-history by contract.
+
+`trend` resolves the same flags as a **pair** — the current window plus the
+equal-length window immediately before it (the previous ends one second before
+the current starts, so no event is counted in both). `--since` alone runs the
+current window to now — a bounded window, unlike the single-window views' open
+end — and `--until` alone is an error: with no current start, the window to
+compare against is undefined.
+
+- `--since DATE` / `--until DATE`: a named-day window over the history, each
+  date a whole day (`YYYY-MM-DD`, read in the presentation zone — **JST**, the
+  same zone the bucketing table uses; the comparison is against the UTC epoch
+  the store keeps). `--until` is **inclusive**: the whole named day counts.
+- `--last SPAN`: a rolling window ending now — `<N>d`, `<N>h`, `<N>w`.
+  Exclusive with the explicit dates (clap conflict), so "last 7 days" can never
+  be silently reinterpreted by a stray `--since`.
+- Errors are parse-time, before any report renders: an unparseable date fails
+  on stderr with a non-zero exit and an empty stdout; `--since` after `--until`
+  is an empty-window error rather than an empty-looking report.
+- The window is **disclosed, never silent**: a dimmed `report window:` line
+  rides with the freshness line on stderr (every format), the framing block
+  carries it as its last line (table only — markdown stays a bare table),
+  `doctor` prints it in-band under its heading, and `--format json` gains a
+  `window` object (`since` / `until` as RFC 3339 with their offset). Without
+  the flags every output is byte-identical to the pre-period behavior.
+- The catalog half of `inventory` is current config, so it is not windowed by
+  time — its **usage half** is. An unused row under a window says
+  `UNUSED (window)` / `"unused-in-window"`, never plain "unused".
+- Sessions the writer could not stamp (no observable start, empty
+  `started_at`) are **excluded** from a windowed `session_stats` /
+  `subagent_totals` figure (`store.rs`'s `<> ''` guard) rather than guessed
+  into it; without the flags they still count.
+
 ## Time bucketing
 
 `--by` groups by `year | month | week | day | hour`. Because the store keeps UTC
@@ -194,7 +235,9 @@ caveats in `events.md` / `surfaces.md`):
   printing it alone under a "what to trim" heading reads as a startup saving the
   deletion never delivers.
 - "Unused" always carries the window it was evaluated over, so it is not mistaken
-  for "never installed".
+  for "never installed": without the period flags the window is all history, and
+  under `--since` / `--until` / `--last` the row itself says `UNUSED (window)`
+  (inventory; the other views' empty states read "in the evaluation window").
 - A subagent run whose agent type was never recorded is shown as `(unknown)`,
   never merged into a named type and never dropped — the per-agent rows must
   keep summing to the subagent total the same report prints above them, for
@@ -205,6 +248,10 @@ caveats in `events.md` / `surfaces.md`):
   so on stderr instead of letting an absent breakdown pass for a zero one
   (`storage.md`'s report-the-gap contract). It rides with the freshness line
   rather than in the table, so piped stdout and `--format json` stay clean.
+  Under a drawn window an empty split is usually the two time axes at work —
+  the total reads the session's stamped start, the rows read each run's own
+  epoch — so the message names the window instead of pointing at a refresh
+  that cannot fill a straddle; the refresh hint stays without the flags.
 - When they sum to only *part* of it — sessions analyzed before runs were
   extracted keep their totals (`storage.md`: the store outlives its inputs), but
   once Claude Code has pruned their transcripts no refresh can ever produce their
@@ -213,10 +260,13 @@ caveats in `events.md` / `surfaces.md`):
   refresh could cure: `usage` prints the covered and uncovered figures between
   the total and the table, `doctor` states the gap before naming any agent, the
   briefing does the same under its subagent line, and JSON carries the
-  reconciliation as `agent_split` (`core::subagent::SplitCoverage`). `doctor`
-  introduces its top rows as "most of" the subagent output only when they
-  exceed half of the total — a long tail, or a partial split, gets a wording
-  that claims no more than the rows show.
+  reconciliation as `agent_split` (`core::subagent::SplitCoverage`). Under a
+  drawn window the same gap is the straddle, so the in-band labels say the
+  uncovered tokens fall outside the report window instead of the
+  pruned-transcript reason; without the flags the wording is unchanged.
+  `doctor` introduces its top rows as "most of" the subagent output only when
+  they exceed half of the total — a long tail, or a partial split, gets a
+  wording that claims no more than the rows show.
 
 Meta-skills are not nested (`events.md`): a driver and the skills it ran are
 each their own span, so a child's cost lands on the child and no figure is
@@ -323,3 +373,20 @@ The split mirrors the rest of the tool: prompt composition is a pure transform
 (`core::optimize` — `render_briefing` for the Markdown report with empty sections
 omitted and long lists capped, `instructions` for the role, `launch_prompt` for
 the argv pointer), and only the temp-file write and process launch are I/O.
+The findings themselves split the same way: the shell fetches the store's rows
+(`findings_input` in `cli.rs`) and hands them to the pure assembly in
+`core::findings` — the joins, the named caps (`TOP_COMMANDS_LIMIT`,
+`EXAMPLES_PER_CATEGORY`, `THRASH_LINES_PER_PROJECT`, …), the scope routing, and
+the ordering — so the briefing's wiring is unit-tested over small inputs and
+only the queries and the print are I/O.
+
+The send is one seam: `deliver` runs a `DeliveryPlan` whose mode
+(`DeliveryMode::Print | Interactive | Headless`, chosen by `--print` over the
+harness's launch shape) picks the payload — `Print` writes the prompt to
+stdout, launch modes write the briefing to the private pointer file, hand the
+spawn to the `AdvisorLaunch` adapter, and remove the file the moment the run
+ends. Production wires `ProcessAdvisor` (inherited stdio, or `run_headless`'s
+logged pipe unless `--verbose`); the delivery tests wire a recording double
+and assert the argv instead of spawning. `Harness::copy` assembles the harness
+data those prompts render from, so the shell never spells `HarnessCopy` field
+by field.

@@ -7,6 +7,37 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に従い、
 バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
+## [Unreleased]
+
+### Added
+
+- レポートビュー 8 つ（usage / inventory / waste / overhead / prompts /
+  failures / stuck / doctor）に期間フィルタ（`--since` / `--until` /
+  `--last`）を追加。集計が期間に絞られ、引いたウィンドウは freshness 行・
+  framing block・JSON の `window` で明示される。フラグ無しの出力は従来と
+  バイト同一。`sql` / `analyze` / `optimize` は変更なし（PR #14）。
+
+### Changed
+
+- 起動時解決（設定→フラグ→既定値→ハーネス→ストアパス→旧ストア移行→
+  open＋guard）を `Session` モジュールに集約（PR #13）。全コマンドの配線が
+  1つの seam になり、不正フラグのエラー表示も従来どおりになった。
+- store の ingest を1トランザクションの `IngestBatch` + `Store::ingest` に
+  集約し、ストアの open 経路を `Store::open(path, OpenMode)` に統一。
+  列オーバーロードの意味の定義を `EVENT_ENCODING` の単一テーブルへ移した。
+- `analyze` のハーネス別 dispatch を `Harness::analyze` に集約。入力ルート
+  解決と analyzer バージョン鍵を各 adapter へ移し、`cli.rs` は
+  dispatch を持たなくなった（4つ目のハーネスは adapter 追加だけで通る）。
+- briefing 組立を純粋な `core::findings` へ移設し、上限値（例示数・
+  thrash 行数・heavy トークン閾値など）を名前付き定数にした。
+- 設定カタログ走査を `catalog_surfaces(harness, roots)` 単一 IF に集約し、
+  サイト定義を `Site` のデータ行にした（新 kind は行を足すだけ）。
+- `optimize` の配信を `deliver` seam（`DeliveryMode` / `AdvisorLaunch`）に
+  切出し、到達不能だった `Option` と `HarnessCopy` の手組みを削除。
+- 上記の構造変更は出力が従来と同一: 旧 `821bf1e` バイナリとのE2E出力
+  269行がバイト同一、`cargo test` 391件 green。PBI 01-06 は
+  `pbi/archived/` にアーカイブ。
+
 ## [0.5.1] - 2026-10-29
 
 ### Added
