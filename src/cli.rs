@@ -14,6 +14,7 @@ use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::findings;
 use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
+use crate::core::period::{self, TimeRange};
 use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::subagent::SplitCoverage;
 use crate::core::surface::{
@@ -77,6 +78,17 @@ enum Command {
         /// Bucket usage by time: year | month | week | day | hour (JST).
         #[arg(long)]
         by: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
@@ -94,6 +106,17 @@ enum Command {
         /// projects' own config) | project:<slug> (one project's).
         #[arg(long)]
         scope: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
@@ -112,6 +135,17 @@ enum Command {
         /// projects' own config) | project:<slug> (one project's).
         #[arg(long)]
         scope: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
@@ -128,6 +162,17 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
@@ -142,6 +187,17 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
@@ -157,6 +213,17 @@ enum Command {
         /// project:<slug> (everything in that one project).
         #[arg(long)]
         scope: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
@@ -173,6 +240,17 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
@@ -187,6 +265,17 @@ enum Command {
         /// projects' own config) | project:<slug> (one project's).
         #[arg(long)]
         scope: Option<String>,
+        /// Only count events on or after this date (YYYY-MM-DD, JST).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Only count events through this date (YYYY-MM-DD, JST) — the
+        /// whole day counts.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling window ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
         /// Output format: table (human text) | json (the routed findings).
         #[arg(long)]
         format: Option<String>,
@@ -271,11 +360,15 @@ pub fn run() -> Result<()> {
         }
         Command::Usage {
             by,
+            since,
+            until,
+            last,
             format,
             frozen,
             db,
         } => {
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -284,16 +377,20 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            usage(&sess, by.as_deref(), fmt)
+            usage(&sess, by.as_deref(), window, fmt)
         }
         Command::Inventory {
             scope,
+            since,
+            until,
+            last,
             format,
             frozen,
             db,
         } => {
             let filter = parse_scope(scope.as_deref())?;
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -302,16 +399,20 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            inventory(&sess, &filter, fmt)
+            inventory(&sess, &filter, window, fmt)
         }
         Command::Waste {
             scope,
+            since,
+            until,
+            last,
             format,
             frozen,
             db,
         } => {
             let filter = parse_scope(scope.as_deref())?;
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -320,10 +421,18 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            waste(&sess, &filter, fmt)
+            waste(&sess, &filter, window, fmt)
         }
-        Command::Overhead { format, frozen, db } => {
+        Command::Overhead {
+            since,
+            until,
+            last,
+            format,
+            frozen,
+            db,
+        } => {
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -332,10 +441,18 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            overhead(&sess, fmt)
+            overhead(&sess, window, fmt)
         }
-        Command::Prompts { format, frozen, db } => {
+        Command::Prompts {
+            since,
+            until,
+            last,
+            format,
+            frozen,
+            db,
+        } => {
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -344,16 +461,20 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            prompts(&sess, fmt)
+            prompts(&sess, window, fmt)
         }
         Command::Failures {
             scope,
+            since,
+            until,
+            last,
             format,
             frozen,
             db,
         } => {
             let filter = parse_scope(scope.as_deref())?;
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -362,10 +483,18 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            failures(&sess, &filter, fmt)
+            failures(&sess, &filter, window, fmt)
         }
-        Command::Stuck { format, frozen, db } => {
+        Command::Stuck {
+            since,
+            until,
+            last,
+            format,
+            frozen,
+            db,
+        } => {
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -374,16 +503,20 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            stuck(&sess, fmt)
+            stuck(&sess, window, fmt)
         }
         Command::Doctor {
             scope,
+            since,
+            until,
+            last,
             format,
             frozen,
             db,
         } => {
             let filter = parse_scope(scope.as_deref())?;
             let fmt = parse_format(format.as_deref())?;
+            let window = parse_period(since.as_deref(), until.as_deref(), last.as_deref())?;
             let sess = Session::open_read(
                 &harness,
                 db,
@@ -392,7 +525,7 @@ pub fn run() -> Result<()> {
                 &env,
                 run_analyze,
             )?;
-            doctor(&sess, &filter, fmt)
+            doctor(&sess, &filter, window, fmt)
         }
         Command::Sql { query, format, db } => {
             let fmt = parse_format(format.as_deref())?;
@@ -675,7 +808,8 @@ fn optimize(
             ))
         );
     }
-    let findings = collect_findings(&sess.store)?;
+    // `optimize` takes the whole history — no period flags reach it.
+    let findings = collect_findings(&sess.store, TimeRange::ALL)?;
 
     // The absolute store path so the session's `saniwalens sql --db …` hits the
     // store this run built, wherever it is launched from.
@@ -885,24 +1019,24 @@ fn write_private_file(path: &Path, contents: &str) -> Result<()> {
 /// shell's half is the queries and the store-row → plain-row mapping; every
 /// join, cap, and sort lives in the core where it is testable
 /// (`pbi/2026-10-29-04-feat-findings-assembly-core.md`).
-fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
-    Ok(findings::collect_findings(&findings_input(store)?))
+fn collect_findings(store: &Store, window: TimeRange) -> Result<optimize_mod::Findings> {
+    Ok(findings::collect_findings(&findings_input(store, window)?))
 }
 
 /// Every row `core::findings` assembles from, fetched in one place.
-fn findings_input(store: &Store) -> Result<findings::FindingsInput> {
+fn findings_input(store: &Store, window: TimeRange) -> Result<findings::FindingsInput> {
     Ok(findings::FindingsInput {
         // No session start observed means the always-on section is omitted
         // rather than guessed at — the sentinel stays the core's business.
-        floor: store.baseline_floor()?,
-        error_examples: store.error_examples(findings::EXAMPLES_PER_CATEGORY)?,
-        error_breakdown: store.error_tool_breakdown()?,
-        friction_cells: store.error_counts_by_project()?,
-        bash_commands: store.work_counts("bash_cmd")?,
-        file_edit_counts: store.work_counts("file_edit")?,
-        file_edits: store.file_edits()?,
+        floor: store.baseline_floor(window)?,
+        error_examples: store.error_examples(findings::EXAMPLES_PER_CATEGORY, window)?,
+        error_breakdown: store.error_tool_breakdown(window)?,
+        friction_cells: store.error_counts_by_project(window)?,
+        bash_commands: store.work_counts("bash_cmd", window)?,
+        file_edit_counts: store.work_counts("file_edit", window)?,
+        file_edits: store.file_edits(window)?,
         catalog: store
-            .effective_catalog()?
+            .effective_catalog(window)?
             .into_iter()
             .map(|e| findings::CatalogRow {
                 kind: e.kind,
@@ -916,10 +1050,10 @@ fn findings_input(store: &Store) -> Result<findings::FindingsInput> {
             })
             .collect(),
         session_roots: store.session_roots()?,
-        prompt_behaviors: store.prompt_behavior_counts()?,
-        subagent_totals: store.subagent_totals()?,
+        prompt_behaviors: store.prompt_behavior_counts(window)?,
+        subagent_totals: store.subagent_totals(window)?,
         agents: store
-            .subagent_by_agent()?
+            .subagent_by_agent(window)?
             .into_iter()
             .map(|row| optimize_mod::AgentCost {
                 agent: row.agent,
@@ -927,7 +1061,11 @@ fn findings_input(store: &Store) -> Result<findings::FindingsInput> {
                 out_tokens: row.out_tokens,
             })
             .collect(),
-        skill_out_tokens: store.skill_usage()?.iter().map(|r| r.out_tokens).collect(),
+        skill_out_tokens: store
+            .skill_usage(window)?
+            .iter()
+            .map(|r| r.out_tokens)
+            .collect(),
         always_on_config_tokens: store.always_on_config_tokens()?,
     })
 }
@@ -982,12 +1120,13 @@ fn sql(sess: &Session, query: Option<&str>, format: Format) -> Result<()> {
 /// split by the config layer that owns each fix — the global picture first,
 /// then each project's own findings ("optimize my global setup" and "optimize
 /// this project" are different tasks). `--scope` narrows to one layer.
-fn doctor(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
+fn doctor(sess: &Session, filter: &ScopeFilter, window: TimeRange, format: Format) -> Result<()> {
     if format == Format::Markdown {
         anyhow::bail!("summary has no markdown form — use the default text or --format json");
     }
     let store = &sess.store;
-    let f = collect_findings(store)?;
+    eprint_window(window);
+    let f = collect_findings(store, window)?;
 
     if format == Format::Json {
         // The routed findings, filtered the same way the text form is: the
@@ -1002,19 +1141,28 @@ fn doctor(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
             .iter()
             .filter(|p| filter.includes_project(&p.project))
             .collect();
-        return emit_json(&serde_json::json!({
-            "global": global,
-            "projects": projects,
-        }));
+        return emit_json(&with_window(
+            serde_json::json!({
+                "global": global,
+                "projects": projects,
+            }),
+            window,
+        ));
     }
 
     // The text form is written for someone who has never seen saniwalens's
     // vocabulary: every item says what happened, why it costs, and what to do
     // — prioritized, so the report reads top to bottom as a to-do list.
     let style = Style::stdout();
-    let (session_count, project_count) = store.session_stats()?;
+    let (session_count, project_count) = store.session_stats(window)?;
     if session_count == 0 {
-        println!("nothing analyzed yet — run `saniwalens analyze` first");
+        println!(
+            "{}",
+            empty_in_window(
+                "nothing analyzed yet — run `saniwalens analyze` first",
+                window
+            )
+        );
         return Ok(());
     }
     println!(
@@ -1025,6 +1173,11 @@ fn doctor(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
             sess.harness.display_name()
         ))
     );
+    // The evaluation window, in-band for a text reader: the session count and
+    // every section below are already window-filtered.
+    if let Some(line) = window_line(window) {
+        println!("{}", style.dim(&line));
+    }
 
     let visible: Vec<_> = f
         .projects
@@ -1398,6 +1551,85 @@ fn preamble(format: Format, text: &str) {
     }
 }
 
+/// Resolve the period flags before the session is built — the same
+/// ahead-of-store evaluation `parse_scope`/`parse_format` have, so an
+/// unparseable date fails on its own. The clock is read here: this is the
+/// thin shell around the pure transform in `core::period`.
+fn parse_period(since: Option<&str>, until: Option<&str>, last: Option<&str>) -> Result<TimeRange> {
+    let now = chrono::Utc::now().timestamp();
+    period::resolve(since, until, last, now, JST_OFFSET_SECS).map_err(anyhow::Error::msg)
+}
+
+/// The evaluation-window disclosure — stderr (every format) and the framing
+/// block's last line (table only) render it. `None` without the period flags,
+/// which is what keeps every existing output byte-identical.
+fn window_line(window: TimeRange) -> Option<String> {
+    (!window.is_all()).then(|| {
+        format!(
+            "report window: {}",
+            period::display(window, JST_OFFSET_SECS)
+        )
+    })
+}
+
+/// The JSON `window` object — added only when the flags drew a window, so the
+/// JSON contract without the flags is untouched.
+fn window_json(window: TimeRange) -> Option<serde_json::Value> {
+    (!window.is_all()).then(|| {
+        let (since, until) = period::bounds(window, JST_OFFSET_SECS);
+        serde_json::json!({ "since": since, "until": until })
+    })
+}
+
+/// Attach the evaluation window to a JSON payload — only when the flags drew
+/// one, so the JSON contract without the flags is untouched.
+fn with_window(mut payload: serde_json::Value, window: TimeRange) -> serde_json::Value {
+    if let Some(w) = window_json(window) {
+        payload["window"] = w;
+    }
+    payload
+}
+
+/// Print the evaluation window beside the freshness line (stderr, every
+/// format) — piped stdout and `--format json` stay clean.
+fn eprint_window(window: TimeRange) {
+    if let Some(line) = window_line(window) {
+        eprintln!("{}", Style::stderr().dim(&line));
+    }
+}
+
+/// A framing block with the evaluation window appended (table only — markdown
+/// is the bare table, json the machine contract).
+fn framed(text: &str, window: TimeRange) -> String {
+    match window_line(window) {
+        Some(line) => format!("{text}\n{line}"),
+        None => text.to_string(),
+    }
+}
+
+/// An empty report's wording when the flags drew a window: the action part
+/// ("run analyze") would misread — the store may hold history outside the
+/// window, and the observation stands within it. The window itself is on
+/// stderr beside the freshness line.
+fn empty_in_window(message: &str, window: TimeRange) -> String {
+    match window.is_all() {
+        true => message.to_string(),
+        false => {
+            let head = message.split(" — ").next().unwrap_or(message);
+            format!("{head} in the evaluation window")
+        }
+    }
+}
+
+/// The catalog row's unused label: a windowed read means "unused *within the
+/// window*" — the catalog is current config, the usage half is historical.
+fn unused_label(window: TimeRange) -> &'static str {
+    match window.is_all() {
+        true => "UNUSED",
+        false => "UNUSED (window)",
+    }
+}
+
 /// Shorten an absolute path under the home directory to `~/…` for display.
 fn tilde_path(path: &str) -> String {
     shorten_to_tilde(path, home_dir())
@@ -1429,11 +1661,12 @@ fn shorten_to_tilde(path: &str, home: Option<&str>) -> String {
 /// got stuck and kept retrying, as opposed to a hotspot's healthy spread-out
 /// edits. An episode is one session's edits to one path, so parallel work on
 /// a same-named file is never presented as one agent looping (`core::thrash`).
-fn stuck(sess: &Session, format: Format) -> Result<()> {
+fn stuck(sess: &Session, window: TimeRange, format: Format) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
     let store = &sess.store;
-    let episodes = detect_thrash(&store.file_edits()?, GAP_SECS, MIN_EDITS);
+    eprint_window(window);
+    let episodes = detect_thrash(&store.file_edits(window)?, GAP_SECS, MIN_EDITS);
     if format == Format::Json {
         let episodes: Vec<serde_json::Value> = episodes
             .iter()
@@ -1448,16 +1681,28 @@ fn stuck(sess: &Session, format: Format) -> Result<()> {
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({ "episodes": episodes }));
+        return emit_json(&with_window(
+            serde_json::json!({ "episodes": episodes }),
+            window,
+        ));
     }
     if episodes.is_empty() {
-        println!("no thrash episodes (>= {MIN_EDITS} rapid re-edits) — run analyze first");
+        println!(
+            "{}",
+            empty_in_window(
+                &format!("no thrash episodes (>= {MIN_EDITS} rapid re-edits) — run analyze first"),
+                window
+            )
+        );
         return Ok(());
     }
     preamble(
         format,
-        "Files the agent kept re-editing in rapid bursts — the signature of getting stuck\n\
-         and retrying. Worth checking what blocked it there (a rule? missing context?).",
+        &framed(
+            "Files the agent kept re-editing in rapid bursts — the signature of getting stuck\n\
+             and retrying. Worth checking what blocked it there (a rule? missing context?).",
+            window,
+        ),
     );
     let rows: Vec<Vec<String>> = episodes
         .iter()
@@ -1498,7 +1743,7 @@ fn note(text: &str) {
 /// `--scope` routes by ownership (`core::scope`): `global` shows the failures
 /// no project owns, `project` each project's majority-owned failures, and
 /// `project:<slug>` everything that happened in that one project.
-fn failures(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
+fn failures(sess: &Session, filter: &ScopeFilter, window: TimeRange, format: Format) -> Result<()> {
     struct FrictionRow {
         project: Option<String>,
         category: String,
@@ -1508,11 +1753,12 @@ fn failures(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> 
     }
 
     let store = &sess.store;
-    let cells = store.error_counts_by_project()?;
+    eprint_window(window);
+    let cells = store.error_counts_by_project(window)?;
 
     let counts: Vec<FrictionRow> = match filter {
         ScopeFilter::All => store
-            .error_counts()?
+            .error_counts(window)?
             .into_iter()
             .map(|(category, count)| FrictionRow {
                 project: None,
@@ -1570,43 +1816,55 @@ fn failures(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> 
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({ "total": total, "failures": failures }));
+        return emit_json(&with_window(
+            serde_json::json!({ "total": total, "failures": failures }),
+            window,
+        ));
     }
     if total == 0 {
-        println!("no tool failures found for this scope — run `saniwalens analyze` first?");
+        println!(
+            "{}",
+            empty_in_window(
+                "no tool failures found for this scope — run `saniwalens analyze` first?",
+                window
+            )
+        );
         return Ok(());
     }
 
     preamble(
         format,
-        &match filter {
-            ScopeFilter::All => {
-                "Tool calls that kept failing the same way, grouped by kind of failure.\n\
+        &framed(
+            &match filter {
+                ScopeFilter::All => {
+                    "Tool calls that kept failing the same way, grouped by kind of failure.\n\
                  Every row wastes turns and tokens; the suggestion says what usually fixes it."
-                    .to_string()
-            }
-            ScopeFilter::Global => {
-                format!(
-                    "Failures spread across several projects — no single project owns them, so\n\
+                        .to_string()
+                }
+                ScopeFilter::Global => {
+                    format!(
+                        "Failures spread across several projects — no single project owns them, so\n\
                      they read as habits or global-config problems. Fix these in {}.",
-                    sess.harness.global_config_ref()
-                )
-            }
-            ScopeFilter::Project(None) => {
-                format!(
-                    "Failures each project owns (it holds the majority of that kind). Fix each\n\
+                        sess.harness.global_config_ref()
+                    )
+                }
+                ScopeFilter::Project(None) => {
+                    format!(
+                        "Failures each project owns (it holds the majority of that kind). Fix each\n\
                      in that project's own {}, not globally.",
-                    sess.harness.project_config_ref()
-                )
-            }
-            ScopeFilter::Project(Some(_)) => {
-                format!(
-                    "Every recurring failure inside this one project, most frequent first.\n\
+                        sess.harness.project_config_ref()
+                    )
+                }
+                ScopeFilter::Project(Some(_)) => {
+                    format!(
+                        "Every recurring failure inside this one project, most frequent first.\n\
                      Fix them in this project's own {}.",
-                    sess.harness.project_config_ref()
-                )
-            }
-        },
+                        sess.harness.project_config_ref()
+                    )
+                }
+            },
+            window,
+        ),
     );
     let with_project = matches!(filter, ScopeFilter::Project(None));
     let rows: Vec<Vec<String>> = counts
@@ -1651,9 +1909,10 @@ fn failures(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> 
 /// Show the mix of how the user steers the session, and what it suggests. Heavy
 /// steering points to room for more autonomy; frequent corrections point to
 /// clearer upfront specs. The classes are lexical heuristics (`core::prompt`).
-fn prompts(sess: &Session, format: Format) -> Result<()> {
+fn prompts(sess: &Session, window: TimeRange, format: Format) -> Result<()> {
     let store = &sess.store;
-    let counts = store.prompt_behavior_counts()?;
+    eprint_window(window);
+    let counts = store.prompt_behavior_counts(window)?;
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
     if format == Format::Json {
         let behaviors: Vec<serde_json::Value> = counts
@@ -1670,14 +1929,25 @@ fn prompts(sess: &Session, format: Format) -> Result<()> {
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({ "total": total, "behaviors": behaviors }));
+        return emit_json(&with_window(
+            serde_json::json!({ "total": total, "behaviors": behaviors }),
+            window,
+        ));
     }
     if total == 0 {
         // An analyzed store with sessions but no prompts means this harness
         // harvests no prompt signal (opencode v1 does not) — telling the user
         // to run `analyze` again would send them in a circle.
-        let (sessions, _) = store.session_stats()?;
-        if sessions > 0 {
+        let (sessions, _) = store.session_stats(window)?;
+        if !window.is_all() {
+            if sessions > 0 {
+                println!(
+                    "no prompts in the evaluation window — the store holds {sessions} analyzed session(s) within it"
+                );
+            } else {
+                println!("no prompts in the evaluation window");
+            }
+        } else if sessions > 0 {
             println!(
                 "no prompts harvested for this harness — the store holds {sessions} analyzed session(s)"
             );
@@ -1689,11 +1959,14 @@ fn prompts(sess: &Session, format: Format) -> Result<()> {
 
     preamble(
         format,
-        &format!(
-            "How you steer {}, classified per prompt: instruct (substantive asks),\n\
-             steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
-             steering = room for more autonomy; lots of correcting = unclear upfront specs.",
-            sess.harness.display_name()
+        &framed(
+            &format!(
+                "How you steer {}, classified per prompt: instruct (substantive asks),\n\
+                 steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
+                 steering = room for more autonomy; lots of correcting = unclear upfront specs.",
+                sess.harness.display_name()
+            ),
+            window,
         ),
     );
     let pct = |n: i64| (n as f64 * 100.0 / total as f64).round() as i64;
@@ -1759,12 +2032,13 @@ fn prompts(sess: &Session, format: Format) -> Result<()> {
 /// leaves the residual — system prompt, built-in tools, and MCP tool schemas the
 /// catalog cannot weigh. The per-project floors let you infer an MCP server's
 /// real cost by comparing a project that enables it against one that does not.
-fn overhead(sess: &Session, format: Format) -> Result<()> {
+fn overhead(sess: &Session, window: TimeRange, format: Format) -> Result<()> {
     let store = &sess.store;
-    let floor = store.baseline_floor()?;
+    eprint_window(window);
+    let floor = store.baseline_floor(window)?;
     let config = store.always_on_config_tokens()?;
     let residual = floor.map(|floor| (floor - config).max(0));
-    let per_project = store.baseline_floor_per_project()?;
+    let per_project = store.baseline_floor_per_project(window)?;
 
     if format == Format::Json {
         let per_project: Vec<serde_json::Value> = per_project
@@ -1777,19 +2051,25 @@ fn overhead(sess: &Session, format: Format) -> Result<()> {
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({
-            "floor": floor,
-            "config_tokens": config,
-            "residual": residual,
-            "per_project": per_project,
-        }));
+        return emit_json(&with_window(
+            serde_json::json!({
+                "floor": floor,
+                "config_tokens": config,
+                "residual": residual,
+                "per_project": per_project,
+            }),
+            window,
+        ));
     }
     // No session start observed — say so rather than substituting a mid-session
     // context that would read as a startup cost.
     let Some(floor) = floor else {
-        let (sessions, _) = store.session_stats()?;
+        let (sessions, _) = store.session_stats(window)?;
         if sessions == 0 {
-            println!("no data — run `saniwalens analyze` first");
+            println!(
+                "{}",
+                empty_in_window("no data — run `saniwalens analyze` first", window)
+            );
         } else {
             println!(
                 "always-on floor unavailable — none of the {sessions} analyzed session(s)\n\
@@ -1809,8 +2089,11 @@ fn overhead(sess: &Session, format: Format) -> Result<()> {
 
     preamble(
         format,
-        "What every session pays in context before any work starts, and how much of\n\
-         it your own config files account for.",
+        &framed(
+            "What every session pays in context before any work starts, and how much of\n\
+             it your own config files account for.",
+            window,
+        ),
     );
     let style = Style::stdout();
     println!(
@@ -1853,7 +2136,8 @@ fn overhead(sess: &Session, format: Format) -> Result<()> {
 fn analyze(sess: &Session, projects: Option<PathBuf>, format: Format) -> Result<()> {
     let stats = run_analyze(&sess.harness, projects, &sess.db_path)?;
     let store = &sess.store;
-    let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    // `analyze` takes the whole history — no period flags reach it.
+    let (sub_tokens, sub_agents) = store.subagent_totals(TimeRange::ALL)?;
     if format == Format::Json {
         return emit_json(&serde_json::json!({
             "sessions": stats.sessions,
@@ -1917,22 +2201,23 @@ fn warn_missing_agent_split(coverage: &SplitCoverage) {
         );
     }
 }
-fn usage(sess: &Session, by: Option<&str>, format: Format) -> Result<()> {
+fn usage(sess: &Session, by: Option<&str>, window: TimeRange, format: Format) -> Result<()> {
     let store = &sess.store;
+    eprint_window(window);
 
     if let Some(by) = by {
         let bucket = Bucket::parse(by)
             .with_context(|| format!("unknown --by value '{by}' (year|month|week|day|hour)"))?;
-        return usage_by_time(store, bucket, format);
+        return usage_by_time(store, bucket, window, format);
     }
 
-    let skills = store.skill_usage()?;
+    let skills = store.skill_usage(window)?;
     // Where the tokens actually go: main-thread skill output vs subagents. The
     // subagent figure is usually the larger by far — worth seeing before reading
     // the per-skill table.
     let main_out: i64 = skills.iter().map(|row| row.out_tokens).sum();
-    let (sub_tokens, sub_agents) = store.subagent_totals()?;
-    let agents = store.subagent_by_agent()?;
+    let (sub_tokens, sub_agents) = store.subagent_totals(window)?;
+    let agents = store.subagent_by_agent(window)?;
     // How much of the total the rows actually account for: a store that kept
     // totals for sessions whose transcripts were pruned before their runs were
     // extracted has rows for only part of it, and the rows must not pass for
@@ -1947,30 +2232,42 @@ fn usage(sess: &Session, by: Option<&str>, format: Format) -> Result<()> {
     // goes to stderr precisely so it can be given to both.
     warn_missing_agent_split(&agent_split);
     if format == Format::Json {
-        return emit_json(&serde_json::json!({
-            "tokens": {
-                "main_out": main_out,
-                "sub_tokens": sub_tokens,
-                "sub_agents": sub_agents,
-            },
-            "agent_split": agent_split,
-            "agents": agents,
-            "skills": skills,
-        }));
+        return emit_json(&with_window(
+            serde_json::json!({
+                "tokens": {
+                    "main_out": main_out,
+                    "sub_tokens": sub_tokens,
+                    "sub_agents": sub_agents,
+                },
+                "agent_split": agent_split,
+                "agents": agents,
+                "skills": skills,
+            }),
+            window,
+        ));
     }
     // A subagent total with neither table behind it is not "nothing happened" —
     // it is a store whose per-agent split has not been extracted yet, and saying
     // "no usage" there would be false.
     if skills.is_empty() && agents.is_empty() && sub_tokens == 0 {
-        println!("no skill usage found — run `saniwalens analyze` first");
+        println!(
+            "{}",
+            empty_in_window(
+                "no skill usage found — run `saniwalens analyze` first",
+                window
+            )
+        );
         return Ok(());
     }
     preamble(
         format,
-        "What ran and what it cost. First the subagent bill per agent type\n\
-         (costliest first), then how often each skill ran — output tokens written,\n\
-         context growth while it ran, and wall-clock seconds (most-invoked first).\n\
-         A section with nothing to show is omitted.",
+        &framed(
+            "What ran and what it cost. First the subagent bill per agent type\n\
+             (costliest first), then how often each skill ran — output tokens written,\n\
+             context growth while it ran, and wall-clock seconds (most-invoked first).\n\
+             A section with nothing to show is omitted.",
+            window,
+        ),
     );
     println!(
         "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)"
@@ -2037,8 +2334,8 @@ fn usage(sess: &Session, by: Option<&str>, format: Format) -> Result<()> {
 
 /// Skill usage rolled up per time bucket (JST). A long span is assigned whole to
 /// its start bucket (`docs/specs/cli.md`).
-fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
-    let events = store.skill_event_costs()?;
+fn usage_by_time(store: &Store, bucket: Bucket, window: TimeRange, format: Format) -> Result<()> {
+    let events = store.skill_event_costs(window)?;
 
     let mut totals: std::collections::BTreeMap<String, (i64, i64, i64, f64)> =
         std::collections::BTreeMap::new();
@@ -2064,17 +2361,29 @@ fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({ "buckets": buckets }));
+        return emit_json(&with_window(
+            serde_json::json!({ "buckets": buckets }),
+            window,
+        ));
     }
     if events.is_empty() {
-        println!("no skill usage found — run `saniwalens analyze` first");
+        println!(
+            "{}",
+            empty_in_window(
+                "no skill usage found — run `saniwalens analyze` first",
+                window
+            )
+        );
         return Ok(());
     }
 
     preamble(
         format,
-        "Skill activity per time bucket (times in JST). A long-running skill counts\n\
-         whole in the bucket it started in, so fine buckets can show spikes.",
+        &framed(
+            "Skill activity per time bucket (times in JST). A long-running skill counts\n\
+             whole in the bucket it started in, so fine buckets can show spikes.",
+            window,
+        ),
     );
     let rows: Vec<Vec<String>> = totals
         .into_iter()
@@ -2106,14 +2415,20 @@ fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
 /// Join the catalogued surfaces against usage: each installed surface with its
 /// static cost and (for usage-measurable kinds) invocation count, unused ones
 /// flagged. Usage with no matching surface is shown as orphaned.
-fn inventory(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
+fn inventory(
+    sess: &Session,
+    filter: &ScopeFilter,
+    window: TimeRange,
+    format: Format,
+) -> Result<()> {
     let store = &sess.store;
+    eprint_window(window);
     let catalog: Vec<_> = store
-        .effective_catalog()?
+        .effective_catalog(window)?
         .into_iter()
         .filter(|e| in_scope(filter, &e.scope, &e.project))
         .collect();
-    let usage = store.usage_counts()?;
+    let usage = store.usage_counts(window)?;
 
     if format == Format::Json {
         let catalogued: std::collections::HashSet<(&str, &str)> = catalog
@@ -2133,8 +2448,9 @@ fn inventory(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()>
                     "startup_tokens": entry.startup_tokens,
                     "uses": if measurable { Some(entry.uses) } else { None },
                     "load_mode": entry.load_mode,
-                    "status": if measurable && entry.uses == 0 { "unused" }
-                              else if !measurable { "catalog-only" } else { "" },
+                    "status": if measurable && entry.uses == 0 {
+                        if window.is_all() { "unused" } else { "unused-in-window" }
+                    } else if !measurable { "catalog-only" } else { "" },
                 })
             })
             .collect();
@@ -2150,14 +2466,17 @@ fn inventory(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()>
                 }
             }
         }
-        return emit_json(&serde_json::json!({ "surfaces": items }));
+        return emit_json(&with_window(
+            serde_json::json!({ "surfaces": items }),
+            window,
+        ));
     }
     if catalog.is_empty() && usage.is_empty() {
         println!("nothing catalogued — run `saniwalens analyze` first");
         return Ok(());
     }
 
-    preamble(format, sess.harness.inventory_preamble());
+    preamble(format, &framed(sess.harness.inventory_preamble(), window));
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
@@ -2166,7 +2485,11 @@ fn inventory(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()>
         let (uses_cell, status) = if measurable {
             (
                 entry.uses.to_string(),
-                if entry.uses == 0 { "UNUSED" } else { "" },
+                if entry.uses == 0 {
+                    unused_label(window)
+                } else {
+                    ""
+                },
             )
         } else {
             ("-".to_string(), "(catalog-only)")
@@ -2256,10 +2579,11 @@ fn scope_cell(scope: &str, project: &str) -> String {
 /// at session start — real always-on tokens first, then MCP schemas, then
 /// declutter-only (skills/agents, whose body is on-demand). This is the "where
 /// and how to optimize" view, honest about which removals save context.
-fn waste(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
+fn waste(sess: &Session, filter: &ScopeFilter, window: TimeRange, format: Format) -> Result<()> {
     let store = &sess.store;
+    eprint_window(window);
     let catalog: Vec<_> = store
-        .effective_catalog()?
+        .effective_catalog(window)?
         .into_iter()
         .filter(|e| in_scope(filter, &e.scope, &e.project))
         .collect();
@@ -2333,18 +2657,30 @@ fn waste(sess: &Session, filter: &ScopeFilter, format: Format) -> Result<()> {
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({ "wedges": wedges }));
+        return emit_json(&with_window(
+            serde_json::json!({ "wedges": wedges }),
+            window,
+        ));
     }
     if found.is_empty() {
-        println!("nothing wasteful found — run `saniwalens analyze` first");
+        println!(
+            "{}",
+            empty_in_window(
+                "nothing wasteful found — run `saniwalens analyze` first",
+                window
+            )
+        );
         return Ok(());
     }
 
     preamble(
         format,
-        "Concrete cleanup opportunities in your config, ranked by what removing each\n\
-         one actually saves at session start. A \"~\" figure is declutter-only — just\n\
-         the description is loaded at startup; the body costs nothing until invoked.",
+        &framed(
+            "Concrete cleanup opportunities in your config, ranked by what removing each\n\
+             one actually saves at session start. A \"~\" figure is declutter-only — just\n\
+             the description is loaded at startup; the body costs nothing until invoked.",
+            window,
+        ),
     );
     let rows: Vec<Vec<String>> = found
         .iter()
@@ -2944,5 +3280,143 @@ mod tests {
             delivery_mode(false, optimize_mod::RunMode::Headless),
             DeliveryMode::Headless
         );
+    }
+
+    // ---- PBI 2026-10-30-01: the period flags ----
+
+    #[test]
+    fn the_period_flags_parse_on_every_report_view() {
+        // The flags exist on all eight views and nothing else.
+        let views = [
+            vec!["usage"],
+            vec!["inventory"],
+            vec!["waste"],
+            vec!["overhead"],
+            vec!["prompts"],
+            vec!["failures"],
+            vec!["stuck"],
+            vec!["doctor"],
+        ];
+        for view in views {
+            let mut argv = vec!["saniwalens"];
+            argv.extend(view.iter().copied());
+            argv.extend(["--since", "2026-10-01", "--until", "2026-10-07"]);
+            Cli::try_parse_from(argv).expect("the view takes the period flags");
+        }
+        // The other commands do not.
+        for argv in [
+            vec!["saniwalens", "analyze", "--since", "2026-10-01"],
+            vec!["saniwalens", "sql", "--last", "7d"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "the period flags stay on the report views"
+            );
+        }
+    }
+
+    #[test]
+    fn last_conflicts_with_the_explicit_dates() {
+        let err = Cli::try_parse_from([
+            "saniwalens",
+            "usage",
+            "--last",
+            "7d",
+            "--since",
+            "2026-10-01",
+        ])
+        .err()
+        .expect("the flags are rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let err = Cli::try_parse_from([
+            "saniwalens",
+            "waste",
+            "--last",
+            "7d",
+            "--until",
+            "2026-10-07",
+        ])
+        .err()
+        .expect("the flags are rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        // Alone, `--last` parses.
+        let cli = Cli::try_parse_from(["saniwalens", "usage", "--last", "7d"]).unwrap();
+        let Command::Usage {
+            by,
+            since,
+            until,
+            last,
+            format,
+            frozen,
+            db,
+        } = cli.command
+        else {
+            panic!("the command is `usage`");
+        };
+        assert_eq!(by, None);
+        assert_eq!(since, None);
+        assert_eq!(until, None);
+        assert_eq!(last.as_deref(), Some("7d"));
+        assert_eq!(format, None);
+        assert!(!frozen);
+        assert_eq!(db, None);
+    }
+
+    #[test]
+    fn the_window_helpers_say_nothing_without_the_flags() {
+        let all = TimeRange::ALL;
+        assert_eq!(window_line(all), None);
+        assert_eq!(window_json(all), None);
+        assert!(framed("text", all) == "text");
+        assert_eq!(
+            empty_in_window("no skill usage found — run `saniwalens analyze` first", all),
+            "no skill usage found — run `saniwalens analyze` first"
+        );
+        assert_eq!(unused_label(all), "UNUSED");
+    }
+
+    #[test]
+    fn the_window_helpers_disclose_a_drawn_window() {
+        let window = TimeRange {
+            start: Some(1_790_780_400),
+            end: Some(1_791_385_199),
+        };
+        assert_eq!(
+            window_line(window).as_deref(),
+            Some("report window: since 2026-10-01T00:00:00+09:00, until 2026-10-07T23:59:59+09:00")
+        );
+        assert_eq!(
+            window_json(window),
+            Some(serde_json::json!({
+                "since": "2026-10-01T00:00:00+09:00",
+                "until": "2026-10-07T23:59:59+09:00",
+            }))
+        );
+        // The framing block appends the line to the text; the JSON payload
+        // gains the `window` key without touching the rest.
+        assert!(framed("text", window).contains("text\nreport window: since"));
+        let payload = with_window(serde_json::json!({ "total": 3 }), window);
+        assert_eq!(payload["window"]["since"], "2026-10-01T00:00:00+09:00");
+        assert_eq!(payload["total"], 3);
+    }
+
+    #[test]
+    fn an_empty_report_reads_within_the_window() {
+        let window = TimeRange {
+            start: Some(1),
+            end: Some(2),
+        };
+        assert_eq!(
+            empty_in_window(
+                "no skill usage found — run `saniwalens analyze` first",
+                window
+            ),
+            "no skill usage found in the evaluation window"
+        );
+        assert_eq!(
+            empty_in_window("no data — run `saniwalens analyze` first", window),
+            "no data in the evaluation window"
+        );
+        assert_eq!(unused_label(window), "UNUSED (window)");
     }
 }
