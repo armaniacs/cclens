@@ -3413,6 +3413,7 @@ mod tests {
         for argv in [
             vec!["saniwalens", "analyze", "--since", "2026-10-01"],
             vec!["saniwalens", "sql", "--last", "7d"],
+            vec!["saniwalens", "optimize", "--since", "2026-10-01"],
         ] {
             assert!(
                 Cli::try_parse_from(argv).is_err(),
