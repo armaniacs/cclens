@@ -75,6 +75,88 @@ pub fn resolve(
     Ok(TimeRange { start, end })
 }
 
+/// The two comparison windows of the trend view: the current window and the
+/// equal-length window immediately before it. The pair tiles the timeline —
+/// the previous window ends one second before the current one starts — so no
+/// event is counted in both windows of a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowPair {
+    pub current: TimeRange,
+    pub previous: TimeRange,
+}
+
+/// Resolve the trend flags into the current window and the same-length window
+/// immediately before it.
+///
+/// With no flags at all the current window is the last 7 days and the previous
+/// one the 7 days before them. `--last <N>d | <N>h | <N>w` is a rolling pair
+/// ending at the injected `now`: current `(now-N, now]`, previous
+/// `(now-2N, now-N]`. `--since X` (+ optional `--until Y`, inclusive per
+/// [`resolve`]) fixes the current window at `[X, Y or now]` — a `--since`
+/// without `--until` runs to the injected now — and derives the previous one
+/// as the equal-length window ending one second before `X`. The date and span
+/// errors of `resolve` carry over; `--until` without `--since` is an error
+/// because the current window's start is undefined, and a `--since` after the
+/// injected now leaves no current window to compare.
+pub fn resolve_pair(
+    since: Option<&str>,
+    until: Option<&str>,
+    last: Option<&str>,
+    now: i64,
+    tz_offset_secs: i32,
+) -> Result<WindowPair, String> {
+    // `resolve` alone accepts `--until` without `--since`; the trend cannot —
+    // the comparison needs the current window's start to derive the previous
+    // one from.
+    if since.is_none() && until.is_some() {
+        return Err(
+            "--until requires --since — without a start the current window (and the window to compare it with) is undefined"
+                .to_string(),
+        );
+    }
+    // `--last` — and the flags-absent default of 7d — is a rolling pair on its
+    // own; `resolve` carries the span parse errors and the
+    // cannot-be-combined-with-dates rule.
+    if let Some(span) = last.or_else(|| (since.is_none() && until.is_none()).then_some("7d")) {
+        let resolved = resolve(since, until, Some(span), now, tz_offset_secs)?;
+        let secs = span_secs(span)?;
+        // The rolling current is (now-N, now] — resolve's inclusive start
+        // moved one second in — so the previous window, the same length
+        // ending one second earlier, shares no event with it.
+        let start = resolved.start.expect("a rolling window has a start") + 1;
+        return Ok(WindowPair {
+            current: TimeRange {
+                start: Some(start),
+                end: Some(now),
+            },
+            previous: TimeRange {
+                start: Some(start - secs),
+                end: Some(start - 1),
+            },
+        });
+    }
+    let mut current = resolve(since, until, None, now, tz_offset_secs)?;
+    if current.end.is_none() {
+        // `--since` without `--until`: the current window runs to the injected
+        // now, so the previous window has a definite length.
+        current.end = Some(now);
+    }
+    let start = current.start.expect("--since is present in this branch");
+    let end = current.end.expect("the current end is clamped just above");
+    if start > end {
+        let since = since.unwrap_or_default();
+        return Err(format!("empty window: --since {since} is after now"));
+    }
+    let length = end - start + 1;
+    Ok(WindowPair {
+        current,
+        previous: TimeRange {
+            start: Some(start - length),
+            end: Some(start - 1),
+        },
+    })
+}
+
 /// The whole day `--until` names, inclusive: the day's last local second.
 fn day_end_epoch(value: &str, flag: &str, tz_offset_secs: i32) -> Result<i64, String> {
     Ok(day_start_epoch(value, flag, tz_offset_secs)? + 86_400 - 1)
@@ -288,5 +370,141 @@ mod tests {
             "the JST presentation of the day start: {text}"
         );
         assert!(text.contains("until 2026-10-07T23:59:59+09:00"), "{text}");
+    }
+
+    // ---- PBI 2026-10-30-02: the trend view's two windows ----
+
+    // 2026-10-01T00:00:00+09:00 == 2026-09-30T15:00:00Z.
+    const OCT_1_JST_START: i64 = OCT_1_UTC - 9 * 3_600;
+
+    fn resolve_pair(
+        since: Option<&str>,
+        until: Option<&str>,
+        last: Option<&str>,
+    ) -> Result<WindowPair, String> {
+        super::resolve_pair(since, until, last, NOW, JST_OFFSET_SECS)
+    }
+
+    #[test]
+    fn trend_defaults_to_the_last_7_days_and_the_7_before_them() {
+        // (now-7d, now] vs (now-14d, now-7d] — the seam second belongs to the
+        // previous window only, so no event is compared against itself.
+        assert_eq!(
+            resolve_pair(None, None, None).unwrap(),
+            WindowPair {
+                current: TimeRange {
+                    start: Some(NOW - 7 * 86_400 + 1),
+                    end: Some(NOW)
+                },
+                previous: TimeRange {
+                    start: Some(NOW - 14 * 86_400 + 1),
+                    end: Some(NOW - 7 * 86_400)
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn trend_last_rolls_both_windows_back_from_the_injected_now() {
+        let pair = resolve_pair(None, None, Some("24h")).unwrap();
+        assert_eq!(
+            pair.current,
+            TimeRange {
+                start: Some(NOW - 86_400 + 1),
+                end: Some(NOW)
+            }
+        );
+        assert_eq!(
+            pair.previous,
+            TimeRange {
+                start: Some(NOW - 2 * 86_400 + 1),
+                end: Some(NOW - 86_400)
+            }
+        );
+        // Adjacency: the previous window ends exactly where the current one
+        // starts minus a second — same length, immediately before.
+        assert_eq!(pair.previous.end.unwrap(), pair.current.start.unwrap() - 1);
+        // 2w works too.
+        assert_eq!(
+            resolve_pair(None, None, Some("2w")).unwrap().previous,
+            TimeRange {
+                start: Some(NOW - 4 * 7 * 86_400 + 1),
+                end: Some(NOW - 2 * 7 * 86_400)
+            }
+        );
+    }
+
+    #[test]
+    fn trend_since_and_until_derive_the_equal_length_window_before_the_start() {
+        let pair = resolve_pair(Some("2026-10-01"), Some("2026-10-07"), None).unwrap();
+        assert_eq!(pair.current.start, Some(OCT_1_JST_START));
+        assert_eq!(pair.current.end, Some(OCT_8_JST_MIDNIGHT - 1));
+        // The 7 days before the current window: 2026-09-24 .. 2026-09-30 JST,
+        // inclusive to the second — one less than the current window's start.
+        assert_eq!(
+            pair.previous,
+            TimeRange {
+                start: Some(OCT_1_JST_START - 7 * 86_400),
+                end: Some(OCT_1_JST_START - 1),
+            }
+        );
+    }
+
+    #[test]
+    fn trend_since_only_clamps_the_current_end_to_the_injected_now() {
+        // The clock is injected: run it to 2026-10-03 23:59:59 JST.
+        let now = OCT_1_JST_START + 3 * 86_400 - 1;
+        let pair =
+            super::resolve_pair(Some("2026-10-01"), None, None, now, JST_OFFSET_SECS).unwrap();
+        assert_eq!(
+            pair.current,
+            TimeRange {
+                start: Some(OCT_1_JST_START),
+                end: Some(now)
+            }
+        );
+        // The three days before the current window: 2026-09-28 .. 09-30 JST.
+        assert_eq!(
+            pair.previous,
+            TimeRange {
+                start: Some(OCT_1_JST_START - 3 * 86_400),
+                end: Some(OCT_1_JST_START - 1),
+            }
+        );
+    }
+
+    #[test]
+    fn trend_until_without_since_is_an_error() {
+        let err = resolve_pair(None, Some("2026-10-01"), None).unwrap_err();
+        assert!(err.contains("--until"), "{err}");
+        assert!(err.contains("--since"), "{err}");
+    }
+
+    #[test]
+    fn trend_since_after_until_is_an_error() {
+        let err = resolve_pair(Some("2026-10-07"), Some("2026-10-01"), None).unwrap_err();
+        assert!(err.contains("2026-10-07"), "{err}");
+        assert!(err.contains("2026-10-01"), "{err}");
+    }
+
+    #[test]
+    fn trend_since_after_the_injected_now_is_an_empty_window_error() {
+        // NOW = 1_000_000 is 1970: a 2026 --since leaves no current window and
+        // no previous one to derive from it.
+        let err = resolve_pair(Some("2026-10-01"), None, None).unwrap_err();
+        assert!(err.contains("2026-10-01"), "{err}");
+    }
+
+    #[test]
+    fn trend_last_cannot_be_combined_with_the_dates() {
+        assert!(resolve_pair(Some("2026-10-01"), None, Some("7d")).is_err());
+        assert!(resolve_pair(None, Some("2026-10-01"), Some("7d")).is_err());
+    }
+
+    #[test]
+    fn trend_carries_the_date_and_span_parse_errors() {
+        assert!(resolve_pair(Some("2026/10/01"), None, None).is_err());
+        assert!(resolve_pair(Some("2026-10-01"), Some("2026/10/07"), None).is_err());
+        assert!(resolve_pair(None, None, Some("7")).is_err());
     }
 }
