@@ -1090,8 +1090,11 @@ impl Store {
         );
         // Anonymous placeholders throughout: the range bounds bind first (the
         // filter sits before the LIMIT), the per-group cap last.
-        let mut params: Vec<rusqlite::types::Value> =
-            binds.iter().copied().map(rusqlite::types::Value::from).collect();
+        let mut params: Vec<rusqlite::types::Value> = binds
+            .iter()
+            .copied()
+            .map(rusqlite::types::Value::from)
+            .collect();
         params.push(rusqlite::types::Value::Integer(i64::from(per_group)));
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
