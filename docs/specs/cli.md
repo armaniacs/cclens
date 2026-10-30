@@ -165,6 +165,32 @@ Slices not covered here — the Bash command mix, the most-edited files, an erro
 category broken down any way — are a `sql` one-liner; those once had thin
 `commands`/`hotspots` views, dropped once `sql` existed.
 
+### Period — narrow a report to a window of the history
+
+The eight report views above take `--since` / `--until` / `--last` so "what did
+the agent cost last week" is a view flag, not a `sql` query. The other commands
+(`analyze`, `sql`, `optimize`) take none — they are whole-history by contract.
+
+- `--since DATE` / `--until DATE`: a named-day window over the history, each
+  date a whole day (`YYYY-MM-DD`, read in the presentation zone — **JST**, the
+  same zone the bucketing table uses; the comparison is against the UTC epoch
+  the store keeps). `--until` is **inclusive**: the whole named day counts.
+- `--last SPAN`: a rolling window ending now — `<N>d`, `<N>h`, `<N>w`.
+  Exclusive with the explicit dates (clap conflict), so "last 7 days" can never
+  be silently reinterpreted by a stray `--since`.
+- Errors are parse-time, before any report renders: an unparseable date fails
+  on stderr with a non-zero exit and an empty stdout; `--since` after `--until`
+  is an empty-window error rather than an empty-looking report.
+- The window is **disclosed, never silent**: a dimmed `report window:` line
+  rides with the freshness line on stderr (every format), the framing block
+  carries it as its last line (table only — markdown stays a bare table),
+  `doctor` prints it in-band under its heading, and `--format json` gains a
+  `window` object (`since` / `until` as RFC 3339 with their offset). Without
+  the flags every output is byte-identical to the pre-period behavior.
+- The catalog half of `inventory` is current config, so it is not windowed by
+  time — its **usage half** is. An unused row under a window says
+  `UNUSED (window)` / `"unused-in-window"`, never plain "unused".
+
 ## Time bucketing
 
 `--by` groups by `year | month | week | day | hour`. Because the store keeps UTC
@@ -197,7 +223,9 @@ caveats in `events.md` / `surfaces.md`):
   printing it alone under a "what to trim" heading reads as a startup saving the
   deletion never delivers.
 - "Unused" always carries the window it was evaluated over, so it is not mistaken
-  for "never installed".
+  for "never installed": without the period flags the window is all history, and
+  under `--since` / `--until` / `--last` the row itself says `UNUSED (window)`
+  (inventory; the other views' empty states read "in the evaluation window").
 - A subagent run whose agent type was never recorded is shown as `(unknown)`,
   never merged into a named type and never dropped — the per-agent rows must
   keep summing to the subagent total the same report prints above them, for
