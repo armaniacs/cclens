@@ -3920,6 +3920,31 @@ mod tests {
         .err()
         .expect("the flags are rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        // The trend's pair resolver rejects the combination too; the parser
+        // rejects it first — the same `conflicts_with_all` wiring as the
+        // single-window views.
+        let err = Cli::try_parse_from([
+            "saniwalens",
+            "trend",
+            "--last",
+            "7d",
+            "--since",
+            "2026-10-01",
+        ])
+        .err()
+        .expect("the flags are rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let err = Cli::try_parse_from([
+            "saniwalens",
+            "trend",
+            "--last",
+            "7d",
+            "--until",
+            "2026-10-07",
+        ])
+        .err()
+        .expect("the flags are rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
         // Alone, `--last` parses.
         let cli = Cli::try_parse_from(["saniwalens", "usage", "--last", "7d"]).unwrap();
         let Command::Usage {
@@ -4108,6 +4133,64 @@ mod tests {
                     None,
                 )]),
             )
+            .unwrap();
+        store
+    }
+
+    /// A store whose previous window holds a kind the current one does not:
+    /// the kind-level row must read as a move to zero — the previous side has
+    /// a real baseline, not 比較不能.
+    fn kind_gone_store() -> Store {
+        let mut store = Store::in_memory().unwrap();
+        let mut past = trend_session("past");
+        past.start = Some(SessionStart {
+            timestamp_ms: 1_500 * 1000,
+            ctx: 9_000,
+        });
+        store
+            .ingest(IngestBatch::new(&past, &[], &[]).work_events(&[(
+                1_900_000,
+                "web_fetch",
+                "docs",
+                None,
+            )]))
+            .unwrap();
+        let mut present = trend_session("present");
+        present.start = Some(SessionStart {
+            timestamp_ms: 2_500 * 1000,
+            ctx: 10_000,
+        });
+        store
+            .ingest(IngestBatch::new(&present, &[], &[]).work_events(&[(
+                2_600_000,
+                "file_edit",
+                "main.rs",
+                None,
+            )]))
+            .unwrap();
+        store
+    }
+
+    /// One session declared in the previous window whose events happen in the
+    /// current one: totals follow the stamped start, events split by epoch —
+    /// the two axes never merge.
+    fn straddling_store() -> Store {
+        let mut store = Store::in_memory().unwrap();
+        let mut meta = trend_session("straddle");
+        meta.start = Some(SessionStart {
+            timestamp_ms: 1_500 * 1000,
+            ctx: 9_000,
+        });
+        meta.sub_tokens = 100;
+        meta.sub_agent_count = 1;
+        let spans = [trend_span("commit", 2_500, 300)];
+        store
+            .ingest(IngestBatch::new(&meta, &spans, &[]).work_events(&[(
+                2_600_000,
+                "file_edit",
+                "main.rs",
+                None,
+            )]))
             .unwrap();
         store
     }
@@ -4419,5 +4502,69 @@ mod tests {
         };
         trend(&empty, trend_pair(), Format::Table).unwrap();
         trend(&empty, trend_pair(), Format::Json).unwrap();
+    }
+
+    #[test]
+    fn trend_kind_rows_read_a_gone_kind_as_a_move_to_zero() {
+        // The skill-level path is covered above; this pins the kind-row path:
+        // a kind present only in the PREVIOUS window has a real baseline, so
+        // it reads as a move to zero — down, with a negative delta.
+        let agg = kind_gone_store().trend_aggregates(trend_pair()).unwrap();
+        let rows = trend_kind_rows(&agg);
+        let gone = rows
+            .iter()
+            .find(|r| r[0] == "web_fetch" && r[1] == "events")
+            .expect("the previous window's kind still shows");
+        assert_eq!(gone[2], "1", "the previous side has a baseline: {rows:?}");
+        assert_eq!(gone[3], "0");
+        assert_eq!(gone[4], "-1", "a negative delta: {rows:?}");
+        assert_eq!(gone[5], "down");
+    }
+
+    #[test]
+    fn trend_splits_a_straddling_session_across_the_two_axes() {
+        // One session started in the previous window whose events happen in
+        // the current one: totals follow the sessions axis (started_at), the
+        // events follow their own epochs — the axes never merge.
+        let agg = straddling_store().trend_aggregates(trend_pair()).unwrap();
+
+        let rows = trend_total_rows(&agg);
+        let sessions = rows.iter().find(|r| r[0] == "sessions").unwrap();
+        assert_eq!(sessions[1], "1", "started_at is in the previous window");
+        assert_eq!(sessions[2], "0");
+        assert_eq!(sessions[3], "-1");
+        assert_eq!(sessions[4], "down");
+        let runs = rows.iter().find(|r| r[0] == "subagent runs").unwrap();
+        assert_eq!((runs[1].as_str(), runs[2].as_str()), ("1", "0"));
+        let tokens = rows.iter().find(|r| r[0] == "subagent tokens").unwrap();
+        assert_eq!((tokens[1].as_str(), tokens[3].as_str()), ("100", "-100"));
+
+        // Events split by epoch: the span and the work event happened in the
+        // current window, so the previous side of those rows is empty
+        // (比較不能) — and the session_start event rides its own epoch, the
+        // stamped start in the previous window.
+        let kind_rows = trend_kind_rows(&agg);
+        let span = kind_rows
+            .iter()
+            .find(|r| r[0] == "skill_invocation" && r[1] == "events")
+            .unwrap();
+        assert_eq!(span[2], "0");
+        assert_eq!(span[3], "1");
+        assert_eq!(span[4], "n/a");
+        let edit = kind_rows
+            .iter()
+            .find(|r| r[0] == "file_edit" && r[1] == "events")
+            .unwrap();
+        assert_eq!(edit[2], "0");
+        assert_eq!(edit[3], "1");
+        assert_eq!(edit[4], "n/a");
+        let started = kind_rows
+            .iter()
+            .find(|r| r[0] == "session_start" && r[1] == "events")
+            .unwrap();
+        assert_eq!(started[2], "1", "the start event rides started_at");
+        assert_eq!(started[3], "0");
+        assert_eq!(started[4], "-1");
+        assert_eq!(started[5], "down");
     }
 }
