@@ -44,22 +44,22 @@ Scenario: フラグ無しの出力は現行と同一
 ```
 
 ## 受け入れ基準
-- [ ] 8 つのレポートビュー（usage / inventory / waste / overhead / prompts /
+- [x] 8 つのレポートビュー（usage / inventory / waste / overhead / prompts /
   failures / stuck / doctor）に `--since` / `--until` / `--last` が付き、集計が
   期間に絞られる
-- [ ] `sql` / `analyze` / `optimize` は変更しない（sql は生 SQL が脱出ハッチ、
+- [x] `sql` / `analyze` / `optimize` は変更しない（sql は生 SQL が脱出ハッチ、
   analyze は全歴史を取り込む、optimize は別節の命令）
-- [ ] `--last` は `<N>d` / `<N>h` / `<N>w` を受け付け、now からのローリング
+- [x] `--last` は `<N>d` / `<N>h` / `<N>w` を受け付け、now からのローリング
   ウィンドウを意味し、`--since` / `--until` と排他（clap conflict）
-- [ ] `--until` は指定日の一日いっぱいまで含む（inclusive）。日付は既定の
+- [x] `--until` は指定日の一日いっぱいまで含む（inclusive）。日付は既定の
   提示タイムゾーン（JST、bucket.rs と同じ規約）で解釈し、比較は UTC エポック
-- [ ] ウィンドウ指定時、レポートは評価ウィンドウを明示する（freshness 行
+- [x] ウィンドウ指定時、レポートは評価ウィンドウを明示する（freshness 行
   （stderr、全形式）、framing block（table のみ）、`--format json` には
   `window` を追加。既存 JSON キーは変えない）
-- [ ] フラグ無しの各ビュー出力は変更前とバイト同一
-- [ ] `docs/specs/cli.md` の Views 配下に期間フィルタの節を追記し、
+- [x] フラグ無しの各ビュー出力は変更前とバイト同一
+- [x] `docs/specs/cli.md` の Views 配下に期間フィルタの節を追記し、
   Reporting honesty の「Unused はウィンドウを明示」契約と整合させる
-- [ ] `just check`（rustfmt + clippy -D warnings）と `cargo test` が green
+- [x] `just check`（rustfmt + clippy -D warnings）と `cargo test` が green
 
 ## テスト戦略（t_wadaスタイル）
 
@@ -132,8 +132,16 @@ grep -rn '\-\-since\|--until\|--last\|TimeRange\|period_filter' src/
   JSON は `window` を足すが既存キーは変えない
 
 ## Definition of Done
-- [ ] 全 BDD シナリオが自動テストとして実装されパスする
-- [ ] フラグ無し出力がバイト同一であることを確認
-- [ ] `just check` と `cargo test` が green
-- [ ] コードレビュー完了（task reviewer）
-- [ ] docs/specs/cli.md 更新済み
+- [x] 全 BDD シナリオが自動テストとして実装されパスする（シナリオ 1-4 は
+  e2e/統合/単体テスト、シナリオ 5 のバイト同一は ALL 委譲のバイト同一テスト
+  と手動 capture（既存手順の踏襲、最終 review が計画どおりとトリアージ）で
+  確認）
+- [x] フラグ無し出力がバイト同一であることを確認（capture 60 ファイルの
+  diff -r が 0 差分、fix 後に再確認）
+- [x] `just check` と `cargo test` が green（2026-10-30: 検証エビデンス —
+  cargo test 418 passed / clippy --all-targets --all-features -D warnings /
+  rustfmt --check。サンドボックスで just 不使用のため各コマンドを直接実行）
+- [x] コードレビュー完了（task reviewer: Spec ✅ / Approved。最終 review
+  With fixes → fix 5 コミット → re-review Approved）
+- [x] docs/specs/cli.md 更新済み（Views 配下に Period 節、Reporting honesty
+  の契約と整合）
