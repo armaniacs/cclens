@@ -17,7 +17,7 @@ pub struct TimeRange {
 
 impl TimeRange {
     /// Every event — the flags-absent default, which must not change a
-    /// query's text or a view's output by a byte.
+    /// query's results or a view's output.
     pub const ALL: Self = Self {
         start: None,
         end: None,
