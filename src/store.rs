@@ -3453,4 +3453,59 @@ mod tests {
         assert_eq!(store.error_counts(TimeRange::ALL).unwrap().len(), 1);
         assert_eq!(store.file_edits(TimeRange::ALL).unwrap().len(), 2);
     }
+
+    #[test]
+    fn a_range_narrows_error_examples_and_keeps_the_cap_binds_last() {
+        // The anonymous-placeholder trick is textual-order-sensitive: the
+        // range binds first (the filter sits before the per-group cap), the
+        // cap last. A windowed test pins that a refactor moving the filter
+        // cannot silently truncate the examples.
+        let mut store = Store::in_memory().unwrap();
+        let mut s1 = session("s1");
+        s1.start = Some(SessionStart {
+            timestamp_ms: 500_000,
+            ctx: 1_000,
+        });
+        let errors = [
+            (1_000_000, "path-not-found", "no /a", "Read", "/a"),
+            (1_100_000, "path-not-found", "no /b", "Read", "/b"),
+            (1_200_000, "path-not-found", "no /c", "Read", "/c"),
+            (2_000_000, "timeout", "timed out", "Bash", "cmd"),
+            (9_000_000, "path-not-found", "no /late", "Read", "/late"),
+        ];
+        store
+            .ingest(IngestBatch::new(&s1, &[], &[]).tool_errors(&errors))
+            .unwrap();
+
+        // A window that keeps only the timeout: the past-`--until` example
+        // and the pre-`--since` ones drop out.
+        let range = TimeRange {
+            start: Some(1_500),
+            end: Some(2_500),
+        };
+        assert_eq!(
+            store.error_examples(2, range).unwrap(),
+            vec![(
+                "demo".to_string(),
+                "timeout".to_string(),
+                "timed out".to_string()
+            )]
+        );
+
+        // The cap binds last: three in-group examples, per_group 2, keeps the
+        // two earliest — the past-`--until` one never sneaks in.
+        let range = TimeRange {
+            start: Some(900),
+            end: Some(1_500),
+        };
+        let examples = store.error_examples(2, range).unwrap();
+        assert_eq!(examples.len(), 2);
+        assert_eq!(examples[0].2, "no /a");
+        assert_eq!(examples[1].2, "no /b");
+
+        // Unbounded, every example comes back — the cap still applied per
+        // group.
+        assert_eq!(store.error_examples(2, TimeRange::ALL).unwrap().len(), 3);
+        assert_eq!(store.error_examples(10, TimeRange::ALL).unwrap().len(), 5);
+    }
 }
