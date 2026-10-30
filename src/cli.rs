@@ -4154,7 +4154,7 @@ mod tests {
         // fail as period errors — non-zero, before any store work or
         // freshness line. The clock is read inside parse_pair; none of the
         // errors depend on it.
-        let cases: [(&[&str], &str); 3] = [
+        let cases: [(&[&str], &str); 4] = [
             (
                 &["saniwalens", "trend", "--since", "2026/10/01"],
                 "invalid --since '2026/10/01'",
@@ -4173,6 +4173,13 @@ mod tests {
                     "2026-10-01",
                 ],
                 "empty window: --since 2026-10-07 is after --until 2026-10-01",
+            ),
+            // The span parses (it fits i64) but its doubled window does not —
+            // the pair resolution's overflow guard must reject it as the
+            // invalid-span error, not panic.
+            (
+                &["saniwalens", "trend", "--last", "92233720368547d"],
+                "invalid --last '92233720368547d'",
             ),
         ];
         for (args, expected) in cases {

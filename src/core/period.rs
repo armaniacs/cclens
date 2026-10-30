@@ -124,13 +124,19 @@ pub fn resolve_pair(
         // moved one second in — so the previous window, the same length
         // ending one second earlier, shares no event with it.
         let start = resolved.start.expect("a rolling window has a start") + 1;
+        // A span whose doubled window leaves i64 has no previous window to
+        // name — the same invalid-span error as every other bad `--last`,
+        // not an overflow panic or a wrapped-into-n/a window.
+        let previous_start = start
+            .checked_sub(secs)
+            .ok_or_else(|| invalid_span_error(span))?;
         return Ok(WindowPair {
             current: TimeRange {
                 start: Some(start),
                 end: Some(now),
             },
             previous: TimeRange {
-                start: Some(start - secs),
+                start: Some(previous_start),
                 end: Some(start - 1),
             },
         });
@@ -148,6 +154,9 @@ pub fn resolve_pair(
         return Err(format!("empty window: --since {since} is after now"));
     }
     let length = end - start + 1;
+    // `start` and `length` are date-derived — `--since`/`--until` parse as
+    // NaiveDate, bounded to the calendar's range — so this subtraction cannot
+    // leave i64 the way a huge `--last` span's doubled window can.
     Ok(WindowPair {
         current,
         previous: TimeRange {
@@ -177,12 +186,17 @@ fn day_start_epoch(value: &str, flag: &str, tz_offset_secs: i32) -> Result<i64, 
 }
 
 /// The seconds in a `<N>d | <N>h | <N>w` rolling window.
+/// The invalid-`--last` error — shared by `span_secs` and the pair
+/// resolution, so a span with no derivable previous window fails the same way
+/// a span that cannot be parsed does.
+fn invalid_span_error(value: &str) -> String {
+    format!(
+        "invalid --last '{value}' — expected <N>d | <N>h | <N>w with a positive N (e.g. 7d, 24h, 2w)"
+    )
+}
+
 fn span_secs(value: &str) -> Result<i64, String> {
-    let invalid = || {
-        format!(
-            "invalid --last '{value}' — expected <N>d | <N>h | <N>w with a positive N (e.g. 7d, 24h, 2w)"
-        )
-    };
+    let invalid = || invalid_span_error(value);
     let mut chars = value.chars();
     let unit = chars.next_back().ok_or_else(invalid)?;
     let n: i64 = chars.as_str().parse().map_err(|_| invalid())?;
@@ -506,5 +520,16 @@ mod tests {
         assert!(resolve_pair(Some("2026/10/01"), None, None).is_err());
         assert!(resolve_pair(Some("2026-10-01"), Some("2026/10/07"), None).is_err());
         assert!(resolve_pair(None, None, Some("7")).is_err());
+    }
+
+    #[test]
+    fn trend_last_beyond_the_i64_range_is_a_span_error() {
+        // `92233720368547d` parses (the span itself fits i64) but its doubled
+        // window does not: the previous window's start would leave i64. That
+        // must fail as the invalid-span error — not panic on overflow in
+        // debug, not silently wrap into an n/a previous window in release.
+        let err = resolve_pair(None, None, Some("92233720368547d")).unwrap_err();
+        assert!(err.contains("invalid --last"), "{err}");
+        assert!(err.contains("92233720368547d"), "{err}");
     }
 }
