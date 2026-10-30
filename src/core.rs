@@ -7,6 +7,7 @@ pub mod friction;
 pub mod metrics;
 pub mod optimize;
 pub mod path;
+pub mod period;
 pub mod prompt;
 pub mod scope;
 pub mod span;
