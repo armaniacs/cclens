@@ -190,6 +190,10 @@ the agent cost last week" is a view flag, not a `sql` query. The other commands
 - The catalog half of `inventory` is current config, so it is not windowed by
   time — its **usage half** is. An unused row under a window says
   `UNUSED (window)` / `"unused-in-window"`, never plain "unused".
+- Sessions the writer could not stamp (no observable start, empty
+  `started_at`) are **excluded** from a windowed `session_stats` /
+  `subagent_totals` figure (`store.rs`'s `<> ''` guard) rather than guessed
+  into it; without the flags they still count.
 
 ## Time bucketing
 
