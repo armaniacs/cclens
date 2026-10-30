@@ -39,27 +39,36 @@ Scenario: until だけの指定はエラーになる
 ```
 
 ## 受け入れ基準
-- [ ] 新ビュー `trend` が現在ウィンドウとその直前の同長ウィンドウを比較する。
+- [x] 新ビュー `trend` が現在ウィンドウとその直前の同長ウィンドウを比較する。
   既定は直近 7 日 vs その前の 7 日。`--last <N>d|h|w` で長さを、
   `--since`（+ 任意の `--until`）で現在ウィンドウを指定できる。
-  `--until` 単独はエラー
-- [ ] 行: 種別ごとのイベント集計（count / out_tokens / duration の差分）、
+  `--until` 単独はエラー（`resolve_pair`、単体 9 テスト）
+- [x] 行: 種別ごとのイベント集計（count / out_tokens / duration の差分）、
   スキル別の増減（差分の大きい順）、セッション数と subagent runs/tokens の
-  合計。各行に両ウィンドウの値と差分を出す
-- [ ] 増減の向きを明示する（増えた / 減った / 同じ）。直前ウィンドウに
+  合計。各行に両ウィンドウの値と差分を出す（`trend_kind_rows` /
+  `skill_deltas` / `trend_total_rows`）
+- [x] 増減の向きを明示する（増えた / 減った / 同じ）。直前ウィンドウに
   イベントが無い場合、その比較は「比較不能」と明示され -100% と読めない
-- [ ] 2 つのウィンドウの範囲を明示する（freshness 行（stderr）、framing
+  （`direction_of` → Unavailable、表は n/a、JSON は delta null。
+  no-%/-100 を grep 確認済み）
+- [x] 2 つのウィンドウの範囲を明示する（freshness 行（stderr）、framing
   block（table のみ）、`--format json` に `window`（current / previous）を追加）
-- [ ] 期間解釈は PBI 01 の規約に揃える（`YYYY-MM-DD` は JST、`--until` は
-  inclusive、`since > until` はエラー、`--last` は now 起点のローリング）
-- [ ] `--format table|markdown|json` / `--frozen` / `--db` を他のビューと
-  同様に持つ。freshness（自動 refresh）の慣例に従う
-- [ ] 既存 8 ビューと `sql` / `analyze` / `optimize` の出力は一切変わらない
-  （新コマンドは追加のみ）
-- [ ] `docs/specs/cli.md` の Views 表に `trend` の行を追記し、Period 節との
+- [x] 期間解釈は PBI 01 の規約に揃える（`YYYY-MM-DD` は JST、`--until` は
+  inclusive、`since > until` はエラー、`--last` は now 起点のローリング。
+  巨大 `--last` の checked_sub ガード込み）
+- [x] `--format table|markdown|json` / `--frozen` / `--db` を他のビューと
+  同様に持つ。freshness（自動 refresh）の慣例に従う（clap conflicts
+  テスト込み）
+- [x] 既存 8 ビューと `sql` / `analyze` / `optimize` の出力は一切変わらない
+  （新コマンドは追加のみ。capture 20 実行の diff -r が 0 差分、fix 後に
+  再確認）
+- [x] `docs/specs/cli.md` の Views 表に `trend` の行を追記し、Period 節との
   関係（比較対象の 2 ウィンドウ）を書く。`docs/specs/storage.md` は変更しない
   （カタログ履歴は別候補）
-- [ ] `just check`（各コマンド直接実行）と `cargo test` が green
+- [x] `just check`（= fmt + clippy）と `cargo test` が green（2026-10-31:
+  検証エビデンス — cargo test 443 passed / clippy --all-targets
+  --all-features -D warnings / rustfmt --check。直接実行は capture
+  スクリプト（20 実行）でカバー）
 
 ## テスト戦略（t_wadaスタイル）
 
@@ -127,8 +136,16 @@ Scenario: until だけの指定はエラーになる
   セッション数を出すなら PBI 01 のテスト規約に揃える
 
 ## Definition of Done
-- [ ] 全 BDD シナリオが自動テストとして実装されパスする
-- [ ] 既存ビュー・コマンドの出力が一切変わらないことを確認
-- [ ] `just check`（直接実行）と `cargo test` が green
-- [ ] コードレビュー完了（task reviewer）
-- [ ] docs/specs/cli.md 更新済み
+- [x] 全 BDD シナリオが自動テストとして実装されパスする（シナリオ 1-2 は
+  e2e/統合 — `tests/trend_markdown.rs` は実バイナリ経由、シナリオ 3-4 は
+  e2e エラーパステスト（無効日付 / `--until` 単独 / since>until で
+  stderr・非ゼロ・空 stdout を確認））
+- [x] 既存ビュー・コマンドの出力が一切変わらないことを確認（capture 20 実行の
+  diff -r が 0 差分、fix 後に再確認）
+- [x] `just check`（= fmt + clippy）と `cargo test` が green（2026-10-31:
+  検証エビデンス — cargo test 443 passed / clippy --all-targets
+  --all-features -D warnings / rustfmt --check）
+- [x] コードレビュー完了（task reviewer: Approved。最終 review With fixes →
+  fix 4 コミット → re-review Approved）
+- [x] docs/specs/cli.md 更新済み（Views 表に trend 行、Period 節は 9 ビューに
+  更新、storage.md は変更なし）
