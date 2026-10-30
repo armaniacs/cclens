@@ -14,7 +14,7 @@ use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::findings;
 use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
-use crate::core::period::{self, TimeRange};
+use crate::core::period::{self, TimeRange, WindowPair};
 use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::subagent::SplitCoverage;
 use crate::core::surface::{
@@ -26,7 +26,7 @@ use crate::session::{
     AnalyzeStats, Session, SessionEnv, Style, eprint_freshness, freshness_line, guard_harness,
     resolve_cli,
 };
-use crate::store::{OpenMode, Store};
+use crate::store::{KindRollup, OpenMode, Store, TrendWindowAggregates, TwoWindow, skill_deltas};
 
 #[derive(Parser)]
 #[command(
@@ -90,6 +90,32 @@ enum Command {
         #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
         last: Option<String>,
         /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
+        /// Store path (default: $XDG_STATE_HOME/saniwalens/saniwalens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// How usage moved: each kind of event, each skill, and the session and
+    /// subagent totals this window against the equal-length window right
+    /// before it (default 7d vs the 7d before).
+    Trend {
+        /// Current window start (YYYY-MM-DD, JST). The window to compare it
+        /// with is the same length immediately before it.
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Current window end (YYYY-MM-DD, JST) — the whole day counts.
+        /// Needs --since; alone, the window to compare against is undefined.
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// Rolling pair ending now: <N>d | <N>h | <N>w (e.g. 7d). Exclusive
+        /// with the explicit dates.
+        #[arg(long, value_name = "SPAN", conflicts_with_all = ["since", "until"])]
+        last: Option<String>,
+        /// Output format: table | markdown | json.
         #[arg(long)]
         format: Option<String>,
         /// Read the store as-is; skip the automatic refresh.
@@ -378,6 +404,29 @@ pub fn run() -> Result<()> {
                 run_analyze,
             )?;
             usage(&sess, by.as_deref(), window, fmt)
+        }
+        Command::Trend {
+            since,
+            until,
+            last,
+            format,
+            frozen,
+            db,
+        } => {
+            let fmt = parse_format(format.as_deref())?;
+            // The pair resolves before the session opens — the same
+            // ahead-of-store evaluation `parse_period` gives the other views,
+            // so a bad date fails as a period error before any store work.
+            let pair = parse_pair(since.as_deref(), until.as_deref(), last.as_deref())?;
+            let sess = Session::open_read(
+                &harness,
+                db,
+                config_db.as_deref(),
+                frozen,
+                &env,
+                run_analyze,
+            )?;
+            trend(&sess, pair, fmt)
         }
         Command::Inventory {
             scope,
@@ -1576,6 +1625,17 @@ fn parse_period(since: Option<&str>, until: Option<&str>, last: Option<&str>) ->
     period::resolve(since, until, last, now, JST_OFFSET_SECS).map_err(anyhow::Error::msg)
 }
 
+/// Resolve the trend's period flags into the two comparison windows before
+/// the session is built — the same ahead-of-store evaluation `parse_period`
+/// gives the other views, so an unparseable date, a `--until` without a
+/// `--since`, or an inverted window fails as a period error before any store
+/// work or freshness line. The clock is read here: the thin shell around the
+/// pure transform in `core::period`.
+fn parse_pair(since: Option<&str>, until: Option<&str>, last: Option<&str>) -> Result<WindowPair> {
+    let now = chrono::Utc::now().timestamp();
+    period::resolve_pair(since, until, last, now, JST_OFFSET_SECS).map_err(anyhow::Error::msg)
+}
+
 /// The evaluation-window disclosure — stderr (every format) and the framing
 /// block's last line (table only) render it. `None` without the period flags,
 /// which is what keeps every existing output byte-identical.
@@ -1644,6 +1704,389 @@ fn unused_label(window: TimeRange) -> &'static str {
         true => "UNUSED",
         false => "UNUSED (window)",
     }
+}
+
+/// One direction of a two-window comparison. `Unavailable` is 比較不能: the
+/// previous side holds no events, so there is nothing to compare against —
+/// labeled, never read as a drop to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Up,
+    Down,
+    Same,
+    Unavailable,
+}
+
+impl Direction {
+    /// The terse table label.
+    fn label(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+            Direction::Same => "same",
+            Direction::Unavailable => "n/a",
+        }
+    }
+
+    /// The JSON direction value — explicit where the table is terse.
+    fn json_value(self) -> &'static str {
+        match self {
+            Direction::Unavailable => "unavailable",
+            other => other.label(),
+        }
+    }
+}
+
+/// Which way a metric moved between the two windows. An empty previous side
+/// (0 events) is 比較不能 — the store holds no baseline for the row, so no
+/// direction is claimed whatever the current value is; a delta against an
+/// empty side is a coverage fact, not a move.
+fn direction_of<T: PartialOrd + Default>(previous: T, current: T) -> Direction {
+    if previous == T::default() {
+        return Direction::Unavailable;
+    }
+    match current.partial_cmp(&previous) {
+        Some(std::cmp::Ordering::Greater) => Direction::Up,
+        Some(std::cmp::Ordering::Less) => Direction::Down,
+        _ => Direction::Same,
+    }
+}
+
+/// One integer metric's JSON cell: both windows' values, the delta, and the
+/// direction — with the delta null when the previous side is empty, so no
+/// change is claimed for a comparison that cannot be made.
+fn metric_json_int(previous: i64, current: i64) -> serde_json::Value {
+    let direction = direction_of(previous, current);
+    let delta = match direction {
+        Direction::Unavailable => serde_json::Value::Null,
+        _ => serde_json::json!(current - previous),
+    };
+    serde_json::json!({
+        "previous": previous,
+        "current": current,
+        "delta": delta,
+        "direction": direction.json_value(),
+    })
+}
+
+/// One float metric's JSON cell — the duration form of [`metric_json_int`].
+fn metric_json_float(previous: f64, current: f64) -> serde_json::Value {
+    let direction = direction_of(previous, current);
+    let delta = match direction {
+        Direction::Unavailable => serde_json::Value::Null,
+        _ => serde_json::json!(current - previous),
+    };
+    serde_json::json!({
+        "previous": previous,
+        "current": current,
+        "delta": delta,
+        "direction": direction.json_value(),
+    })
+}
+
+/// The two windows' per-kind rollups paired by kind — a kind present in only
+/// one window keeps None on the other side, which reads downstream as an
+/// empty (0-event) side. Sorted by kind, the aggregation's own order.
+fn kind_pairs(
+    agg: &TwoWindow<TrendWindowAggregates>,
+) -> Vec<(String, Option<KindRollup>, Option<KindRollup>)> {
+    let mut pairs: std::collections::BTreeMap<String, (Option<KindRollup>, Option<KindRollup>)> =
+        std::collections::BTreeMap::new();
+    for rollup in &agg.current.by_kind {
+        pairs.entry(rollup.kind.clone()).or_default().0 = Some(rollup.clone());
+    }
+    for rollup in &agg.previous.by_kind {
+        pairs.entry(rollup.kind.clone()).or_default().1 = Some(rollup.clone());
+    }
+    pairs
+        .into_iter()
+        .map(|(kind, (current, previous))| (kind, current, previous))
+        .collect()
+}
+
+/// The trend's JSON contract: both windows' ranges under `window`, the
+/// per-kind rows, the skill deltas, and the session/subagent totals — every
+/// metric carrying both windows' values, the delta, and the direction.
+fn trend_json(pair: WindowPair, agg: &TwoWindow<TrendWindowAggregates>) -> serde_json::Value {
+    let (current_since, current_until) = period::bounds(pair.current, JST_OFFSET_SECS);
+    let (previous_since, previous_until) = period::bounds(pair.previous, JST_OFFSET_SECS);
+    let kinds: Vec<serde_json::Value> = kind_pairs(agg)
+        .into_iter()
+        .map(|(kind, current, previous)| {
+            let (c, p) = (current.as_ref(), previous.as_ref());
+            serde_json::json!({
+                "kind": kind,
+                "events": metric_json_int(
+                    p.map_or(0, |r| r.events),
+                    c.map_or(0, |r| r.events),
+                ),
+                "out_tokens": metric_json_int(
+                    p.map_or(0, |r| r.out_tokens),
+                    c.map_or(0, |r| r.out_tokens),
+                ),
+                "duration_sec": metric_json_float(
+                    p.map_or(0.0, |r| r.duration_sec),
+                    c.map_or(0.0, |r| r.duration_sec),
+                ),
+            })
+        })
+        .collect();
+    let skills: Vec<serde_json::Value> = skill_deltas(&agg.current.skills, &agg.previous.skills)
+        .iter()
+        .map(|d| {
+            let direction = direction_of(d.previous, d.current);
+            let delta = match direction {
+                Direction::Unavailable => serde_json::Value::Null,
+                _ => serde_json::json!(d.delta),
+            };
+            serde_json::json!({
+                "skill": d.skill,
+                "previous": d.previous,
+                "current": d.current,
+                "delta": delta,
+                "direction": direction.json_value(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "window": {
+            "current": { "since": current_since, "until": current_until },
+            "previous": { "since": previous_since, "until": previous_until },
+        },
+        "kinds": kinds,
+        "skills": skills,
+        "sessions": metric_json_int(agg.previous.sessions, agg.current.sessions),
+        "subagent_runs": metric_json_int(
+            agg.previous.subagent_runs,
+            agg.current.subagent_runs,
+        ),
+        "sub_tokens": metric_json_int(agg.previous.sub_tokens, agg.current.sub_tokens),
+    })
+}
+
+/// A table cell pair for an integer metric: the signed delta and the
+/// direction — both n/a when the previous side is empty.
+fn delta_cells_int(previous: i64, current: i64) -> (String, String) {
+    match direction_of(previous, current) {
+        Direction::Unavailable => ("n/a".to_string(), "n/a".to_string()),
+        direction => (
+            format!("{:+}", current - previous),
+            direction.label().to_string(),
+        ),
+    }
+}
+
+/// A table cell pair for a float metric — the duration form of
+/// [`delta_cells_int`].
+fn delta_cells_float(previous: f64, current: f64) -> (String, String) {
+    match direction_of(previous, current) {
+        Direction::Unavailable => ("n/a".to_string(), "n/a".to_string()),
+        direction => (
+            format!("{:+.1}", current - previous),
+            direction.label().to_string(),
+        ),
+    }
+}
+
+/// The per-kind section's rows: one row per kind and metric (events, output
+/// tokens, seconds), so each row carries one comparison and one direction.
+/// Both windows' values keep their columns even when the comparison is n/a.
+fn trend_kind_rows(agg: &TwoWindow<TrendWindowAggregates>) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for (kind, current, previous) in kind_pairs(agg) {
+        let (c, p) = (current.as_ref(), previous.as_ref());
+        let (p_events, c_events) = (p.map_or(0, |r| r.events), c.map_or(0, |r| r.events));
+        let (p_tokens, c_tokens) = (p.map_or(0, |r| r.out_tokens), c.map_or(0, |r| r.out_tokens));
+        let (p_secs, c_secs) = (
+            p.map_or(0.0, |r| r.duration_sec),
+            c.map_or(0.0, |r| r.duration_sec),
+        );
+        let (delta, direction) = delta_cells_int(p_events, c_events);
+        rows.push(vec![
+            kind.clone(),
+            "events".to_string(),
+            p_events.to_string(),
+            c_events.to_string(),
+            delta,
+            direction,
+        ]);
+        let (delta, direction) = delta_cells_int(p_tokens, c_tokens);
+        rows.push(vec![
+            kind.clone(),
+            "out tokens".to_string(),
+            p_tokens.to_string(),
+            c_tokens.to_string(),
+            delta,
+            direction,
+        ]);
+        let (delta, direction) = delta_cells_float(p_secs, c_secs);
+        rows.push(vec![
+            kind,
+            "seconds".to_string(),
+            format!("{p_secs:.1}"),
+            format!("{c_secs:.1}"),
+            delta,
+            direction,
+        ]);
+    }
+    rows
+}
+
+/// The skill section's rows: `skill_deltas`' order (largest movement first),
+/// one row per skill with both windows' invocation counts.
+fn trend_skill_rows(agg: &TwoWindow<TrendWindowAggregates>) -> Vec<Vec<String>> {
+    skill_deltas(&agg.current.skills, &agg.previous.skills)
+        .iter()
+        .map(|d| {
+            let (delta, direction) = delta_cells_int(d.previous, d.current);
+            vec![
+                d.skill.clone(),
+                d.previous.to_string(),
+                d.current.to_string(),
+                delta,
+                direction,
+            ]
+        })
+        .collect()
+}
+
+/// The totals section's rows: sessions, subagent runs, and subagent tokens
+/// along the sessions axis.
+fn trend_total_rows(agg: &TwoWindow<TrendWindowAggregates>) -> Vec<Vec<String>> {
+    [
+        ("sessions", agg.previous.sessions, agg.current.sessions),
+        (
+            "subagent runs",
+            agg.previous.subagent_runs,
+            agg.current.subagent_runs,
+        ),
+        (
+            "subagent tokens",
+            agg.previous.sub_tokens,
+            agg.current.sub_tokens,
+        ),
+    ]
+    .into_iter()
+    .map(|(label, previous, current)| {
+        let (delta, direction) = delta_cells_int(previous, current);
+        vec![
+            label.to_string(),
+            previous.to_string(),
+            current.to_string(),
+            delta,
+            direction,
+        ]
+    })
+    .collect()
+}
+
+/// The trend preamble's text: what the report compares and how to read an
+/// n/a, plus the previous window's range — the current one comes from
+/// `framed`. Table format only.
+fn trend_preamble(pair: WindowPair) -> String {
+    format!(
+        "Usage trend — this window against the equal-length window right before it.\n\
+         A delta marked n/a: the previous side holds no events, so the comparison is\n\
+         unavailable — not a drop. previous window: {}",
+        period::display(pair.previous, JST_OFFSET_SECS)
+    )
+}
+
+/// The trend's two-window disclosure — stderr beside the freshness line,
+/// every format, so piped stdout and `--format json` stay clean.
+fn eprint_trend_windows(pair: WindowPair) {
+    let line = format!(
+        "trend windows: current {} | previous {}",
+        period::display(pair.current, JST_OFFSET_SECS),
+        period::display(pair.previous, JST_OFFSET_SECS),
+    );
+    eprintln!("{}", Style::stderr().dim(&line));
+}
+
+/// A section label between a trend report's tables — printed in table and
+/// markdown alike, so pasted tables keep their reading order.
+fn trend_section(label: &str) {
+    println!("\n{label}");
+}
+
+/// The usage trend: what each kind of event, each skill, and the session and
+/// subagent totals did this window against the equal-length window right
+/// before it. The pair is resolved before the store opens (`parse_pair`), so
+/// a bad date fails like every other period error, and the store's numbers
+/// are the same windowed queries the single-window views read.
+fn trend(sess: &Session, pair: WindowPair, format: Format) -> Result<()> {
+    let store = &sess.store;
+    eprint_trend_windows(pair);
+    let agg = store.trend_aggregates(pair)?;
+    if format == Format::Json {
+        return emit_json(&trend_json(pair, &agg));
+    }
+    // Nothing in either window *and* no session on either axis: the store
+    // holds nothing to compare — unlike an empty previous window, this is
+    // the analyze hint's case.
+    if agg.current.by_kind.is_empty()
+        && agg.previous.by_kind.is_empty()
+        && agg.current.sessions == 0
+        && agg.previous.sessions == 0
+    {
+        println!("no usage in either comparison window — run `saniwalens analyze` first");
+        return Ok(());
+    }
+    preamble(format, &framed(&trend_preamble(pair), pair.current));
+    render(
+        &[
+            "kind",
+            "metric",
+            "previous",
+            "current",
+            "delta",
+            "direction",
+        ],
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+        ],
+        &trend_kind_rows(&agg),
+        format,
+    );
+    trend_section("Skills (largest movement first):");
+    render(
+        &["skill", "previous", "current", "delta", "direction"],
+        &[
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+        ],
+        &trend_skill_rows(&agg),
+        format,
+    );
+    trend_section("Totals:");
+    render(
+        &["total", "previous", "current", "delta", "direction"],
+        &[
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+        ],
+        &trend_total_rows(&agg),
+        format,
+    );
+    if agg.previous.by_kind.is_empty() {
+        note(&format!(
+            "the previous window ({}) holds no events in this store — comparisons\n\
+             marked n/a have nothing to compare against, so no change is claimed for them",
+            period::display(pair.previous, JST_OFFSET_SECS)
+        ));
+    }
+    Ok(())
 }
 
 /// Shorten an absolute path under the home directory to `~/…` for display.
@@ -3392,9 +3835,10 @@ mod tests {
 
     #[test]
     fn the_period_flags_parse_on_every_report_view() {
-        // The flags exist on all eight views and nothing else.
+        // The flags exist on all nine views and nothing else.
         let views = [
             vec!["usage"],
+            vec!["trend"],
             vec!["inventory"],
             vec!["waste"],
             vec!["overhead"],
@@ -3525,5 +3969,399 @@ mod tests {
             "no data in the evaluation window"
         );
         assert_eq!(unused_label(window), "UNUSED (window)");
+    }
+
+    // ---- PBI 2026-10-30-02 part 2: the trend view's CLI wiring ----
+
+    use crate::core::period::WindowPair;
+    use crate::core::span::{SessionStart, Source, Span};
+    use crate::store::{IngestBatch, SessionMeta};
+
+    fn trend_session(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            project: "demo".to_string(),
+            slug: "demo".to_string(),
+            root: String::new(),
+            source_path: format!("/tmp/{id}.jsonl"),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            start: None,
+        }
+    }
+
+    fn trend_span(skill: &str, epoch_secs: i64, out_tokens: u64) -> Span {
+        Span {
+            skill: skill.to_string(),
+            source: Source::Slash,
+            started_epoch_ms: epoch_secs * 1000,
+            duration_sec: 2.0,
+            out_tokens,
+            ctx_growth: 5,
+            ctx_start: 0,
+            ctx_peak: 5,
+            model: None,
+            is_trailing: false,
+            spawns: Vec::new(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            sub_tokens_estimated: false,
+        }
+    }
+
+    /// Usage in both comparison windows: previous [1_000, 2_000] (two skill
+    /// spans, one file_edit), current [2_001, 3_000] (one skill span, one
+    /// file_edit). Each window's spans ride its own session — the stamped
+    /// start is the earliest of the declared start and the spans, so a
+    /// session's own spans must not reach into the other window.
+    fn two_window_store() -> Store {
+        let mut store = Store::in_memory().unwrap();
+        let mut past = trend_session("past");
+        past.start = Some(SessionStart {
+            timestamp_ms: 1_500 * 1000,
+            ctx: 9_000,
+        });
+        past.sub_tokens = 400;
+        past.sub_agent_count = 1;
+        let past_spans = [
+            trend_span("commit", 1_500, 100),
+            trend_span("review", 1_800, 50),
+        ];
+        store
+            .ingest(IngestBatch::new(&past, &past_spans, &[]).work_events(&[(
+                1_900_000,
+                "file_edit",
+                "main.rs",
+                None,
+            )]))
+            .unwrap();
+
+        let mut present = trend_session("present");
+        present.start = Some(SessionStart {
+            timestamp_ms: 2_500 * 1000,
+            ctx: 10_000,
+        });
+        present.sub_tokens = 500;
+        present.sub_agent_count = 2;
+        let present_spans = [trend_span("commit", 2_500, 300)];
+        store
+            .ingest(
+                IngestBatch::new(&present, &present_spans, &[]).work_events(&[(
+                    2_600_000,
+                    "file_edit",
+                    "main.rs",
+                    None,
+                )]),
+            )
+            .unwrap();
+        store
+    }
+
+    /// A store with usage only in the current window: the previous side of
+    /// every comparison is empty.
+    fn one_sided_store() -> Store {
+        let mut store = Store::in_memory().unwrap();
+        let mut present = trend_session("present");
+        present.start = Some(SessionStart {
+            timestamp_ms: 2_500 * 1000,
+            ctx: 10_000,
+        });
+        present.sub_tokens = 500;
+        present.sub_agent_count = 2;
+        let present_spans = [trend_span("commit", 2_500, 300)];
+        store
+            .ingest(
+                IngestBatch::new(&present, &present_spans, &[]).work_events(&[(
+                    2_600_000,
+                    "file_edit",
+                    "main.rs",
+                    None,
+                )]),
+            )
+            .unwrap();
+        store
+    }
+
+    fn trend_pair() -> WindowPair {
+        WindowPair {
+            current: TimeRange {
+                start: Some(2_001),
+                end: Some(3_000),
+            },
+            previous: TimeRange {
+                start: Some(1_000),
+                end: Some(2_000),
+            },
+        }
+    }
+
+    #[test]
+    fn the_trend_direction_judgment() {
+        use Direction::{Down, Same, Unavailable, Up};
+        assert_eq!(direction_of(3.0, 5.0), Up);
+        assert_eq!(direction_of(5.0, 3.0), Down);
+        assert_eq!(direction_of(5.0, 5.0), Same);
+        // An empty previous side is 比較不能: the comparison is unavailable
+        // whatever the current value is — never a -100% drop to zero.
+        assert_eq!(direction_of(0.0, 5.0), Unavailable);
+        assert_eq!(direction_of(0.0, 0.0), Unavailable);
+        // Integer sides share the judgment.
+        assert_eq!(direction_of(4, 1), Down);
+        assert_eq!(direction_of(1, 4), Up);
+        assert_eq!(direction_of(7, 7), Same);
+        assert_eq!(direction_of(0, 7), Unavailable);
+    }
+
+    #[test]
+    fn trend_resolves_a_rolling_pair_through_the_flag_surface() {
+        // No flags: 7d against the 7d right before it, the two tiling the
+        // timeline with no shared second.
+        let cli = Cli::try_parse_from(["saniwalens", "trend"]).unwrap();
+        let Command::Trend {
+            since, until, last, ..
+        } = cli.command
+        else {
+            panic!("expected the trend command");
+        };
+        let pair = parse_pair(since.as_deref(), until.as_deref(), last.as_deref()).unwrap();
+        let day = 86_400;
+        assert_eq!(
+            pair.current.end.unwrap() - pair.current.start.unwrap() + 1,
+            7 * day
+        );
+        assert_eq!(
+            pair.previous.end.unwrap() - pair.previous.start.unwrap() + 1,
+            7 * day
+        );
+        assert_eq!(pair.previous.end.unwrap() + 1, pair.current.start.unwrap());
+
+        // --last 24h: the same shape at 24h (86_400 seconds).
+        let cli = Cli::try_parse_from(["saniwalens", "trend", "--last", "24h"]).unwrap();
+        let Command::Trend { last, .. } = cli.command else {
+            panic!("expected the trend command");
+        };
+        let pair = parse_pair(None, None, last.as_deref()).unwrap();
+        assert_eq!(
+            pair.current.end.unwrap() - pair.current.start.unwrap() + 1,
+            24 * 3_600
+        );
+        assert_eq!(pair.previous.end.unwrap() + 1, pair.current.start.unwrap());
+    }
+
+    #[test]
+    fn trend_period_errors_fail_before_the_store_opens() {
+        // The dispatch resolves the pair before Session::open_read, so these
+        // fail as period errors — non-zero, before any store work or
+        // freshness line. The clock is read inside parse_pair; none of the
+        // errors depend on it.
+        let cases: [(&[&str], &str); 3] = [
+            (
+                &["saniwalens", "trend", "--since", "2026/10/01"],
+                "invalid --since '2026/10/01'",
+            ),
+            (
+                &["saniwalens", "trend", "--until", "2026-10-01"],
+                "--until requires --since",
+            ),
+            (
+                &[
+                    "saniwalens",
+                    "trend",
+                    "--since",
+                    "2026-10-07",
+                    "--until",
+                    "2026-10-01",
+                ],
+                "empty window: --since 2026-10-07 is after --until 2026-10-01",
+            ),
+        ];
+        for (args, expected) in cases {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Trend {
+                since, until, last, ..
+            } = cli.command
+            else {
+                panic!("expected the trend command for {args:?}");
+            };
+            let err = parse_pair(since.as_deref(), until.as_deref(), last.as_deref())
+                .expect_err("a bad period must fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trend_json_carries_both_windows_and_their_deltas() {
+        let store = two_window_store();
+        let pair = trend_pair();
+        let agg = store.trend_aggregates(pair).unwrap();
+        let json = trend_json(pair, &agg);
+
+        // Both windows' ranges are disclosed under `window`.
+        assert_eq!(
+            json["window"]["current"]["since"],
+            "1970-01-01T09:33:21+09:00"
+        );
+        assert_eq!(
+            json["window"]["current"]["until"],
+            "1970-01-01T09:50:00+09:00"
+        );
+        assert_eq!(
+            json["window"]["previous"]["since"],
+            "1970-01-01T09:16:40+09:00"
+        );
+        assert_eq!(
+            json["window"]["previous"]["until"],
+            "1970-01-01T09:33:20+09:00"
+        );
+
+        // Per-kind rows carry both windows' values and the delta. The skill
+        // invocations went 2 -> 1 (down); their tokens 150 -> 300 (up).
+        let kinds = json["kinds"].as_array().unwrap();
+        let skill = kinds
+            .iter()
+            .find(|k| k["kind"] == "skill_invocation")
+            .unwrap();
+        assert_eq!(skill["events"]["previous"], 2);
+        assert_eq!(skill["events"]["current"], 1);
+        assert_eq!(skill["events"]["delta"], -1);
+        assert_eq!(skill["events"]["direction"], "down");
+        assert_eq!(skill["out_tokens"]["previous"], 150);
+        assert_eq!(skill["out_tokens"]["current"], 300);
+        assert_eq!(skill["out_tokens"]["delta"], 150);
+        assert_eq!(skill["out_tokens"]["direction"], "up");
+        // A kind both windows share at the same size reads as unchanged.
+        let edit = kinds.iter().find(|k| k["kind"] == "file_edit").unwrap();
+        assert_eq!(edit["events"]["previous"], 1);
+        assert_eq!(edit["events"]["current"], 1);
+        assert_eq!(edit["events"]["delta"], 0);
+        assert_eq!(edit["events"]["direction"], "same");
+
+        // Skills are ordered by movement: review (0 <- 1) before commit (1, 1).
+        let skills = json["skills"].as_array().unwrap();
+        assert_eq!(skills[0]["skill"], "review");
+        assert_eq!(skills[0]["previous"], 1);
+        assert_eq!(skills[0]["current"], 0);
+        assert_eq!(skills[0]["delta"], -1);
+        assert_eq!(skills[0]["direction"], "down");
+        assert_eq!(skills[1]["skill"], "commit");
+        assert_eq!(skills[1]["direction"], "same");
+
+        // Session and subagent totals follow the sessions axis.
+        assert_eq!(json["sessions"]["previous"], 1);
+        assert_eq!(json["sessions"]["current"], 1);
+        assert_eq!(json["sessions"]["direction"], "same");
+        assert_eq!(json["subagent_runs"]["previous"], 1);
+        assert_eq!(json["subagent_runs"]["current"], 2);
+        assert_eq!(json["subagent_runs"]["delta"], 1);
+        assert_eq!(json["subagent_runs"]["direction"], "up");
+        assert_eq!(json["sub_tokens"]["previous"], 400);
+        assert_eq!(json["sub_tokens"]["current"], 500);
+        assert_eq!(json["sub_tokens"]["delta"], 100);
+        assert_eq!(json["sub_tokens"]["direction"], "up");
+    }
+
+    #[test]
+    fn trend_marks_comparisons_unavailable_when_the_previous_window_holds_no_events() {
+        let store = one_sided_store();
+        let pair = trend_pair();
+        let agg = store.trend_aggregates(pair).unwrap();
+        let json = trend_json(pair, &agg);
+
+        // Every metric cell is labeled unavailable, with no delta claimed —
+        // the previous side is empty, not a real zero baseline.
+        for kind in json["kinds"].as_array().unwrap() {
+            for metric in ["events", "out_tokens", "duration_sec"] {
+                assert_eq!(
+                    kind[metric]["direction"], "unavailable",
+                    "unexpected direction for {} of {}",
+                    metric, kind["kind"]
+                );
+                assert_eq!(kind[metric]["delta"], serde_json::Value::Null);
+            }
+        }
+        for skill in json["skills"].as_array().unwrap() {
+            assert_eq!(skill["direction"], "unavailable");
+            assert_eq!(skill["delta"], serde_json::Value::Null);
+        }
+        for total in ["sessions", "subagent_runs", "sub_tokens"] {
+            assert_eq!(json[total]["direction"], "unavailable");
+            assert_eq!(json[total]["delta"], serde_json::Value::Null);
+        }
+
+        // And nothing in the payload reads as a drop to zero.
+        let text = serde_json::to_string(&json).unwrap();
+        assert!(!text.contains("-100%"));
+        assert!(!text.contains("dropped"));
+    }
+
+    #[test]
+    fn trend_rows_label_unavailable_comparisons_instead_of_drops() {
+        let store = one_sided_store();
+        let agg = store.trend_aggregates(trend_pair()).unwrap();
+
+        // The kind rows keep both windows' values (the previous side renders
+        // as 0) but mark the delta and direction n/a.
+        let rows = trend_kind_rows(&agg);
+        assert!(
+            rows.iter()
+                .any(|r| r[1] == "events" && r[2] == "0" && r[3] == "1"),
+            "the current window's values still show: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r[4] == "n/a" && r[5] == "n/a"),
+            "every comparison is n/a: {rows:?}"
+        );
+
+        // No percentage and no drop claim anywhere in the rendered cells.
+        let flat = rows
+            .iter()
+            .flat_map(|r| r.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!flat.contains('%'), "no percentages: {flat:?}");
+        assert!(!flat.contains("-100"), "no -100: {flat:?}");
+    }
+
+    #[test]
+    fn the_trend_preamble_discloses_both_windows() {
+        let pair = trend_pair();
+        let text = trend_preamble(pair);
+        assert!(
+            text.contains("previous window: since 1970-01-01T09:16:40+09:00"),
+            "the previous window is named in the preamble: {text:?}"
+        );
+        // framed() appends the current window — both windows end up in the
+        // table's framing block.
+        let framed_text = framed(&text, pair.current);
+        assert!(
+            framed_text.contains("report window: since 1970-01-01T09:33:21+09:00"),
+            "the current window is disclosed too: {framed_text:?}"
+        );
+    }
+
+    #[test]
+    fn trend_runs_end_to_end_against_a_session() {
+        // The full view path — including the empty store's early message —
+        // runs against a real Session without error. The payload and row
+        // structures are asserted by the tests above.
+        let two = Session {
+            harness: Harness::Claude,
+            db_path: PathBuf::new(),
+            store: two_window_store(),
+        };
+        trend(&two, trend_pair(), Format::Table).unwrap();
+        trend(&two, trend_pair(), Format::Markdown).unwrap();
+        trend(&two, trend_pair(), Format::Json).unwrap();
+        let empty = Session {
+            harness: Harness::Claude,
+            db_path: PathBuf::new(),
+            store: Store::in_memory().unwrap(),
+        };
+        trend(&empty, trend_pair(), Format::Table).unwrap();
+        trend(&empty, trend_pair(), Format::Json).unwrap();
     }
 }

@@ -131,6 +131,7 @@ ranking.
 | `doctor` | The entry point: a one-screen health check **written for someone who has never seen saniwalens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units, naming the agent types behind the subagent figure — and, when the named rows cover only part of that figure, saying so first; see *Reporting honesty*), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
 | `inventory` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): startup cost, static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
 | `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table, then splits the subagent half **per agent type** (runs and output tokens, costliest first) — the aggregate is usually the larger number and the split is the part that can be acted on. JSON carries the split's coverage as `agent_split` in every state. In text, a partial split prints its covered and uncovered figures between the total and the table, an unavailable split (no rows at all) is warned on stderr, and rows that cover the total need no note (see *Reporting honesty*). A section with no rows is omitted rather than rendered as bare headers. |
+| `trend` | How usage moved: each kind of event (count / output tokens / duration), each skill (invocations, largest movement first), and the session / subagent totals — this window against the equal-length window right before it (default 7d vs the 7d before; `--last` or `--since` [+ `--until`] fixes the current one, the pair resolved by the Period section's rules). Every row carries both windows' values, the delta, and the direction; the previous window's emptiness makes a comparison `n/a` / `"unavailable"` with no delta claimed, never a drop to zero (see *Reporting honesty*). Both windows' ranges are disclosed like every view's window is, and `--format json` carries them as `window.current` / `window.previous`. |
 | `waste` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
 | `overhead` | Reconcile the empirical always-on floor (the leanest observed **session start**, not the context a skill happened to run at — `surfaces.md`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh. The per-project table carries the session count behind each floor, because the floor is a minimum over observations and a project with few sessions may never have caught a fresh one. Reports the metric as unavailable when no session start was observed at all. |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
@@ -167,9 +168,16 @@ category broken down any way — are a `sql` one-liner; those once had thin
 
 ### Period — narrow a report to a window of the history
 
-The eight report views above take `--since` / `--until` / `--last` so "what did
+The nine report views above take `--since` / `--until` / `--last` so "what did
 the agent cost last week" is a view flag, not a `sql` query. The other commands
 (`analyze`, `sql`, `optimize`) take none — they are whole-history by contract.
+
+`trend` resolves the same flags as a **pair** — the current window plus the
+equal-length window immediately before it (the previous ends one second before
+the current starts, so no event is counted in both). `--since` alone runs the
+current window to now — a bounded window, unlike the single-window views' open
+end — and `--until` alone is an error: with no current start, the window to
+compare against is undefined.
 
 - `--since DATE` / `--until DATE`: a named-day window over the history, each
   date a whole day (`YYYY-MM-DD`, read in the presentation zone — **JST**, the
