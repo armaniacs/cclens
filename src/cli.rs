@@ -1876,9 +1876,19 @@ fn delta_cells_int(previous: i64, current: i64) -> (String, String) {
     }
 }
 
+/// A float rounded to the table's display precision — the same rounding the
+/// `{:.1}` cells use (round via the format itself, so the rounded value is by
+/// construction the one the table shows).
+fn display_precise(value: f64) -> f64 {
+    format!("{value:.1}").parse().unwrap_or(value)
+}
+
 /// A table cell pair for a float metric — the duration form of
-/// [`delta_cells_int`].
+/// [`delta_cells_int`]. The direction is judged at display precision: float
+/// drift smaller than the shown 0.1 must not claim a move the table renders
+/// as ±0.0, so direction and displayed delta never disagree.
 fn delta_cells_float(previous: f64, current: f64) -> (String, String) {
+    let (previous, current) = (display_precise(previous), display_precise(current));
     match direction_of(previous, current) {
         Direction::Unavailable => ("n/a".to_string(), "n/a".to_string()),
         direction => (
@@ -4130,6 +4140,25 @@ mod tests {
         assert_eq!(direction_of(1, 4), Up);
         assert_eq!(direction_of(7, 7), Same);
         assert_eq!(direction_of(0, 7), Unavailable);
+    }
+
+    #[test]
+    fn the_float_delta_judges_direction_at_display_precision() {
+        // The unrounded seconds can differ by float drift smaller than the
+        // display's 0.1: the direction must not claim a move the table shows
+        // as ±0.0 — direction and displayed delta never disagree.
+        let (delta, direction) = delta_cells_float(3.3, 3.3000000000000003);
+        assert_eq!(direction, "same", "drift above zero is not a move");
+        assert_eq!(delta, "+0.0");
+        // A sub-0.05 real move rounds to ±0.0 too: no direction is claimed
+        // for a move the table cannot show.
+        let (delta, direction) = delta_cells_float(1.0, 1.0 - 1e-9);
+        assert_eq!(direction, "same", "drift below zero is not a move");
+        assert_eq!(delta, "+0.0");
+        // A move the table CAN show still reads as one.
+        let (delta, direction) = delta_cells_float(1.0, 2.0);
+        assert_eq!(direction, "up");
+        assert_eq!(delta, "+1.0");
     }
 
     #[test]
