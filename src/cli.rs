@@ -2003,6 +2003,23 @@ fn eprint_trend_windows(pair: WindowPair) {
     eprintln!("{}", Style::stderr().dim(&line));
 }
 
+/// A trend section: its label and table together — omitted entirely when the
+/// section has no rows, so markdown never shows bare headers (the usage
+/// view's convention: a section with no rows is omitted, not rendered empty).
+fn trend_table(
+    label: &str,
+    headers: &[&str],
+    aligns: &[Align],
+    rows: &[Vec<String>],
+    format: Format,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    trend_section(label);
+    render(headers, aligns, rows, format);
+}
+
 /// A section label between a trend report's tables — printed in table and
 /// markdown alike, so pasted tables keep their reading order.
 fn trend_section(label: &str) {
@@ -2033,28 +2050,31 @@ fn trend(sess: &Session, pair: WindowPair, format: Format) -> Result<()> {
         return Ok(());
     }
     preamble(format, &framed(&trend_preamble(pair), pair.current));
-    render(
-        &[
-            "kind",
-            "metric",
-            "previous",
-            "current",
-            "delta",
-            "direction",
-        ],
-        &[
-            Align::Left,
-            Align::Left,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Left,
-        ],
-        &trend_kind_rows(&agg),
-        format,
-    );
-    trend_section("Skills (largest movement first):");
-    render(
+    let kind_rows = trend_kind_rows(&agg);
+    if !kind_rows.is_empty() {
+        render(
+            &[
+                "kind",
+                "metric",
+                "previous",
+                "current",
+                "delta",
+                "direction",
+            ],
+            &[
+                Align::Left,
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+            ],
+            &kind_rows,
+            format,
+        );
+    }
+    trend_table(
+        "Skills (largest movement first):",
         &["skill", "previous", "current", "delta", "direction"],
         &[
             Align::Left,
@@ -2066,8 +2086,8 @@ fn trend(sess: &Session, pair: WindowPair, format: Format) -> Result<()> {
         &trend_skill_rows(&agg),
         format,
     );
-    trend_section("Totals:");
-    render(
+    trend_table(
+        "Totals:",
         &["total", "previous", "current", "delta", "direction"],
         &[
             Align::Left,
